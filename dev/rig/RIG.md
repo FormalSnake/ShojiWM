@@ -67,8 +67,8 @@ region.
 - Compositor key binds: `"$SHOJI_BIN" --key Super+Return` (or
   `printf 'key Super+Return\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"`).
   The chord goes through the compositor's input path like a real keyboard:
-  binds, then the focused window. `code:<evdev code>` names a key by code
-  (`Super+code:2`). `--hold 800` (`key XF86AudioRaiseVolume 800` on the
+  binds, then the focused window. `code:<xkb keycode>` names a key by code
+  (`Super+code:10` is the 1 key). `--hold 800` (`key XF86AudioRaiseVolume 800` on the
   socket) keeps it down 800 ms, for key repeat and repeating binds. Answers
   `ok` once the event loop has pressed it, `error: ...` for an unknown key.
 - Pointer: `wlrctl pointer move <dx> <dy>`, `wlrctl pointer click left`,
