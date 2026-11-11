@@ -80,6 +80,31 @@ then no longer opens the launcher on release. The default config uses 300 ms.
 COMPOSITOR.key.bind('launcher-tap', 'Super', openLauncher, {on: 'release', within: 300});
 ```
 
+### Repeating and locked bindings
+
+`repeat: true` fires the handler again while the key is held, after the
+keyboard's `repeatDelay` and then `repeatRate` times a second (see
+[Input](./input.md)). Pressing any other key stops it. `locked: true` lets the
+binding fire while the session is locked, where every other binding is
+swallowed by the lock screen; use it for volume, brightness and media keys.
+Both need a key and the default `on: "press"` phase, so mouse buttons, wheel
+directions and taps are rejected.
+
+```ts
+COMPOSITOR.key.bind('volume-up', 'XF86AudioRaiseVolume', raiseVolume, {locked: true, repeat: true});
+```
+
+In Rust the same options go through `bind_with`:
+
+```rust
+COMPOSITOR.key.bind_with(
+    "volume-up",
+    "XF86AudioRaiseVolume",
+    KeyBindOptions::new().locked().repeat(),
+    || COMPOSITOR.process.spawn(Command::exec(["wpctl", "set-volume", "@DEFAULT_SINK@", "5%+"])),
+);
+```
+
 ### Quit and reload
 
 `Super+Shift+Q` (quit) and `Super+Shift+R` (reload the config) are built into
@@ -111,11 +136,15 @@ compositor, as if it came from a keyboard: it reaches your key bindings, the
 built-in `Super+Shift+Q`/`Super+Shift+R`, and then the focused window. Chords
 use the binding syntax (`Super+Shift+Return`, `Ctrl+c`); the key is a keysym
 looked up on the active layout, and `code:<evdev code>` names a key by its
-code. A keysym that needs Shift on the layout gets Shift added.
+code. A keysym that needs Shift on the layout gets Shift added. `--hold <ms>`
+keeps the chord down that long before releasing it, which is enough for key
+repeat and [repeating bindings](#repeating-and-locked-bindings).
 
 ```sh
 shoji_wm --key Super+T
+shoji_wm --key XF86AudioRaiseVolume --hold 800
 printf 'key Super+T\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"
+printf 'key XF86AudioRaiseVolume 800\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"
 ```
 
 Tools like `wtype` use the virtual keyboard protocol, which types into the

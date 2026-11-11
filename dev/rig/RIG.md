@@ -9,6 +9,20 @@ refreshes it.
 
 ## Run a session
 
+From the macbook:
+
+```sh
+~/Developer/ShojiWM/dev/rig/shoji-rig '~/shoji-run.sh [<config>] -- <command...>'
+```
+
+FormalShell's `dev/remote.sh` also runs Hyprland on this slot (it spreads
+smoke runs over all four mac slots). `shoji-rig` holds the macbook's
+`/tmp/formalshell-mac-3.lock`, the lock `remote.sh` takes for slot 3, for the
+length of the ssh command, so the two queue instead of fighting over the
+card. A bare `ssh fstest3@fstestmac ~/shoji-run.sh ...` works when nothing
+else is running, and exits 125 naming the process when the card is taken.
+On the guest:
+
 ```sh
 ~/shoji-run.sh [<config>] -- <command...>
 ```
@@ -35,7 +49,7 @@ Inside the command:
 | --- | --- |
 | `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` | the session; the runtime dir is private to the run |
 | `DBUS_SESSION_BUS_ADDRESS` | a private session bus |
-| `SHOJIWM_SOCKET` | the core's control socket: one line per connection, `quit` or `reload`, answers `ok` |
+| `SHOJIWM_SOCKET` | the core's control socket: one line per connection, `quit`, `reload` or `key <chord> [<hold-ms>]`, answers `ok` |
 | `SHOJI_IPC_SOCKET` | where a TypeScript config's `createIpcServer()` listens by default |
 | `SHOJI_RUN_DIR` | `~/shoji-runs/<stamp>-<pid>/`: `log/latest.log`, `stdout.log`, `command`; put screenshots here |
 | `SHOJI_RUN_LOG` | the compositor's log |
@@ -54,8 +68,9 @@ region.
   `printf 'key Super+Return\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"`).
   The chord goes through the compositor's input path like a real keyboard:
   binds, then the focused window. `code:<evdev code>` names a key by code
-  (`Super+code:2`). Answers `ok` once the event loop has run it, `error: ...`
-  for an unknown key.
+  (`Super+code:2`). `--hold 800` (`key XF86AudioRaiseVolume 800` on the
+  socket) keeps it down 800 ms, for key repeat and repeating binds. Answers
+  `ok` once the event loop has pressed it, `error: ...` for an unknown key.
 - Pointer: `wlrctl pointer move <dx> <dy>`, `wlrctl pointer click left`,
   `wlrctl pointer scroll 0 3` (wlr-virtual-pointer, same path as a mouse:
   focus on click, hot corners, grabs). Park it first with a large negative

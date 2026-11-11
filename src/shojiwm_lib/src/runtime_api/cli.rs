@@ -52,6 +52,7 @@ impl CommonArgs {
         let mut value_options = vec![
             "--tty-output".to_string(),
             "--key".to_string(),
+            "--hold".to_string(),
             "--config".to_string(),
             "--runtime-dir".to_string(),
             "--xwayland-satellite-path".to_string(),
@@ -107,8 +108,14 @@ impl CommonArgs {
             } else if flag("--reload") || flag("-r") {
                 Some(crate::control_socket::Command::Reload)
             } else {
-                parse_option_value(args, "--key", &consumed_values)
-                    .map(crate::control_socket::Command::Key)
+                parse_option_value(args, "--key", &consumed_values).map(|chord| {
+                    crate::control_socket::Command::Key {
+                        chord,
+                        hold_ms: parse_option_value(args, "--hold", &consumed_values)
+                            .and_then(|hold| hold.parse().ok())
+                            .unwrap_or(0),
+                    }
+                })
             },
         }
     }
@@ -153,6 +160,10 @@ const COMMON_HELP: &[(&str, &str)] = &[
     (
         "--key <CHORD>",
         "Press a key chord in the running ShojiWM, e.g. Super+Return",
+    ),
+    (
+        "--hold <MS>",
+        "With --key: hold the chord this long before releasing",
     ),
     ("-h, --help", "Print this help"),
     ("-V, --version", "Print the version"),
@@ -341,7 +352,19 @@ mod tests {
 
         assert_eq!(
             parsed.control_command,
-            Some(crate::control_socket::Command::Key("Super+Return".into()))
+            Some(crate::control_socket::Command::Key {
+                chord: "Super+Return".into(),
+                hold_ms: 0
+            })
+        );
+
+        let parsed = CommonArgs::parse(&args(&["--key", "Up", "--hold", "900"]), &[]);
+        assert_eq!(
+            parsed.control_command,
+            Some(crate::control_socket::Command::Key {
+                chord: "Up".into(),
+                hold_ms: 900
+            })
         );
     }
 

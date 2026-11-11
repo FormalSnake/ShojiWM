@@ -71,6 +71,13 @@ for sysfs in /sys/class/drm/card[0-9]*; do
   esac
 done
 [ -n "$card" ] || { echo "shoji-run: no vkms card for $(id -un)" >&2; exit 125; }
+for fd in /proc/[0-9]*/fd/*; do
+  if [ "$(readlink "$fd" 2>/dev/null)" = "$card" ]; then
+    pid=${fd#/proc/}; pid=${pid%%/*}
+    echo "shoji-run: $card is held by $pid ($(tr '\0' ' ' < "/proc/$pid/cmdline" | cut -c1-120)); run through shoji-rig on the macbook, which waits for FormalShell's slot lock" >&2
+    exit 125
+  fi
+done
 
 runs=$HOME/shoji-runs
 run_dir=$runs/$(date +%Y%m%d-%H%M%S)-$$

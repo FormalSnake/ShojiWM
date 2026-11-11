@@ -10,14 +10,15 @@
 //! `SHOJIWM_SOCKET`. The wire format is one command per connection:
 //!
 //! ```text
-//! client -> server   "quit\n" | "reload\n" | "key <chord>\n"
+//! client -> server   "quit\n" | "reload\n" | "key <chord> [<hold-ms>]\n"
 //! server -> client   "ok\n" | "error: <message>\n"
 //! ```
 //!
 //! `key Super+Return` presses and releases the chord on a virtual keyboard
 //! that goes through the compositor's input path, so it reaches the config's
-//! key binds (see [`crate::virtual_input`]). The answer comes once the event
-//! loop has run the command.
+//! key binds (see [`crate::virtual_input`]). `key XF86AudioRaiseVolume 800`
+//! holds it for 800 ms before the release, long enough for key repeat. The
+//! answer comes once the event loop has pressed the chord.
 
 use std::{
     ffi::OsStr,
@@ -46,8 +47,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub enum Command {
     Quit,
     Reload,
-    /// Press and release a chord such as `Super+Shift+Return`.
-    Key(String),
+    /// Press a chord such as `Super+Shift+Return`, and release it
+    /// `hold_ms` later.
+    Key {
+        chord: String,
+        hold_ms: u32,
+    },
 }
 
 impl Command {
@@ -55,7 +60,8 @@ impl Command {
         match self {
             Self::Quit => "quit".into(),
             Self::Reload => "reload".into(),
-            Self::Key(chord) => format!("key {chord}"),
+            Self::Key { chord, hold_ms: 0 } => format!("key {chord}"),
+            Self::Key { chord, hold_ms } => format!("key {chord} {hold_ms}"),
         }
     }
 
@@ -64,11 +70,18 @@ impl Command {
         match line {
             "quit" => Some(Self::Quit),
             "reload" => Some(Self::Reload),
-            _ => line
-                .strip_prefix("key ")
-                .map(str::trim)
-                .filter(|chord| !chord.is_empty())
-                .map(|chord| Self::Key(chord.to_string())),
+            _ => {
+                let mut words = line.strip_prefix("key ")?.split_whitespace();
+                let chord = words.next()?.to_string();
+                let hold_ms = match words.next() {
+                    Some(hold) => hold.parse().ok()?,
+                    None => 0,
+                };
+                words
+                    .next()
+                    .is_none()
+                    .then_some(Self::Key { chord, hold_ms })
+            }
         }
     }
 }
@@ -132,7 +145,7 @@ pub fn start(
                     state.reload_decoration_runtime();
                     Ok(())
                 }
-                Command::Key(chord) => state.inject_key_chord(&chord),
+                Command::Key { chord, hold_ms } => state.inject_key_chord(&chord, hold_ms),
             };
             let _ = reply.send(result);
         }
@@ -232,7 +245,14 @@ mod tests {
         for command in [
             Command::Quit,
             Command::Reload,
-            Command::Key("Super+Shift+Return".into()),
+            Command::Key {
+                chord: "Super+Shift+Return".into(),
+                hold_ms: 0,
+            },
+            Command::Key {
+                chord: "XF86AudioRaiseVolume".into(),
+                hold_ms: 800,
+            },
         ] {
             assert_eq!(
                 Command::parse(&format!("{}\n", command.to_line())),
@@ -247,8 +267,24 @@ mod tests {
         assert_eq!(Command::parse("key   "), None);
         assert_eq!(
             Command::parse(" key  ctrl+c \n"),
-            Some(Command::Key("ctrl+c".into()))
+            Some(Command::Key {
+                chord: "ctrl+c".into(),
+                hold_ms: 0
+            })
         );
         assert_eq!(Command::parse("press a"), None);
+    }
+
+    #[test]
+    fn key_hold_is_a_number_of_milliseconds() {
+        assert_eq!(
+            Command::parse("key a 250"),
+            Some(Command::Key {
+                chord: "a".into(),
+                hold_ms: 250
+            })
+        );
+        assert_eq!(Command::parse("key a long"), None);
+        assert_eq!(Command::parse("key a 250 b"), None);
     }
 }
