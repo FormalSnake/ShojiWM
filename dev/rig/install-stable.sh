@@ -19,8 +19,11 @@ if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
   echo "install-stable: $repo has uncommitted changes; stable builds come from a commit" >&2
   exit 1
 fi
-if [ "$(stat -c %Y "$bin")" -lt "$(git -C "$repo" log -1 --format=%ct)" ]; then
-  echo "install-stable: $bin is older than HEAD; rebuild first" >&2
+# shoji-build.sh records the commit a build came from; the binary is current
+# when no compositor source changed since.
+read -r built dirty < "$bin.rev" 2>/dev/null || { echo "install-stable: no $bin.rev; build with shoji-build.sh" >&2; exit 1; }
+if [ -n "${dirty:-}" ] || ! git -C "$repo" diff --quiet "$built" HEAD -- src Cargo.toml Cargo.lock; then
+  echo "install-stable: $bin was built from ${built:0:9}${dirty:+ with uncommitted changes}, not HEAD; rebuild first" >&2
   exit 1
 fi
 
@@ -58,7 +61,7 @@ if LD_LIBRARY_PATH=$new/lib ldd "$new/bin/shoji_wm" | grep 'not found'; then
   echo "install-stable: the binary still misses libraries" >&2
   exit 1
 fi
-printf '%s %s\n' "$(git -C "$repo" rev-parse HEAD)" "$(date -Is)" > "$new/REV"
+printf '%s built from %s, installed %s\n' "$(git -C "$repo" rev-parse HEAD)" "$built" "$(date -Is)" > "$new/REV"
 
 exec 9>"$HOME/shoji-rig.lock"
 flock 9
