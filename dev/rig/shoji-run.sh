@@ -14,17 +14,20 @@
 #                      Any binary built on shojiwm_lib takes the same command
 #                      line, e.g. SHOJI_BIN=~/formalwm/target/release/formalwm.
 #   SHOJI_ARGS         extra compositor arguments, split on spaces.
+#   SHOJI_RUNTIME      --runtime-dir for a TypeScript config (default
+#                      ~/shoji-stable/runtime); a ShojiWM checkout works.
 #   SHOJI_RUN_TIMEOUT  seconds the command may run (default 900).
 #   SHOJI_LOCK_WAIT    seconds to wait for the rig lock (default 3600).
 #   SHOJI_KEEP_RUNS    run directories kept under ~/shoji-runs (default 30).
 #
 # Inside the command: WAYLAND_DISPLAY, XDG_RUNTIME_DIR (private to the run),
-# SHOJIWM_SOCKET (the control socket: one line, "quit" or "reload"),
+# SHOJIWM_SOCKET (the control socket: one line, "quit", "reload" or
+# "key <chord>"),
 # SHOJI_IPC_SOCKET (where a TypeScript config's createIpcServer() listens by
 # default), SHOJI_RUN_DIR and SHOJI_RUN_LOG (the compositor's log).
 set -euo pipefail
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" >&2; exit 2; }
 
 config=""
 if [ $# -gt 0 ] && [ "$1" != -- ]; then
@@ -39,14 +42,15 @@ stable=$HOME/shoji-stable
 bin=${SHOJI_BIN:-$stable/bin/shoji_wm}
 [ -x "$bin" ] || { echo "shoji-run: no executable compositor at $bin" >&2; exit 125; }
 bin=$(realpath "$bin")
+runtime=$(realpath "${SHOJI_RUNTIME:-$stable/runtime}")
 
 config_args=()
 if [ -n "$config" ]; then
   if [ -d "$config" ]; then config=$config/src/index.tsx; fi
   [ -f "$config" ] || { echo "shoji-run: no config entry at $config" >&2; exit 125; }
-  config_args=(--config "$(realpath "$config")" --runtime-dir "$stable/runtime")
+  config_args=(--config "$(realpath "$config")" --runtime-dir "$runtime")
 elif [ -z "${SHOJI_BIN:-}" ]; then
-  config_args=(--config "$stable/default-config/src/index.tsx" --runtime-dir "$stable/runtime")
+  config_args=(--config "$stable/default-config/src/index.tsx" --runtime-dir "$runtime")
 fi
 # shellcheck disable=SC2206
 extra_args=(${SHOJI_ARGS:-})
