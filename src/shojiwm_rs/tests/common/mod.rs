@@ -14,7 +14,7 @@ use smithay::{
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
-    protocol::{wl_compositor, wl_registry, wl_seat, wl_surface},
+    protocol::{wl_compositor, wl_output, wl_registry, wl_seat, wl_surface},
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
@@ -127,15 +127,34 @@ impl Session {
         surface
     }
 
+    pub fn bind_global<I>(&self, name: u32, version: u32) -> I
+    where
+        I: Proxy + 'static,
+        Client: Dispatch<I, ()>,
+    {
+        self.registry
+            .bind::<I, _, _>(name, version, &self.queue.handle(), ())
+    }
+
     /// Maps a layer surface across the top of the first output.
     pub fn map_layer(&mut self, namespace: &str) -> wl_surface::WlSurface {
+        self.map_layer_on(namespace, None)
+    }
+
+    /// Maps a layer surface across the top of `output`, or of the first
+    /// output.
+    pub fn map_layer_on(
+        &mut self,
+        namespace: &str,
+        output: Option<&wl_output::WlOutput>,
+    ) -> wl_surface::WlSurface {
         let qh = self.queue.handle();
         let compositor: wl_compositor::WlCompositor = self.bind("wl_compositor", 1);
         let shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = self.bind("zwlr_layer_shell_v1", 1);
         let surface = compositor.create_surface(&qh, ());
         let layer = shell.get_layer_surface(
             &surface,
-            None,
+            output,
             zwlr_layer_shell_v1::Layer::Top,
             namespace.into(),
             &qh,
@@ -159,6 +178,15 @@ pub struct Client {
 }
 
 impl Client {
+    /// Names of the globals of `interface` advertised and not removed.
+    pub fn globals_of(&self, interface: &str) -> Vec<u32> {
+        self.globals
+            .iter()
+            .filter(|(candidate, _)| candidate == interface)
+            .map(|(_, name)| *name)
+            .collect()
+    }
+
     fn global(&self, interface: &str) -> u32 {
         self.globals
             .iter()
@@ -177,11 +205,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name, interface, ..
-        } = event
-        {
-            client.globals.push((interface, name));
+        match event {
+            wl_registry::Event::Global {
+                name, interface, ..
+            } => client.globals.push((interface, name)),
+            wl_registry::Event::GlobalRemove { name } => {
+                client.globals.retain(|(_, global)| *global != name);
+            }
+            _ => {}
         }
     }
 }
@@ -217,6 +248,7 @@ ignore_events!(
     zwlr_layer_shell_v1::ZwlrLayerShellV1,
     zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     wl_seat::WlSeat,
+    wl_output::WlOutput,
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1
 );
