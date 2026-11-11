@@ -81,6 +81,10 @@ region.
   the layout's key for the same keysym (`wtype -M logo -k 1 -m logo` fires
   `Super+code:10` on US). A stable older than the virtual keyboard commit
   delivers wtype's keys to the client only; send binds with `--key` there.
+  Hold modifiers with `-M`/`-m`: wtype's keymap maps no modifiers, so
+  `-P Alt_L` presses a key named Alt_L that sets no modifier, and neither
+  `Alt+Tab` nor a `transparent` Alt release bind sees it.
+  `wtype -M alt -k Tab -m alt` fires `Alt+Tab`, then the release bind.
 
 ## Talking to the session
 
