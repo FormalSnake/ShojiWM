@@ -66,6 +66,7 @@ or map it as `window.isFocused((f) => f ? 'a' : 'b')`.
 | `parentId`        | `string \| undefined`     | Parent window id, if transient               |
 | `foreignToplevelId` | `string \| undefined`   | The window's `ext-foreign-toplevel-list-v1` identifier, once mapped |
 | `tag`             | `string \| undefined`     | The client's `xdg-toplevel-tag-v1` tag, such as `"settings"` |
+| `contentType`     | `"photo" \| "video" \| "game" \| undefined` | What the client says it shows (`wp-content-type-v1`) |
 | `sizeConstraints` | `WindowSizeConstraints`   | Min/max size from the client                 |
 | `interaction`     | snapshot                  | Current pointer/drag interaction state       |
 
@@ -85,6 +86,13 @@ the same across restarts, so it suits window rules that `appId` alone cannot
 express, such as floating one program's settings window only. It is `undefined`
 until the client sets one and follows later changes. In a Rust config it is
 `window.tag()`.
+
+A client can say what a surface shows with `wp-content-type-v1`: `"photo"`,
+`"video"` or `"game"`. `contentType` is that value for the window's main
+surface, and `undefined` when the client said nothing. It changes with the
+client's next commit, so a config can follow it, for example to turn on an
+output's `vrr` while a game is focused. In a Rust config it is
+`window.content_type()`, a `WindowContentType`.
 
 `pid` is the process behind the window's client, read from the credentials of
 its Wayland socket (`_NET_WM_PID` for an X11 window on Xwayland), and

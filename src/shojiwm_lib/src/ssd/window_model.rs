@@ -61,6 +61,10 @@ pub struct WaylandWindowSnapshot {
     /// "main window" or "settings": untranslated and stable across restarts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// What the client says it shows, from `wp-content-type-v1`; `None` when it
+    /// said nothing or `none`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<WindowContentType>,
     /// The process behind the window's client, from its socket credentials
     /// (`_NET_WM_PID` for an X11 window on Xwayland); `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -979,6 +983,7 @@ impl ShojiWM {
             minimized_geometry: self.plasma_minimized_geometry(window),
             foreign_toplevel_id: foreign_toplevel_id(window),
             tag: toplevel_tag(toplevel.wl_surface()),
+            content_type: window_content_type(toplevel.wl_surface()),
             pid: toplevel
                 .wl_surface()
                 .client()
@@ -1012,6 +1017,7 @@ impl ShojiWM {
                 minimized_geometry: None,
                 foreign_toplevel_id: None,
                 tag: None,
+                content_type: None,
             };
         };
 
@@ -1091,6 +1097,7 @@ impl ShojiWM {
             minimized_geometry: self.plasma_minimized_geometry(window),
             foreign_toplevel_id: foreign_toplevel_id(window),
             tag: None,
+            content_type: None,
             pid: x11.pid().and_then(|pid| i32::try_from(pid).ok()),
         }
     }
@@ -1316,6 +1323,33 @@ fn foreign_toplevel_id(window: &Window) -> Option<String> {
         .map(|handle| handle.identifier())
 }
 
+/// The `wp-content-type-v1` hint of a window, which a config can use to pick
+/// VRR or a scaling filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowContentType {
+    Photo,
+    Video,
+    Game,
+}
+
+pub(crate) fn window_content_type(surface: &WlSurface) -> Option<WindowContentType> {
+    use smithay::reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_v1::Type;
+    let content_type = with_states(surface, |states| {
+        *states
+            .cached_state
+            .get::<smithay::wayland::content_type::ContentTypeSurfaceCachedState>()
+            .current()
+            .content_type()
+    });
+    match content_type {
+        Type::Photo => Some(WindowContentType::Photo),
+        Type::Video => Some(WindowContentType::Video),
+        Type::Game => Some(WindowContentType::Game),
+        _ => None,
+    }
+}
+
 fn toplevel_tag(surface: &WlSurface) -> Option<String> {
     with_states(surface, |states| {
         states
@@ -1401,6 +1435,7 @@ mod tests {
             minimized_geometry: None,
             foreign_toplevel_id: None,
             tag: None,
+            content_type: None,
         };
         let unmapped = serde_json::to_value(&snapshot).expect("serialize unmapped");
         assert!(unmapped.get("foreignToplevelId").is_none());
