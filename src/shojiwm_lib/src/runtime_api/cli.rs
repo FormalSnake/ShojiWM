@@ -51,6 +51,7 @@ impl CommonArgs {
             |name: &str| std::env::var_os(name).is_some_and(|value| value == "off" || value == "0");
         let mut value_options = vec![
             "--tty-output".to_string(),
+            "--key".to_string(),
             "--config".to_string(),
             "--runtime-dir".to_string(),
             "--xwayland-satellite-path".to_string(),
@@ -106,7 +107,8 @@ impl CommonArgs {
             } else if flag("--reload") || flag("-r") {
                 Some(crate::control_socket::Command::Reload)
             } else {
-                None
+                parse_option_value(args, "--key", &consumed_values)
+                    .map(crate::control_socket::Command::Key)
             },
         }
     }
@@ -147,6 +149,10 @@ const COMMON_HELP: &[(&str, &str)] = &[
     (
         "-r, --reload",
         "Reload the running ShojiWM's config (same as Super+Shift+R)",
+    ),
+    (
+        "--key <CHORD>",
+        "Press a key chord in the running ShojiWM, e.g. Super+Return",
     ),
     ("-h, --help", "Print this help"),
     ("-V, --version", "Print the version"),
@@ -327,6 +333,16 @@ mod tests {
         assert!(!parsed.help);
         assert!(!parsed.version);
         assert_eq!(parsed.control_command, None);
+    }
+
+    #[test]
+    fn key_sends_its_chord_to_the_running_compositor() {
+        let parsed = CommonArgs::parse(&args(&["--key", "Super+Return"]), &[]);
+
+        assert_eq!(
+            parsed.control_command,
+            Some(crate::control_socket::Command::Key("Super+Return".into()))
+        );
     }
 
     #[test]
