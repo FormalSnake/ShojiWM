@@ -24,6 +24,8 @@ export interface WaylandWindowSnapshot {
   readonly minimizedGeometry?: WindowPosition;
   /** The window's `ext-foreign-toplevel-list-v1` identifier; absent until mapped. / `ext-foreign-toplevel-list-v1` での識別子。マップされるまでは省略。 */
   readonly foreignToplevelId?: string;
+  /** The window's `xdg-toplevel-tag-v1` tag, if the client set one. / クライアントが `xdg-toplevel-tag-v1` で設定したタグ。 */
+  readonly tag?: string;
   /** The process behind the window's client, from its socket credentials; absent when unknown. / クライアントのソケット資格情報から得たプロセス ID。不明なら省略。 */
   readonly pid?: number;
 }
@@ -304,6 +306,15 @@ export interface WaylandWindow {
    * ウィンドウを識別します。マップされるまでは `undefined`。
    */
   readonly foreignToplevelId: import("./signals").ReadonlySignal<string | undefined>;
+  /**
+   * The tag the client gave the window with `xdg-toplevel-tag-v1`, such as
+   * "main window" or "settings". Untranslated and stable across restarts, so
+   * window rules can tell a program's windows apart. `undefined` until set.
+   * クライアントが `xdg-toplevel-tag-v1` で設定したタグ（"main window"、
+   * "settings" など）。翻訳されず再起動後も変わらないので、ウィンドウルールで
+   * 同じプログラムのウィンドウを区別できます。設定されるまでは `undefined`。
+   */
+  readonly tag: import("./signals").ReadonlySignal<string | undefined>;
   /**
    * The process behind the window's client, from its socket credentials
    * (`_NET_WM_PID` for an X11 window on Xwayland). `undefined` when unknown.
@@ -3655,6 +3666,7 @@ export interface ReactiveWaylandWindowSignals {
   plasma: import("./signals").ReadonlySignal<PlasmaSurfaceState | undefined>;
   minimizedGeometry: import("./signals").ReadonlySignal<WindowPosition | undefined>;
   foreignToplevelId: import("./signals").ReadonlySignal<string | undefined>;
+  tag: import("./signals").ReadonlySignal<string | undefined>;
   icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   interaction: import("./signals").ReadonlySignal<WindowCompositionInteractionSnapshot>;
   output: import("./signals").ReadonlySignal<string | undefined>;

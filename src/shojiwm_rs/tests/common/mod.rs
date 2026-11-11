@@ -157,14 +157,20 @@ impl Session {
         let qh = self.queue.handle();
         let compositor: wl_compositor::WlCompositor = self.bind("wl_compositor", 1);
         let shell: xdg_wm_base::XdgWmBase = self.bind("xdg_wm_base", 1);
-        let shm: wl_shm::WlShm = self.bind("wl_shm", 1);
         let surface = compositor.create_surface(&qh, ());
         let xdg = shell.get_xdg_surface(&surface, &qh, ());
         let toplevel = xdg.get_toplevel(&qh, ());
         toplevel.set_app_id(app_id.into());
         surface.commit();
         self.roundtrip();
+        self.attach_buffer(&surface, width, height);
+        surface
+    }
 
+    /// Attaches and commits a `width`x`height` shm buffer to `surface`.
+    pub fn attach_buffer(&mut self, surface: &wl_surface::WlSurface, width: i32, height: i32) {
+        let qh = self.queue.handle();
+        let shm: wl_shm::WlShm = self.bind("wl_shm", 1);
         let stride = width * 4;
         let file = tempfile("shm");
         file.set_len((stride * height) as u64).unwrap();
@@ -176,7 +182,6 @@ impl Session {
         surface.damage(0, 0, width, height);
         surface.commit();
         self.roundtrip();
-        surface
     }
 
     /// Maps a layer surface across the top of the first output.

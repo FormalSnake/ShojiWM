@@ -15,6 +15,7 @@ fn snapshot(foreign_toplevel_id: Option<&str>) -> WaylandWindowSnapshot {
         plasma: None,
         minimized_geometry: None,
         foreign_toplevel_id: foreign_toplevel_id.map(Into::into),
+        tag: None,
         id: "w1".into(),
         title: "title".into(),
         app_id: Some("test".into()),

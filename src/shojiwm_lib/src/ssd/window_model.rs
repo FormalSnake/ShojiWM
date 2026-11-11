@@ -57,6 +57,10 @@ pub struct WaylandWindowSnapshot {
     /// by; `None` until the window is mapped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreign_toplevel_id: Option<String>,
+    /// The tag the client gave the window with `xdg-toplevel-tag-v1`, such as
+    /// "main window" or "settings": untranslated and stable across restarts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// The process behind the window's client, from its socket credentials
     /// (`_NET_WM_PID` for an X11 window on Xwayland); `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -974,6 +978,7 @@ impl ShojiWM {
             plasma: crate::protocols::plasma_shell::plasma_surface_snapshot(toplevel.wl_surface()),
             minimized_geometry: self.plasma_minimized_geometry(window),
             foreign_toplevel_id: foreign_toplevel_id(window),
+            tag: toplevel_tag(toplevel.wl_surface()),
             pid: toplevel
                 .wl_surface()
                 .client()
@@ -1006,6 +1011,7 @@ impl ShojiWM {
                 plasma: None,
                 minimized_geometry: None,
                 foreign_toplevel_id: None,
+                tag: None,
             };
         };
 
@@ -1084,6 +1090,7 @@ impl ShojiWM {
             plasma: None,
             minimized_geometry: self.plasma_minimized_geometry(window),
             foreign_toplevel_id: foreign_toplevel_id(window),
+            tag: None,
             pid: x11.pid().and_then(|pid| i32::try_from(pid).ok()),
         }
     }
@@ -1309,6 +1316,16 @@ fn foreign_toplevel_id(window: &Window) -> Option<String> {
         .map(|handle| handle.identifier())
 }
 
+fn toplevel_tag(surface: &WlSurface) -> Option<String> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<smithay::wayland::xdg_toplevel_tag::XdgToplevelTagSurfaceData>()
+            .and_then(|data| data.tag())
+            .map(|tag| tag.to_string())
+    })
+}
+
 /// Stable runtime id for a toplevel window (Wayland or X11). Backed by
 /// `smithay::desktop::Window::id()`, a process-lifetime-unique counter, so
 /// unlike the wl_surface protocol id / X11 XID it can't be recycled onto an
@@ -1383,6 +1400,7 @@ mod tests {
             plasma: None,
             minimized_geometry: None,
             foreign_toplevel_id: None,
+            tag: None,
         };
         let unmapped = serde_json::to_value(&snapshot).expect("serialize unmapped");
         assert!(unmapped.get("foreignToplevelId").is_none());
