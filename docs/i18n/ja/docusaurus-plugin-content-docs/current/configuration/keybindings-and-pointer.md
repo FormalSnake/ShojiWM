@@ -135,10 +135,14 @@ ShojiWM は起動するすべてのプロセスにこの変数を渡します。
 組み合わせはバインディングと同じ書式（`Super+Shift+Return`、`Ctrl+c`）です。キーは
 現在のレイアウト上の keysym として探され、`code:<evdev コード>` でコードを直接指定
 できます。そのレイアウトで Shift が必要な keysym には Shift が加わります。
+`--hold <ms>` を付けると、その時間だけ押し続けてから離します。キーリピートや
+[リピートするバインド](#リピートとロック中のバインド)の確認に使えます。
 
 ```sh
 shoji_wm --key Super+T
+shoji_wm --key XF86AudioRaiseVolume --hold 800
 printf 'key Super+T\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"
+printf 'key XF86AudioRaiseVolume 800\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"
 ```
 
 `wtype` などの仮想キーボードプロトコルを使うツールは、フォーカス中のウィンドウに

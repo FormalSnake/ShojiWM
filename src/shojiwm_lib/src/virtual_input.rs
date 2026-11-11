@@ -9,12 +9,15 @@
 //! focused client directly, which is right for typing text but never reaches
 //! a key bind.
 
+use std::time::Duration;
+
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
     DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
     PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent,
     UnusedEvent,
 };
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::utils::{Logical, Rectangle};
 use xkbcommon::xkb;
 
@@ -414,7 +417,7 @@ impl ShojiWM {
 
     /// Press then release `chord` on a virtual keyboard, through the same
     /// path as a real key press.
-    pub fn inject_key_chord(&mut self, chord: &str) -> Result<(), String> {
+    pub fn inject_key_chord(&mut self, chord: &str, hold_ms: u32) -> Result<(), String> {
         let keyboard = self
             .seat
             .get_keyboard()
@@ -426,19 +429,49 @@ impl ShojiWM {
             let keymap = unsafe { xkb.keymap() };
             resolve_chord(chord, keymap, layout.0)
         })?;
+        self.send_control_keys(&codes, KeyState::Pressed);
+        if hold_ms == 0 {
+            self.send_control_keys(&codes, KeyState::Released);
+            return Ok(());
+        }
+        let timer = Timer::from_duration(Duration::from_millis(u64::from(hold_ms)));
+        let held = codes.clone();
+        let scheduled = self.loop_handle.insert_source(timer, move |_, _, state| {
+            state.send_control_keys(&held, KeyState::Released);
+            TimeoutAction::Drop
+        });
+        if let Err(error) = scheduled {
+            self.send_control_keys(&codes, KeyState::Released);
+            return Err(format!("could not schedule the release: {error}"));
+        }
+        Ok(())
+    }
+
+    /// Presses `codes` in order, or releases them in reverse, on the control
+    /// socket's keyboard.
+    fn send_control_keys(&mut self, codes: &[Keycode], state: KeyState) {
         let device = VirtualDevice {
             id: "shojiwm-control-keyboard".into(),
             name: "ShojiWM control socket keyboard".into(),
             keyboard: true,
         };
-        let presses = codes.iter().map(|code| (*code, KeyState::Pressed));
-        let releases = codes.iter().rev().map(|code| (*code, KeyState::Released));
-        for (index, (keycode, state)) in presses.chain(releases).enumerate() {
-            let count = if index < codes.len() {
-                index as u32 + 1
-            } else {
-                (2 * codes.len() - index - 1) as u32
-            };
+        let len = codes.len() as u32;
+        let ordered: Vec<(u32, Keycode)> = match state {
+            KeyState::Pressed => codes
+                .iter()
+                .copied()
+                .zip(1..)
+                .map(|(c, n)| (n, c))
+                .collect(),
+            KeyState::Released => codes
+                .iter()
+                .rev()
+                .copied()
+                .zip((0..len).rev())
+                .map(|(c, n)| (n, c))
+                .collect(),
+        };
+        for (count, keycode) in ordered {
             self.process_input_event(InputEvent::<VirtualInput>::Keyboard {
                 event: VirtualKey {
                     device: device.clone(),
@@ -449,7 +482,6 @@ impl ShojiWM {
                 },
             });
         }
-        Ok(())
     }
 }
 
