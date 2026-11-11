@@ -12,7 +12,6 @@
 #   shoji-cargo.sh ~/ShojiWM test -p shojiwm_lib runtime_key_binding
 #   shoji-cargo.sh ~/formalwm/wm build --release
 #   shoji-cargo.sh ~/ShojiWM -- bash -c 'cargo fmt --check'
-#   CARGO_TARGET_DIR=~/shoji-pr/target shoji-cargo.sh ~/shoji-pr/src/<branch> test -p shojiwm_rs
 set -euo pipefail
 if [ $# -lt 2 ]; then
   sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -58,6 +57,5 @@ tty_flag=()
 [ -t 0 ] && [ -t 1 ] && tty_flag=(-t)
 exec podman run --rm -i ${tty_flag[@]+"${tty_flag[@]}"} --userns=keep-id --security-opt label=disable \
   -v "$HOME:$HOME" -e CARGO_HOME="$HOME/shoji-cache/cargo" -e RUSTUP_HOME="$HOME/shoji-cache/rustup" \
-  -e HOME=/tmp -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-auto}" \
-  ${CARGO_TARGET_DIR:+-e CARGO_TARGET_DIR="$CARGO_TARGET_DIR"} -w "$src" shoji-build \
+  -e HOME=/tmp -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-auto}" -w "$src" shoji-build \
   bash -c 'rustup toolchain list | grep -q stable || rustup default stable >/dev/null; rustup component list --installed | grep -q rustfmt || rustup component add rustfmt >/dev/null; exec "$@"' -- "$@"

@@ -128,9 +128,15 @@ build: check `pgrep -fa 'cargo|rustc'` first), then retry:
 
 - Check `df -h /` before a build, and `du -xh -d 2 <tree>/target | sort -h`
   to see what is yours.
-- Checkouts of other branches (PR branches, worktrees) build into one shared
-  `CARGO_TARGET_DIR` per agent, not a `target/` each, so dependencies are
-  compiled once: `CARGO_TARGET_DIR=~/shoji-pr/target ~/shoji-cargo.sh <tree> test ...`.
+- Check other branches of a tree (PR branches) in one reused checkout with
+  one `target/`, not a checkout and `target/` per branch, so dependencies are
+  compiled once. Replace its sources for each branch and keep `target/`:
+  `cd ~/shoji-pr/check && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar -xm < branch.tar`.
+  `-m` matters: `git archive` stamps files with the commit time, which can be
+  older than the last build, and cargo would then keep stale crates. Never
+  point two checkouts of one workspace at the same `CARGO_TARGET_DIR`: their
+  workspace crates get the same hash and cargo reuses one tree's build for
+  the other.
 - Delete what nothing builds any more: a profile you stopped using, the
   `incremental/` dirs, and a branch checkout with its artifacts once its
   tests passed and its PR is open.
