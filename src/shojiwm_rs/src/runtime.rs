@@ -18,6 +18,7 @@ use shojiwm_lib::{
     cursor::RuntimeCursorConfigUpdate,
     frame_pacing::FramePacing,
     keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
+    lid_switch::LidSwitchSnapshot,
     runtime_api::{HostMessage, RuntimeHost},
     runtime_debug::RuntimeDebugConfigUpdate,
     runtime_input::{RuntimeInputConfig, RuntimeInputDeviceSnapshot},
@@ -76,6 +77,7 @@ pub(crate) struct Listeners {
     pub input_change: Vec<RefListener<InputChangeEvent>>,
     pub keyboard_layout: Vec<RefListener<KeyboardLayoutSnapshot>>,
     pub keyboard_locks: Vec<RefListener<KeyboardLocksSnapshot>>,
+    pub lid_switch: Vec<RefListener<LidSwitchSnapshot>>,
     pub pointer_move: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub pointer_move_async: Vec<RefListener<PointerMoveEventSnapshot>>,
     pub gesture_swipe: Vec<RefListener<GestureSwipeEventSnapshot>>,
@@ -191,6 +193,7 @@ pub(crate) struct GlobalSignals {
     pub layer_order: Signal<Vec<String>>,
     pub keyboard_layout: Signal<Option<KeyboardLayoutSnapshot>>,
     pub keyboard_locks: Signal<Option<KeyboardLocksSnapshot>>,
+    pub lid_switch: Signal<Option<LidSwitchSnapshot>>,
 }
 
 pub(crate) fn global() -> GlobalSignals {
@@ -205,6 +208,7 @@ pub(crate) fn global() -> GlobalSignals {
                 layer_order: scope.signal(Vec::new()),
                 keyboard_layout: scope.signal(None),
                 keyboard_locks: scope.signal(None),
+                lid_switch: scope.signal(None),
             }
         })
     })
