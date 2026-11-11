@@ -936,6 +936,7 @@ impl OutputConfig {
             subpixel: None,
             hdr: None,
             icc: None,
+            vrr: None,
         }
     }
 
@@ -951,6 +952,7 @@ impl OutputConfig {
             subpixel: None,
             hdr: None,
             icc: None,
+            vrr: None,
         }
     }
 }

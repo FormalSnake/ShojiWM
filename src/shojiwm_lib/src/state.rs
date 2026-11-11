@@ -3743,6 +3743,7 @@ impl ShojiWM {
         }
 
         self.apply_runtime_output_subpixels(&outputs);
+        crate::backend::tty::sync_output_vrr(self);
 
         let mut extend_output_names = outputs
             .iter()
