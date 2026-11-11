@@ -321,6 +321,22 @@ How the power state behaves:
   screencasts of that output fail until it is back on (the screencast portal
   retries).
 
+## Night light (gamma)
+
+ShojiWM implements `wlr-gamma-control`, so night light tools such as
+[`wlsunset`](https://git.sr.ht/~kennylevinsen/wlsunset) and `gammastep` can
+warm the colours of each panel:
+
+```sh
+wlsunset -l 52.4 -L 4.9
+```
+
+The ramps go into the output's gamma LUT on the GPU, so they cost nothing per
+frame and show on screen only, not in screenshots or screencasts. One client at
+a time controls an output; when it exits, the output's normal colours come back.
+A switch to another VT and back restores the ramps. Outputs without a gamma LUT
+(nested sessions, headless outputs, drivers without one) refuse the client.
+
 ## Outputs with no display (headless)
 
 `COMPOSITOR.output.create` adds an output that has no connector behind it and
