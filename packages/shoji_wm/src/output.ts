@@ -11,6 +11,7 @@ import type {
   OutputStateSnapshot,
 } from "./types";
 import type { OutputChangeEvent } from "./events";
+import { parseColor, type CompositionColor } from "./composition";
 
 let currentOutputState: Record<string, OutputInfo> = {};
 let desiredOutputConfig: DisplayConfigDraft = {};
@@ -325,6 +326,16 @@ export function setOutputPower(
   native?.(power, options.output ?? "", options.wakeOnInput === true);
 }
 
+type NativeClearColor = (r: number, g: number, b: number, a: number) => void;
+
+/** Outside the ShojiWM runtime there is no output to clear, so this only validates. */
+export function setClearColor(color: CompositionColor): void {
+  const [r, g, b, a] = parseColor(color);
+  const native = (globalThis as { __SHOJI_CLEAR_COLOR__?: NativeClearColor })
+    .__SHOJI_CLEAR_COLOR__;
+  native?.(r, g, b, a);
+}
+
 type NativeHeadlessOutput = (
   action: "create" | "remove",
   name: string,
@@ -412,6 +423,9 @@ export const OUTPUT_CONTROLLER: OutputController = {
   },
   setPower(power, options) {
     setOutputPower(power, options);
+  },
+  setClearColor(color) {
+    setClearColor(color);
   },
   create(options) {
     return createHeadlessOutput(options);

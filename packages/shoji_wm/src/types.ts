@@ -1693,6 +1693,18 @@ export interface OutputController {
    */
   setPower(power: OutputPower, options?: OutputPowerOptions): void;
   /**
+   * Sets the colour every output shows where nothing is drawn, default
+   * `"#141a21"`. Called while the config loads, it is in force from the first
+   * frame, before the config has drawn anything and while a session that
+   * starts locked waits for its lock surface. A config reload resets it.
+   * Fullscreen windows still sit on black.
+   * 何も描画されていない部分に全出力が表示する色を設定します（既定は `"#141a21"`）。
+   * 設定の読み込み中に呼べば、設定が何かを描画する前、またロック状態で開始した
+   * セッションがロック画面を待つ間も含め、最初のフレームから適用されます。
+   * 設定の再読み込みで既定に戻ります。全画面ウィンドウの背後は引き続き黒です。
+   */
+  setClearColor(color: import("./composition").CompositionColor): void;
+  /**
    * Adds an output with no connector and returns its name. From then on it is
    * an ordinary output: clients see it, `configure` places it (right of the
    * connected outputs unless told otherwise), the pointer crosses onto it and

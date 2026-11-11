@@ -337,6 +337,26 @@ How the power state behaves:
   screencasts of that output fail until it is back on (the screencast portal
   retries).
 
+## Clear colour
+
+Where nothing is drawn (no wallpaper yet, gaps the config leaves open) every
+output shows the clear colour, `#141a21` unless the config sets another:
+
+```tsx
+COMPOSITOR.output.setClearColor("#000000");
+```
+
+```rust
+COMPOSITOR.output.set_clear_color(hex("#000000"));
+```
+
+It takes the same colours as composition nodes: a hex string or straight-alpha
+RGBA in 0..1. Set while the config loads, it is in force from the first frame,
+so a session that starts locked (`COMPOSITOR.session.startLocked`) shows it
+until the lock surface arrives instead of the default. A config reload resets
+it to the default until the new config sets it again. Fullscreen windows still
+sit on black.
+
 ## Night light (gamma)
 
 ShojiWM implements `wlr-gamma-control`, so night light tools such as

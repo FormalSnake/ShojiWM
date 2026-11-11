@@ -65,7 +65,7 @@ pub use shojiwm_lib::runtime_pointer_region::{
 use crate::{
     effect::{Effect, SurfaceEffects},
     input_grab::{InputGrab, InputGrabOptions},
-    output_composition::OutputStack,
+    output_composition::{CompositionColor, OutputStack},
     overlay::{Overlay, OverlayHandle},
     reactive::{ReadSignal, untrack},
     runtime::{self, Listeners, with_registry},
@@ -1015,6 +1015,14 @@ impl OutputController {
             output: options.output,
             wake_on_input: options.wake_on_input,
         }));
+    }
+
+    /// `setClearColor(color)`: the colour every output shows where nothing is
+    /// drawn. Set while the config loads, it is in force from the first frame,
+    /// before the config has drawn anything and while a session that starts
+    /// locked waits for its lock surface. A reload resets it.
+    pub fn set_clear_color(&self, color: impl Into<CompositionColor>) {
+        runtime::send(HostMessage::ClearColor(color.into().premultiplied()));
     }
 
     /// `create({ name?, width, height, scale? })`: add an output with no
