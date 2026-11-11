@@ -59,6 +59,7 @@ pub(crate) type WindowListener<E> = Rc<dyn Fn(Window, &E)>;
 pub(crate) struct Listeners {
     pub enable: Vec<RefListener<EnableEvent>>,
     pub disable: Vec<RefListener<DisableEvent>>,
+    pub reload: Vec<Rc<dyn Fn() -> Result<(), String>>>,
     pub open: Vec<Listener<Window>>,
     pub initial_configure: Vec<Listener<Window>>,
     pub first_commit: Vec<Listener<Window>>,
@@ -185,6 +186,9 @@ pub(crate) struct GlobalSignals {
     pub outputs: Signal<BTreeMap<String, WaylandOutputSnapshot>>,
     pub inputs: Signal<BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     pub layers: Signal<BTreeMap<String, WaylandLayerSnapshot>>,
+    /// The layers' ids as the core lists them: output by output, each
+    /// output's in the order it stacks them within one layer.
+    pub layer_order: Signal<Vec<String>>,
     pub keyboard_layout: Signal<Option<KeyboardLayoutSnapshot>>,
     pub keyboard_locks: Signal<Option<KeyboardLocksSnapshot>>,
 }
@@ -198,6 +202,7 @@ pub(crate) fn global() -> GlobalSignals {
                 outputs: scope.signal(BTreeMap::new()),
                 inputs: scope.signal(BTreeMap::new()),
                 layers: scope.signal(BTreeMap::new()),
+                layer_order: scope.signal(Vec::new()),
                 keyboard_layout: scope.signal(None),
                 keyboard_locks: scope.signal(None),
             }
