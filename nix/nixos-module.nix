@@ -179,6 +179,7 @@ in
       config.ShojiWM =
         {
           "org.freedesktop.impl.portal.ScreenCast" = [ "shojiwm" ];
+          "org.freedesktop.impl.portal.Screenshot" = [ "shojiwm" ];
         }
         // lib.optionalAttrs cfg.portal.gtkFallback {
           default = [ "gtk" ];
