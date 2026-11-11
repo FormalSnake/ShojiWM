@@ -50,11 +50,19 @@ region.
 
 ## Input
 
-- Text into the focused client: `wtype "text"`, `wtype -k Return`,
-  `wtype -M ctrl c -m ctrl`. Smithay delivers virtual-keyboard keys straight
-  to the focused client, so they never reach the compositor's key binds.
-- Compositor key binds and the pointer: not reachable yet; patch P10 on
-  `formal` adds them. This section changes when it lands.
+- Compositor key binds: `"$SHOJI_BIN" --key Super+Return` (or
+  `printf 'key Super+Return\n' | socat - UNIX-CONNECT:"$SHOJIWM_SOCKET"`).
+  The chord goes through the compositor's input path like a real keyboard:
+  binds, then the focused window. `code:<evdev code>` names a key by code
+  (`Super+code:2`). Answers `ok` once the event loop has run it, `error: ...`
+  for an unknown key.
+- Pointer: `wlrctl pointer move <dx> <dy>`, `wlrctl pointer click left`,
+  `wlrctl pointer scroll 0 3` (wlr-virtual-pointer, same path as a mouse:
+  focus on click, hot corners, grabs). Park it first with a large negative
+  move (`wlrctl pointer move -5000 -5000`) to start from the top-left corner.
+- Text into the focused client: `wtype "text"`, `wtype -k Return`. Smithay
+  delivers virtual-keyboard keys straight to the client, so `wtype` never
+  reaches a key bind; use `--key` for those.
 
 ## Talking to the session
 

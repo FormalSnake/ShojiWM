@@ -29,14 +29,19 @@ else
   set -- cargo "$@"
 fi
 
-if ! podman image exists shoji-build; then
-  podman build -t shoji-build - <<'D'
-FROM registry.opensuse.org/opensuse/tumbleweed
+# The image is rebuilt when this recipe changes. Fonts: the text layout
+# tests panic without a default font. /tmp/.X11-unix: the Xwayland tests
+# want it owned by root, as CI prepares it.
+recipe='FROM registry.opensuse.org/opensuse/tumbleweed
 RUN zypper -n in --no-recommends rustup clang gcc gcc-c++ make cmake pkgconf git-core curl tar gzip \
   wayland-devel wayland-protocols-devel libxkbcommon-devel systemd-devel libinput-devel \
   libgbm-devel Mesa-libEGL-devel libglvnd-devel libpixman-1-0-devel seatd-devel libdrm-devel \
-  liblcms2-devel libxcb-devel xcb-util-cursor-devel dbus-1-devel pipewire-devel
-D
+  liblcms2-devel libxcb-devel xcb-util-cursor-devel dbus-1-devel pipewire-devel \
+  fontconfig google-noto-sans-fonts dejavu-fonts
+RUN install -d -o root -g root -m 1777 /tmp/.X11-unix'
+recipe_id=$(printf '%s' "$recipe" | sha256sum | cut -c1-16)
+if [ "$(podman image inspect -f '{{index .Labels "shoji.recipe"}}' shoji-build 2>/dev/null)" != "$recipe_id" ]; then
+  printf '%s\nLABEL shoji.recipe=%s\n' "$recipe" "$recipe_id" | podman build -t shoji-build -
 fi
 
 mkdir -p "$HOME/shoji-cache/cargo" "$HOME/shoji-cache/rustup"
