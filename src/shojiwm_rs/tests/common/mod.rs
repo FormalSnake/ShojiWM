@@ -14,9 +14,12 @@ use smithay::{
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
-    protocol::{wl_compositor, wl_registry, wl_surface},
+    protocol::{wl_compositor, wl_registry, wl_seat, wl_surface},
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 pub struct Session {
@@ -212,5 +215,8 @@ ignore_events!(
     xdg_surface::XdgSurface,
     xdg_toplevel::XdgToplevel,
     zwlr_layer_shell_v1::ZwlrLayerShellV1,
-    zwlr_layer_surface_v1::ZwlrLayerSurfaceV1
+    zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    wl_seat::WlSeat,
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1
 );

@@ -75,9 +75,12 @@ region.
   `wlrctl pointer scroll 0 3` (wlr-virtual-pointer, same path as a mouse:
   focus on click, hot corners, grabs). Park it first with a large negative
   move (`wlrctl pointer move -5000 -5000`) to start from the top-left corner.
-- Text into the focused client: `wtype "text"`, `wtype -k Return`. Smithay
-  delivers virtual-keyboard keys straight to the client, so `wtype` never
-  reaches a key bind; use `--key` for those.
+- `wtype` (zwp_virtual_keyboard_v1) types text into the focused client and
+  fires key binds, matched by the keysyms of the keymap it uploads:
+  `wtype -M logo -k space -m logo`, `wtype -k F13`, and `code:` binds through
+  the layout's key for the same keysym (`wtype -M logo -k 1 -m logo` fires
+  `Super+code:10` on US). A stable older than the virtual keyboard commit
+  delivers wtype's keys to the client only; send binds with `--key` there.
 
 ## Talking to the session
 
