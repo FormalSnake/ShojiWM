@@ -462,11 +462,6 @@ fn refresh(entry: &Rc<WindowEntry>, force_full: bool) -> Refresh {
         resolve_window_effects(entry);
     }
     let full = force_full || dirty.full;
-    let managed_only = !full
-        && dirty.managed
-        && dirty.nodes.is_empty()
-        && dirty.uniforms.is_empty()
-        && !dirty.effects;
     let (patches, dirty_node_ids) = {
         let mut view = entry.view.borrow_mut();
         let view = view.as_mut().expect("composed above");
@@ -483,11 +478,16 @@ fn refresh(entry: &Rc<WindowEntry>, force_full: bool) -> Refresh {
     if full || dirty.managed {
         resolve_managed(entry);
     }
+    // The core takes an answer with neither a tree nor a patch for a
+    // mistake, and it asks about a closing window on every frame an
+    // animation runs, changed or not. Nothing of the tree to send is the
+    // managed state alone; new effects go with the tree as it stands.
+    let unchanged = !full && patches.is_empty();
     Refresh {
-        full,
+        full: full || (unchanged && dirty.effects),
         patches,
         dirty_node_ids,
-        managed_only,
+        managed_only: unchanged && !dirty.effects,
     }
 }
 

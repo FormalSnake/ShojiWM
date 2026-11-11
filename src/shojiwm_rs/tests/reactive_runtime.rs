@@ -309,6 +309,23 @@ fn reactive_config_round_trip() {
 }
 
 #[test]
+fn a_window_with_nothing_new_answers_with_its_managed_state_alone() {
+    let (mut runtime, _host) = start();
+    runtime
+        .evaluate_window(&snapshot("w1", "hello", true), 1)
+        .unwrap();
+    // The core asks about a closing window on every frame of an animation.
+    for now in [2, 3] {
+        let cached = runtime
+            .evaluate_cached_window("w1", None, now, false)
+            .unwrap();
+        assert!(cached.managed_window_only);
+        assert!(cached.node.is_none() && cached.node_patches.is_empty());
+        assert_eq!(cached.managed_window.rect.unwrap().width, 400.0);
+    }
+}
+
+#[test]
 fn timers_and_animations_drive_the_scheduler() {
     let host = RuntimeHost::detached();
     let args = CommonArgs::parse(&[], &[]);
