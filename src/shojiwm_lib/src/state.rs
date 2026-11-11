@@ -1640,6 +1640,7 @@ impl ShojiWM {
             crate::protocols::tearing_control::TearingControlManagerState::new::<Self>(&dh);
         let output_power_manager_state =
             crate::protocols::output_power::OutputPowerManagerState::new::<Self>(&dh);
+        crate::protocols::virtual_pointer::VirtualPointerManagerState::new::<Self>(&dh);
         let color_management_state =
             crate::protocols::color_management::ColorManagementState::new::<Self>(&dh);
         let foreign_toplevel_list_state =
@@ -3205,6 +3206,7 @@ impl ShojiWM {
             output_name: None,
             plasma: None,
             minimized_geometry: None,
+            foreign_toplevel_id: None,
             id: "__warmup__".into(),
             title: "warmup".into(),
             app_id: Some("shoji_wm.warmup".into()),
