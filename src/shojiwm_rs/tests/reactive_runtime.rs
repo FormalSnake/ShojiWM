@@ -938,3 +938,78 @@ fn a_reload_asks_the_config_to_read_its_data_again() {
     assert_eq!(bindings(&host), None);
     assert!(runtime.invoke_key_binding("second", 0).unwrap().invoked);
 }
+
+#[test]
+fn layers_are_listed_from_the_bottom_of_the_stack_to_its_top() {
+    use shojiwm_rs::ssd::{
+        WaylandLayerSnapshot,
+        window_model::{
+            KeyboardInteractivitySnapshot, LayerAnchorSnapshot, LayerDesiredSizeSnapshot,
+            LayerExclusiveZoneSnapshot, LayerKindSnapshot, LayerMarginSnapshot,
+            LayerPositionSnapshot,
+        },
+    };
+
+    let layer = |id: &str, kind: LayerKindSnapshot| WaylandLayerSnapshot {
+        id: id.into(),
+        namespace: Some(id.into()),
+        layer: kind,
+        output_name: "DP-1".into(),
+        position: LayerPositionSnapshot {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 32,
+        },
+        anchor: LayerAnchorSnapshot {
+            top: true,
+            bottom: false,
+            left: true,
+            right: true,
+        },
+        exclusive_zone: LayerExclusiveZoneSnapshot::Neutral,
+        exclusive_edge: None,
+        margin: LayerMarginSnapshot {
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 0,
+        },
+        keyboard_interactivity: KeyboardInteractivitySnapshot::None,
+        desired_size: LayerDesiredSizeSnapshot::default(),
+    };
+    let ids = || -> Vec<String> {
+        COMPOSITOR
+            .layer
+            .stacked()
+            .into_iter()
+            .map(|layer| layer.id)
+            .collect()
+    };
+
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime =
+        RuntimeBoot::new(Box::new(ConfigBuilder::new(|| {})), &args).launch(host.clone());
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+
+    // The ids sort the other way round, and the core lists the bar first.
+    let first = [
+        layer("z-bar", LayerKindSnapshot::Top),
+        layer("y-osd", LayerKindSnapshot::Overlay),
+        layer("x-wallpaper", LayerKindSnapshot::Background),
+        layer("a-dock", LayerKindSnapshot::Top),
+    ];
+    runtime.evaluate_layer_effects("DP-1", &first, 0).unwrap();
+    assert_eq!(ids(), ["x-wallpaper", "z-bar", "a-dock", "y-osd"]);
+
+    // The same surfaces stacked the other way within the top layer.
+    let second = [
+        layer("a-dock", LayerKindSnapshot::Top),
+        layer("z-bar", LayerKindSnapshot::Top),
+        layer("x-wallpaper", LayerKindSnapshot::Background),
+    ];
+    runtime.evaluate_layer_effects("DP-1", &second, 0).unwrap();
+    assert_eq!(ids(), ["x-wallpaper", "a-dock", "z-bar"]);
+}
