@@ -87,6 +87,14 @@ fn vt_switch_target(
     }
 }
 
+impl ShojiWM {
+    /// The keycode `code:` binds compare for `handle`'s key.
+    fn bind_keycode(&self, handle: &smithay::input::keyboard::KeysymHandle<'_>) -> u32 {
+        self.bind_keycode_override
+            .unwrap_or_else(|| handle.raw_code().raw())
+    }
+}
+
 fn compositor_pointer_grab_start_data(
     focus: Option<(WlSurface, Point<f64, Logical>)>,
     button: u32,
@@ -341,10 +349,9 @@ impl ShojiWM {
                 if let Some(vt) = vt_switch_target(modifiers, &handle).filter(|_| pressed) {
                     return FilterResult::Intercept(KeyboardAction::ChangeVt(vt));
                 }
-                match locked_bindings
-                    .iter()
-                    .find(|binding| binding.matches(phase, modifiers, &handle))
-                {
+                match locked_bindings.iter().find(|binding| {
+                    binding.matches(phase, modifiers, &handle, data.bind_keycode(&handle))
+                }) {
                     Some(binding) => FilterResult::Intercept(KeyboardAction::RuntimeKeyBinding(
                         binding.id.clone(),
                     )),
@@ -1293,7 +1300,14 @@ impl ShojiWM {
 
                             if let Some(binding_id) = runtime_key_bindings
                                 .iter()
-                                .find(|binding| binding.matches(key_phase, modifiers, &handle))
+                                .find(|binding| {
+                                    binding.matches(
+                                        key_phase,
+                                        modifiers,
+                                        &handle,
+                                        data.bind_keycode(&handle),
+                                    )
+                                })
                                 .map(|binding| binding.id.clone())
                             {
                                 return FilterResult::Intercept(KeyboardAction::RuntimeKeyBinding(

@@ -81,7 +81,6 @@ use smithay::{
         socket::ListeningSocketSource,
         text_input::TextInputManagerState,
         viewporter::ViewporterState,
-        virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::XdgActivationState,
         xwayland_shell::XWaylandShellState,
     },
@@ -514,6 +513,16 @@ pub struct ShojiWM {
     pub runtime_window_resize_modifier: Option<RuntimePointerModifier>,
     pub runtime_input_config: RuntimeInputConfig,
     pub runtime_applied_xkb_config: Option<crate::runtime_input::RuntimeKeyboardInputConfig>,
+    pub virtual_keyboards: HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        crate::virtual_keyboard::VirtualKeyboard,
+    >,
+    /// Set while the seat runs a virtual keyboard's keymap.
+    pub active_virtual_keymap: Option<crate::virtual_keyboard::ActiveVirtualKeymap>,
+    pub next_virtual_keymap_serial: u64,
+    /// The keycode `code:` binds compare for the key being processed, when it
+    /// is not the key's own (a virtual keyboard's key).
+    pub bind_keycode_override: Option<u32>,
     pub runtime_active_keyboard_device: Option<RuntimeInputDeviceSnapshot>,
     pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
     pub runtime_libinput_devices: HashMap<String, input::Device>,
@@ -1685,7 +1694,7 @@ impl ShojiWM {
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
-        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        crate::protocols::virtual_keyboard::VirtualKeyboardManagerState::new::<Self>(&dh);
         RelativePointerManagerState::new::<Self>(&dh);
         PointerConstraintsState::new::<Self>(&dh);
 
@@ -1944,6 +1953,10 @@ impl ShojiWM {
             runtime_window_resize_modifier: None,
             runtime_input_config: Default::default(),
             runtime_applied_xkb_config: None,
+            virtual_keyboards: HashMap::new(),
+            active_virtual_keymap: None,
+            next_virtual_keymap_serial: 0,
+            bind_keycode_override: None,
             runtime_active_keyboard_device: None,
             runtime_input_devices: Default::default(),
             runtime_libinput_devices: Default::default(),
@@ -3217,6 +3230,7 @@ impl ShojiWM {
 
     pub fn warmup_decoration_runtime(&mut self) {
         let snapshot = WaylandWindowSnapshot {
+            pid: None,
             output_name: None,
             plasma: None,
             minimized_geometry: None,
@@ -5887,6 +5901,17 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub xwayland_refresh_override: bool,
     identity: WaylandClientIdentity,
+}
+
+/// The pid of the process behind a Wayland client, from its socket
+/// credentials. `None` for an Xwayland bridge such as xwayland-satellite: the
+/// windows it carries belong to the X11 clients behind it.
+pub(crate) fn client_pid(client: &smithay::reexports::wayland_server::Client) -> Option<i32> {
+    let data = client.get_data::<ClientState>()?;
+    if data.xwayland_refresh_override {
+        return None;
+    }
+    data.identity.pid
 }
 
 impl ClientData for ClientState {

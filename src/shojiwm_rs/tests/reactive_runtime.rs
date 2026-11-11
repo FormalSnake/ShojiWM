@@ -18,6 +18,7 @@ static WIDTH: WindowStateKey<f64> = WindowStateKey::new("width", |_| 400.0);
 
 fn snapshot(id: &str, title: &str, focused: bool) -> WaylandWindowSnapshot {
     WaylandWindowSnapshot {
+        pid: None,
         output_name: None,
         plasma: None,
         minimized_geometry: None,
@@ -968,6 +969,7 @@ fn layers_are_listed_from_the_bottom_of_the_stack_to_its_top() {
     };
 
     let layer = |id: &str, kind: LayerKindSnapshot| WaylandLayerSnapshot {
+        pid: None,
         id: id.into(),
         namespace: Some(id.into()),
         layer: kind,
