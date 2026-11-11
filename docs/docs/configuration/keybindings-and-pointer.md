@@ -29,6 +29,10 @@ Combine modifiers and a key with `+`:
 - **Modifiers:** `Super`, `Ctrl`, `Shift`, `Alt`
 - **Keys:** letters (`T`, `Q`), arrows (`Left`, `Right`, `Up`, `Down`),
   function keys (`F`), etc.
+- **Key codes:** `code:<xkb keycode>` names the physical key, whatever the
+  layout puts on it; the code is the evdev code plus 8, as `wev` prints it.
+  On a layout whose number row gives symbols without Shift (French AZERTY),
+  `Super+code:10` to `Super+code:19` still mean the keys marked 1 to 0.
 - **Mouse side buttons:** `MouseBack` (`BTN_SIDE`, 275) and `MouseForward`
   (`BTN_EXTRA`, 276). Names are case-insensitive and use the default
   `on: "press"` phase. Release-only side-button bindings are rejected.
@@ -135,7 +139,7 @@ the socket is derived from `WAYLAND_DISPLAY`.
 compositor, as if it came from a keyboard: it reaches your key bindings, the
 built-in `Super+Shift+Q`/`Super+Shift+R`, and then the focused window. Chords
 use the binding syntax (`Super+Shift+Return`, `Ctrl+c`); the key is a keysym
-looked up on the active layout, and `code:<evdev code>` names a key by its
+looked up on the active layout, and `code:<xkb keycode>` names a key by its
 code. A keysym that needs Shift on the layout gets Shift added. `--hold <ms>`
 keeps the chord down that long before releasing it, which is enough for key
 repeat and [repeating bindings](#repeating-and-locked-bindings).

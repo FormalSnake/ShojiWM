@@ -329,9 +329,10 @@ fn modifier_code(name: &str) -> Option<u32> {
 }
 
 /// The key presses a chord such as `Super+Shift+Return`, `Ctrl+c` or
-/// `Super+code:2` stands for, as xkb keycodes in press order. The key is a
-/// keysym name looked up in `keymap`'s `layout`, or `code:<evdev code>`. A
-/// keysym only on the shifted level adds Shift.
+/// `Super+code:10` stands for, as xkb keycodes in press order. The key is a
+/// keysym name looked up in `keymap`'s `layout`, or `code:<xkb keycode>` (the
+/// evdev code plus 8, as `wev` prints it). A keysym only on the shifted level
+/// adds Shift.
 pub fn resolve_chord(
     chord: &str,
     keymap: &xkb::Keymap,
@@ -353,7 +354,9 @@ pub fn resolve_chord(
     }
     let key_code = if let Some(code) = key.strip_prefix("code:") {
         code.parse::<u32>()
-            .map_err(|_| format!("bad key code {code:?}"))?
+            .ok()
+            .and_then(|code| code.checked_sub(8))
+            .ok_or_else(|| format!("bad xkb keycode {code:?}"))?
     } else if let Some(code) = modifier_code(key) {
         code
     } else {
@@ -537,7 +540,7 @@ mod tests {
     fn key_codes_and_lone_modifiers() {
         let keymap = us_keymap();
         assert_eq!(
-            evdev(resolve_chord("Super+code:3", &keymap, 0).unwrap()),
+            evdev(resolve_chord("Super+code:11", &keymap, 0).unwrap()),
             vec![KEY_LEFTMETA, 3]
         );
         assert_eq!(
@@ -553,6 +556,7 @@ mod tests {
         assert!(resolve_chord("Super+", &keymap, 0).is_err());
         assert!(resolve_chord("Super+NotAKey", &keymap, 0).is_err());
         assert!(resolve_chord("code:x", &keymap, 0).is_err());
+        assert!(resolve_chord("code:7", &keymap, 0).is_err());
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Key binding options reach the compositor with the binding.
+//! Key binding options and keycode shortcuts reach the compositor with the
+//! binding.
 
 use shojiwm_rs::{HostMessage, RuntimeBoot, RuntimeHost, cli::CommonArgs, prelude::*};
 
@@ -10,6 +11,8 @@ fn setup() {
         || {},
     );
     COMPOSITOR.key.bind("plain", "Super+T", || {});
+    COMPOSITOR.key.bind("by-code", "Super+code:10", || {});
+    COMPOSITOR.key.bind("bad-code", "Super+code:7", || {});
     // Not valid: a tap cannot repeat, so it is not registered.
     COMPOSITOR.key.bind_with(
         "tap",
@@ -39,5 +42,12 @@ fn locked_and_repeat_are_sent_with_the_binding() {
         .iter()
         .map(|entry| (entry.id.as_str(), entry.locked, entry.repeat))
         .collect::<Vec<_>>();
-    assert_eq!(flags, [("louder", true, true), ("plain", false, false)]);
+    assert_eq!(
+        flags,
+        [
+            ("louder", true, true),
+            ("plain", false, false),
+            ("by-code", false, false)
+        ]
+    );
 }
