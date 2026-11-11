@@ -119,6 +119,25 @@ shared in `~/shoji-cache`. The container has network for git dependencies.
 your own trees elsewhere under `~`. Two builds of one tree queue on cargo's
 lock. Use `-p`, not `--workspace`, unless you want the portal too.
 
+### Disk
+
+`/` is 120G shared by every slot's agents, and a build that fills it kills
+everyone's links. `shoji-cargo.sh` refuses to start with under 15G free; when
+it does, clean your own trees (never another agent's, never under a running
+build: check `pgrep -fa 'cargo|rustc'` first), then retry:
+
+- Check `df -h /` before a build, and `du -xh -d 2 <tree>/target | sort -h`
+  to see what is yours.
+- Checkouts of other branches (PR branches, worktrees) build into one shared
+  `CARGO_TARGET_DIR` per agent, not a `target/` each, so dependencies are
+  compiled once: `CARGO_TARGET_DIR=~/shoji-pr/target ~/shoji-cargo.sh <tree> test ...`.
+- Delete what nothing builds any more: a profile you stopped using, the
+  `incremental/` dirs, and a branch checkout with its artifacts once its
+  tests passed and its PR is open.
+- `cargo test` (dev) and `--profile release-fast` cannot share dependency
+  artifacts (debug assertions differ), so a tree holds both at most; do not
+  add more profiles.
+
 ## The stable compositor
 
 `~/shoji-stable/` holds `bin/shoji_wm`, `runtime/` (`packages/shoji_wm` and

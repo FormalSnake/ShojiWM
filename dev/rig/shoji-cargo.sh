@@ -12,6 +12,7 @@
 #   shoji-cargo.sh ~/ShojiWM test -p shojiwm_lib runtime_key_binding
 #   shoji-cargo.sh ~/formalwm/wm build --release
 #   shoji-cargo.sh ~/ShojiWM -- bash -c 'cargo fmt --check'
+#   CARGO_TARGET_DIR=~/shoji-pr/target shoji-cargo.sh ~/shoji-pr/src/<branch> test -p shojiwm_rs
 set -euo pipefail
 if [ $# -lt 2 ]; then
   sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -44,10 +45,19 @@ if [ "$(podman image inspect -f '{{index .Labels "shoji.recipe"}}' shoji-build 2
   printf '%s\nLABEL shoji.recipe=%s\n' "$recipe" "$recipe_id" | podman build -t shoji-build -
 fi
 
+# The guest's / is shared by every slot's agents; a build that fills it kills
+# everyone's links mid-way.
+free_gb=$(df --output=avail -BG "$HOME" | tail -1 | tr -dc 0-9)
+if [ "$free_gb" -lt 15 ]; then
+  echo "shoji-cargo: only ${free_gb}G free on $(df --output=target "$HOME" | tail -1); clean your own target/ dirs first (see ~/RIG.md, Disk)" >&2
+  exit 3
+fi
+
 mkdir -p "$HOME/shoji-cache/cargo" "$HOME/shoji-cache/rustup"
 tty_flag=()
 [ -t 0 ] && [ -t 1 ] && tty_flag=(-t)
 exec podman run --rm -i ${tty_flag[@]+"${tty_flag[@]}"} --userns=keep-id --security-opt label=disable \
   -v "$HOME:$HOME" -e CARGO_HOME="$HOME/shoji-cache/cargo" -e RUSTUP_HOME="$HOME/shoji-cache/rustup" \
-  -e HOME=/tmp -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-auto}" -w "$src" shoji-build \
+  -e HOME=/tmp -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-auto}" \
+  ${CARGO_TARGET_DIR:+-e CARGO_TARGET_DIR="$CARGO_TARGET_DIR"} -w "$src" shoji-build \
   bash -c 'rustup toolchain list | grep -q stable || rustup default stable >/dev/null; rustup component list --installed | grep -q rustfmt || rustup component add rustfmt >/dev/null; exec "$@"' -- "$@"
