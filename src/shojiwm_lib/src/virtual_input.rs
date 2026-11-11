@@ -371,7 +371,10 @@ pub fn resolve_chord(
         code
     };
     codes.push(key_code);
-    Ok(codes.into_iter().map(|code| Keycode::new(code + 8)).collect())
+    Ok(codes
+        .into_iter()
+        .map(|code| Keycode::new(code + 8))
+        .collect())
 }
 
 /// The lowest evdev code producing `keysym` on `layout`, and its level
@@ -479,7 +482,10 @@ mod tests {
             evdev(resolve_chord("Super+Shift+Return", &keymap, 0).unwrap()),
             vec![KEY_LEFTMETA, KEY_LEFTSHIFT, 28]
         );
-        assert_eq!(evdev(resolve_chord("ctrl+c", &keymap, 0).unwrap()), vec![KEY_LEFTCTRL, 46]);
+        assert_eq!(
+            evdev(resolve_chord("ctrl+c", &keymap, 0).unwrap()),
+            vec![KEY_LEFTCTRL, 46]
+        );
     }
 
     #[test]
@@ -498,8 +504,14 @@ mod tests {
     #[test]
     fn key_codes_and_lone_modifiers() {
         let keymap = us_keymap();
-        assert_eq!(evdev(resolve_chord("Super+code:3", &keymap, 0).unwrap()), vec![KEY_LEFTMETA, 3]);
-        assert_eq!(evdev(resolve_chord("Super", &keymap, 0).unwrap()), vec![KEY_LEFTMETA]);
+        assert_eq!(
+            evdev(resolve_chord("Super+code:3", &keymap, 0).unwrap()),
+            vec![KEY_LEFTMETA, 3]
+        );
+        assert_eq!(
+            evdev(resolve_chord("Super", &keymap, 0).unwrap()),
+            vec![KEY_LEFTMETA]
+        );
     }
 
     #[test]
@@ -518,21 +530,39 @@ mod tests {
         frame.add_discrete(Axis::Vertical, 15.0, 1);
         frame.add_discrete(Axis::Vertical, 15.0, 1);
         frame.stop(Axis::Horizontal);
-        assert_eq!(frame.vertical, AxisAmount { value: Some(30.0), v120: Some(240.0) });
-        assert_eq!(frame.horizontal, AxisAmount { value: Some(0.0), v120: None });
+        assert_eq!(
+            frame.vertical,
+            AxisAmount {
+                value: Some(30.0),
+                v120: Some(240.0)
+            }
+        );
+        assert_eq!(
+            frame.horizontal,
+            AxisAmount {
+                value: Some(0.0),
+                v120: None
+            }
+        );
         assert!(!frame.is_empty());
     }
 
     #[test]
     fn absolute_motion_maps_onto_the_layout_or_one_output() {
         let layout = Rectangle::new((0, 0).into(), (3000, 1000).into());
-        assert_eq!(absolute_fraction(50, 25, 100, 100, None, layout), Some((0.5, 0.25)));
+        assert_eq!(
+            absolute_fraction(50, 25, 100, 100, None, layout),
+            Some((0.5, 0.25))
+        );
         let right = Rectangle::new((1000, 0).into(), (2000, 1000).into());
         assert_eq!(
             absolute_fraction(50, 100, 100, 100, Some(right), layout),
             Some((2000.0 / 3000.0, 1.0))
         );
-        assert_eq!(absolute_fraction(200, 0, 100, 100, None, layout), Some((1.0, 0.0)));
+        assert_eq!(
+            absolute_fraction(200, 0, 100, 100, None, layout),
+            Some((1.0, 0.0))
+        );
         assert_eq!(absolute_fraction(1, 1, 0, 100, None, layout), None);
     }
 }

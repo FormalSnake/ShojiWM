@@ -234,7 +234,10 @@ mod tests {
             Command::Reload,
             Command::Key("Super+Shift+Return".into()),
         ] {
-            assert_eq!(Command::parse(&format!("{}\n", command.to_line())), Some(command));
+            assert_eq!(
+                Command::parse(&format!("{}\n", command.to_line())),
+                Some(command)
+            );
         }
     }
 
@@ -242,7 +245,10 @@ mod tests {
     fn key_needs_a_chord() {
         assert_eq!(Command::parse("key"), None);
         assert_eq!(Command::parse("key   "), None);
-        assert_eq!(Command::parse(" key  ctrl+c \n"), Some(Command::Key("ctrl+c".into())));
+        assert_eq!(
+            Command::parse(" key  ctrl+c \n"),
+            Some(Command::Key("ctrl+c".into()))
+        );
         assert_eq!(Command::parse("press a"), None);
     }
 }
