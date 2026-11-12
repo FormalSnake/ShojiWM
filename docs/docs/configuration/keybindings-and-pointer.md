@@ -157,7 +157,10 @@ The pointer under the lock reaches a lock surface or nothing, also where no lock
 surface has mapped yet: a button held in a window when the lock goes up comes
 up in that window at once, a drag is cancelled and a pointer lock lets go.
 Under the lock no other client can open a menu grab, start a drag, set the
-cursor, lock the pointer or be activated, and a panel mapped on demand behind
+cursor, lock the pointer or be activated; its input method gets no keyboard
+grab (the grab object exists and hears nothing, so the input method grabs
+again when it is next activated), cannot write into the locker's text input,
+and shows no popup over the lock screen; and a panel mapped on demand behind
 the lock screen does not take the keyboard at the unlock. A button held on the
 lock screen at the unlock comes up there, and its own release goes nowhere.
 `nonConsuming: true` runs the handler and still delivers the key or the button

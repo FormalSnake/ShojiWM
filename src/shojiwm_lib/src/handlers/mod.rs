@@ -842,6 +842,11 @@ impl ShojiWM {
 
 impl InputMethodHandler for ShojiWM {
     fn new_popup(&mut self, surface: PopupSurface) {
+        // Its parent is the locker's text input: it would map over the lock
+        // screen. Smithay offers it again on the next activation.
+        if self.session_lock_active && !self.of_session_locker(&surface.wl_surface().id()) {
+            return;
+        }
         self.position_input_method_popup(&surface);
         let popup_kind = PopupKind::from(surface);
         if let Err(err) = self.popups.track_popup(popup_kind.clone()) {

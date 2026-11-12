@@ -904,11 +904,19 @@ impl ShojiWM {
         &self,
         object: &smithay::reexports::wayland_server::backend::ObjectId,
     ) -> bool {
+        self.display_handle
+            .get_client(object.clone())
+            .is_ok_and(|client| self.client_holds_session_lock(&client.id()))
+    }
+
+    pub(crate) fn client_holds_session_lock(
+        &self,
+        client: &smithay::reexports::wayland_server::backend::ClientId,
+    ) -> bool {
         self.session_locker
             .as_ref()
             .and_then(|locker| locker.client())
-            .zip(self.display_handle.get_client(object.clone()).ok())
-            .is_some_and(|(locker, client)| locker.id() == client.id())
+            .is_some_and(|locker| &locker.id() == client)
     }
 
     pub fn session_lock_surface_for_output(&self, output: &Output) -> Option<LockSurface> {

@@ -30,10 +30,14 @@ use wayland_client::{
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_wm_base};
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::{
         zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
+        zwp_input_popup_surface_v2,
     },
     zwp_virtual_keyboard_v1::client::{
         zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
@@ -84,6 +88,10 @@ thread_local! {
     static LOCK_SIZE: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
     static GRAB: RefCell<Option<InputGrab>> = const { RefCell::new(None) };
     static BUTTON_SERIAL: Cell<u32> = const { Cell::new(0) };
+    /// Every event an input method's keyboard grab was sent, by name.
+    static IM_GRAB_EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    /// What the locker's text input was sent, by name.
+    static LOCKER_TEXT: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
 fn fired(name: &'static str) -> impl Fn() + 'static {
@@ -512,7 +520,7 @@ fn an_input_method_that_grabs_the_keyboard_under_the_lock_hears_no_key() {
     grab_again(&mut session, im, &input_method);
     press(&mut session, K);
     release(&mut session, K);
-    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    assert_eq!(take(&IM_SEEN), vec![]);
     assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
     unlock(&mut session, locked);
 }
@@ -530,7 +538,7 @@ fn an_input_method_that_grabs_again_under_the_lock_hears_no_release_the_lock_mak
     session.roundtrip();
     session.state.resume_input_session();
     session.roundtrip();
-    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    assert_eq!(take(&IM_SEEN), vec![]);
     assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
     unlock(&mut session, locked);
 }
@@ -962,6 +970,118 @@ fn keys_held_across_a_vt_switch_are_let_go_and_pressed_anew() {
     );
 }
 
+/// The locker's text input, enabled on its lock surface.
+fn locker_text_input(session: &mut common::Session) -> zwp_text_input_v3::ZwpTextInputV3 {
+    let locker = session
+        .peers
+        .iter()
+        .position(|peer| peer.client.name == "locker")
+        .unwrap();
+    let peer = &session.peers[locker];
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let manager: zwp_text_input_manager_v3::ZwpTextInputManagerV3 =
+        peer.bind("zwp_text_input_manager_v3", 1);
+    let text_input = manager.get_text_input(&seat, &peer.queue.handle(), ());
+    session.roundtrip();
+    text_input.enable();
+    text_input.commit();
+    session.roundtrip();
+    text_input
+}
+
+/// An input method that held the keyboard before the lock, and one asked
+/// for under it, poll the modifiers through fresh grabs while the user types
+/// the password with Shift.
+#[test]
+fn an_input_method_gets_no_keyboard_grab_under_the_lock() {
+    let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
+    let locked = lock(&mut session);
+    take(&IM_GRAB_EVENTS);
+
+    press(&mut session, SHIFT);
+    for _ in 0..3 {
+        grab_again(&mut session, im, &input_method);
+    }
+    let peer = &session.peers[im];
+    let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let second = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    second.grab_keyboard(&peer.queue.handle(), ());
+    session.roundtrip();
+    release(&mut session, SHIFT);
+    press(&mut session, K);
+    release(&mut session, K);
+    assert_eq!(take(&IM_GRAB_EVENTS), Vec::<&str>::new());
+    assert_eq!(take(&IM_SEEN), vec![]);
+    unlock(&mut session, locked);
+
+    // Activated again after the unlock, it grabs as usual.
+    grab_again(&mut session, im, &input_method);
+    press(&mut session, A);
+    release(&mut session, A);
+    assert_eq!(
+        take(&IM_SEEN),
+        vec![Seen::Mods(0), Seen::Down(A), Seen::Up(A)]
+    );
+}
+
+/// Another client's input method commits text while the locker's password
+/// field has a text input enabled.
+#[test]
+fn an_input_method_cannot_type_into_the_lockers_text_input() {
+    let mut session = focused_session();
+    let (_im, input_method) = input_method(&mut session);
+    let locked = lock(&mut session);
+    let _text_input = locker_text_input(&mut session);
+    let seen = take(&LOCKER_TEXT);
+    assert!(
+        seen.contains(&"enter"),
+        "the locker's text input has no focus: {seen:?}"
+    );
+
+    input_method.set_preedit_string("hun".into(), 0, 3);
+    input_method.commit_string("hunter2".into());
+    input_method.delete_surrounding_text(4, 0);
+    input_method.commit(1);
+    session.roundtrip();
+    assert_eq!(take(&LOCKER_TEXT), Vec::<&str>::new());
+    unlock(&mut session, locked);
+}
+
+/// Another client's input method maps its candidate popup while the
+/// locker's text input is enabled: it would show over the lock screen.
+#[test]
+fn an_input_method_popup_does_not_map_over_the_lock() {
+    let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
+    let locked = lock(&mut session);
+    let _text_input = locker_text_input(&mut session);
+
+    let peer = &session.peers[im];
+    let compositor: wl_compositor::WlCompositor = peer.bind("wl_compositor", 1);
+    let surface = compositor.create_surface(&peer.queue.handle(), ());
+    input_method.get_input_popup_surface(&surface, &peer.queue.handle(), ());
+    session.roundtrip();
+    session.peers[im].attach_buffer(&surface, 40, 20);
+    session.roundtrip();
+    let lock_surface = session
+        .state
+        .session_lock_surfaces
+        .values()
+        .next()
+        .unwrap()
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        smithay::desktop::PopupManager::popups_for_surface(&lock_surface).count(),
+        0,
+        "an input method popup is tracked over the lock surface"
+    );
+    unlock(&mut session, locked);
+}
+
 fn seen_key(key: u32, state: WEnum<wl_keyboard::KeyState>) -> Seen {
     match state {
         WEnum::Value(wl_keyboard::KeyState::Pressed) => Seen::Down(key),
@@ -1026,6 +1146,15 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        IM_GRAB_EVENTS.with(|events| {
+            events.borrow_mut().push(match &event {
+                zwp_input_method_keyboard_grab_v2::Event::Keymap { .. } => "keymap",
+                zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { .. } => "repeat_info",
+                zwp_input_method_keyboard_grab_v2::Event::Modifiers { .. } => "modifiers",
+                zwp_input_method_keyboard_grab_v2::Event::Key { .. } => "key",
+                _ => "other",
+            })
+        });
         let seen = match event {
             zwp_input_method_keyboard_grab_v2::Event::Key { key, state, .. } => {
                 seen_key(key, state)
@@ -1036,6 +1165,30 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
             _ => return,
         };
         IM_SEEN.with(|seen_list| seen_list.borrow_mut().push(seen));
+    }
+}
+
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for common::Client {
+    fn event(
+        client: &mut Self,
+        _: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if client.name != "locker" {
+            return;
+        }
+        let name = match event {
+            zwp_text_input_v3::Event::Enter { .. } => "enter",
+            zwp_text_input_v3::Event::CommitString { .. } => "commit_string",
+            zwp_text_input_v3::Event::PreeditString { .. } => "preedit_string",
+            zwp_text_input_v3::Event::DeleteSurroundingText { .. } => "delete_surrounding_text",
+            zwp_text_input_v3::Event::Done { .. } => "done",
+            _ => return,
+        };
+        LOCKER_TEXT.with(|seen| seen.borrow_mut().push(name));
     }
 }
 
@@ -1074,5 +1227,7 @@ ignore_events!(
     ext_session_lock_manager_v1::ExtSessionLockManagerV1,
     ext_session_lock_v1::ExtSessionLockV1,
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-    zwp_input_method_v2::ZwpInputMethodV2
+    zwp_input_method_v2::ZwpInputMethodV2,
+    zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3
 );
