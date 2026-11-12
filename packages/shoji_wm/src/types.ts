@@ -385,6 +385,17 @@ export interface WaylandWindow {
    */
   focus(): void;
   /**
+   * Like `focus()`, for a window the user asked for by name: a pick in a dock
+   * or a switcher the config serves, a request over its socket. `focus()` is
+   * refused for a window that opened before the one that has the keyboard
+   * while the user has used neither; this is not.
+   * `focus()` と同じですが、ユーザーが名指しで求めたウィンドウ用です（設定が
+   * 提供するドックやスイッチャーでの選択、ソケット経由の要求など）。どちらの
+   * ウィンドウもまだ使われていない間、キーボードを持つウィンドウより先に開いた
+   * ウィンドウへの `focus()` は拒否されますが、こちらは拒否されません。
+   */
+  focusOnRequest(): void;
+  /**
    * Take keyboard focus from this window if it has it; no window has it
    * then, until one is focused. A layer surface holding the keyboard keeps it.
    * このウィンドウがキーボードフォーカスを持っていれば外します。その後は別の
@@ -3880,6 +3891,7 @@ export interface WaylandWindowActions {
   fullscreen(): void;
   unfullscreen(): void;
   focus(): void;
+  focusOnRequest(): void;
   unfocus(): void;
   scheduleAnimation(options: ManagedWindowScheduleAnimationOptions): void;
   cancelAnimation(channel?: string): void;

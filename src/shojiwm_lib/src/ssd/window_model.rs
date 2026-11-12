@@ -1491,6 +1491,8 @@ mod tests {
         let minimize =
             serde_json::to_string(&WaylandWindowAction::Minimize).expect("serialize minimize");
         let focus = serde_json::to_string(&WaylandWindowAction::Focus).expect("serialize focus");
+        let focus_on_request = serde_json::to_string(&WaylandWindowAction::FocusOnRequest)
+            .expect("serialize focus on request");
         let unfocus =
             serde_json::to_string(&WaylandWindowAction::Unfocus).expect("serialize unfocus");
         let schedule_animation = serde_json::to_string(&WaylandWindowAction::ScheduleAnimation)
@@ -1504,6 +1506,7 @@ mod tests {
         assert_eq!(unmaximize, "\"unmaximize\"");
         assert_eq!(minimize, "\"minimize\"");
         assert_eq!(focus, "\"focus\"");
+        assert_eq!(focus_on_request, "\"focusOnRequest\"");
         assert_eq!(unfocus, "\"unfocus\"");
         assert_eq!(schedule_animation, "\"scheduleAnimation\"");
         assert_eq!(cancel_animation, "\"cancelAnimation\"");

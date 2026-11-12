@@ -216,6 +216,7 @@ export function createReactiveWindow(
     fullscreen: actions.fullscreen,
     unfullscreen: actions.unfullscreen,
     focus: actions.focus,
+    focusOnRequest: actions.focusOnRequest,
     unfocus: actions.unfocus,
     scheduleAnimation: actions.scheduleAnimation,
     cancelAnimation: actions.cancelAnimation,
