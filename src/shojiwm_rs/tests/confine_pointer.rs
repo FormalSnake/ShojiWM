@@ -34,14 +34,19 @@ fn device() -> VirtualDevice {
     }
 }
 
-/// Puts the pointer at the centre of the only window, focuses that window,
-/// then moves the pointer far to the right. Returns the window's right edge
-/// and where the pointer ended up.
-fn push_pointer_out(session: &mut common::Session) -> (f64, f64) {
+/// Puts the pointer at the centre of the only window, focuses that window
+/// (and takes the focus away again when `unfocus`), then moves the pointer
+/// far to the right. Returns the window's right edge and where the pointer
+/// ended up.
+fn push_pointer_out(session: &mut common::Session, unfocus: bool) -> (f64, f64) {
     session.map_toplevel_with_buffer("game", 300, 200);
     session.state.refresh_window_decorations().unwrap();
     COMPOSITOR.window.list()[0].focus();
     session.roundtrip();
+    if unfocus {
+        COMPOSITOR.window.list()[0].unfocus();
+        session.roundtrip();
+    }
     session.state.refresh_window_decorations().unwrap();
 
     let window = session.state.space.elements().next().cloned().unwrap();
@@ -78,7 +83,7 @@ fn push_pointer_out(session: &mut common::Session) -> (f64, f64) {
 fn the_pointer_stops_at_the_edge_of_a_confining_window() {
     CONFINE.with(|confine| confine.set(true));
     let mut session = common::Session::new(setup);
-    let (right, x) = push_pointer_out(&mut session);
+    let (right, x) = push_pointer_out(&mut session, false);
     assert!(x < right, "pointer at {x} left a window ending at {right}");
     assert!(x > right - 1.0, "pointer at {x} stopped short of {right}");
 }
@@ -87,9 +92,20 @@ fn the_pointer_stops_at_the_edge_of_a_confining_window() {
 fn without_the_prop_the_pointer_leaves_the_window() {
     CONFINE.with(|confine| confine.set(false));
     let mut session = common::Session::new(setup);
-    let (right, x) = push_pointer_out(&mut session);
+    let (right, x) = push_pointer_out(&mut session, false);
     assert!(
         x > right,
         "pointer at {x} stayed inside a window ending at {right}"
+    );
+}
+
+#[test]
+fn an_unfocused_confining_window_lets_the_pointer_go() {
+    CONFINE.with(|confine| confine.set(true));
+    let mut session = common::Session::new(setup);
+    let (right, x) = push_pointer_out(&mut session, true);
+    assert!(
+        x > right,
+        "pointer at {x} stayed inside an unfocused window ending at {right}"
     );
 }
