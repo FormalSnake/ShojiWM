@@ -629,6 +629,13 @@ impl ShojiWM {
             source.cancel();
             return;
         };
+        // Smithay starts a drag on the serial of any pointer grab, whoever
+        // asks: under the lock it would be the locker's click. A lock screen
+        // has nothing to drop on, so no drag starts there.
+        if self.session_lock_active {
+            source.cancel();
+            return;
+        }
         let Some(pointer) = seat.get_pointer() else {
             source.cancel();
             return;

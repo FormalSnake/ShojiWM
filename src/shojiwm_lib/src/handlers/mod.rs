@@ -90,6 +90,15 @@ impl SeatHandler for ShojiWM {
         // A new cursor surface (or hotspot update on the same surface) was set; clear
         // any previous override marker so the commit handler re-applies the hotspot
         // reinterpretation exactly once for the next commit (Xwayland HiDPI workaround).
+        // Smithay lets the client of any pointer grab set the cursor. A named
+        // shape carries no client, and only the pointer focus or a grab may
+        // set one: under the lock no other client holds either.
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &image
+            && self.session_lock_active
+            && !self.of_session_locker(&surface.id())
+        {
+            return;
+        }
         if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &image {
             smithay::wayland::compositor::with_states(surface, |states| {
                 if let Some(applied) = states
@@ -155,7 +164,9 @@ smithay::delegate_dispatch2!(ShojiWM);
 
 impl PointerConstraintsHandler for ShojiWM {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        if self.app_lock_ignored {
+        if self.app_lock_ignored
+            || (self.session_lock_active && !self.of_session_locker(&surface.id()))
+        {
             return;
         }
         if pointer.current_focus().as_ref() != Some(surface) {

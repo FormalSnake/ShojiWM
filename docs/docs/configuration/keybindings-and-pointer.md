@@ -156,6 +156,10 @@ on a second connection is one of those others and types into the locker too.
 The pointer under the lock reaches a lock surface or nothing, also where no lock
 surface has mapped yet: a button held in a window when the lock goes up comes
 up in that window at once, a drag is cancelled and a pointer lock lets go.
+Under the lock no other client can open a menu grab, start a drag, set the
+cursor, lock the pointer or be activated, and a panel mapped on demand behind
+the lock screen does not take the keyboard at the unlock. A button held on the
+lock screen at the unlock comes up there, and its own release goes nowhere.
 `nonConsuming: true` runs the handler and still delivers the key or the button
 to the client it was meant for, so a config can watch a press without
 taking it, for example close a menu it shows on `Escape` while the window

@@ -343,8 +343,11 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface, damage: LayerComm
                     );
                 }
                 state.mapped_on_demand_layer_surfaces.insert(surface_id);
+                // Mapped behind the lock screen, it waits for a click like any
+                // other: the unlock goes back to the window the user was in.
                 if matches!(keyboard_interactivity, KeyboardInteractivity::OnDemand)
                     && matches!(layer.layer(), Layer::Overlay | Layer::Top)
+                    && !state.session_lock_active
                 {
                     state.layer_shell_on_demand_focus = Some(layer.clone());
                 }

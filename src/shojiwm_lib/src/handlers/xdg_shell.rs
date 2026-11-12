@@ -543,6 +543,13 @@ impl XdgShellHandler for ShojiWM {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        // Ending the grab would hand the keyboard back to the popup's
+        // toplevel, under the lock screen.
+        if self.session_lock_active && !self.of_session_locker(&surface.wl_surface().id()) {
+            info!("denied xdg popup grab under the session lock");
+            surface.send_popup_done();
+            return;
+        }
         let seat = Seat::from_resource(&seat).unwrap();
         let popup = PopupKind::Xdg(surface);
         let popup_surface_id = popup.wl_surface().id().protocol_id();

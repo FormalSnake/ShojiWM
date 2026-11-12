@@ -893,7 +893,22 @@ impl ShojiWM {
             self.take_pointer_from_clients();
         } else {
             self.let_go_of_keys_held_under_lock();
+            // The locker's lock surfaces are about to go: a button held on one
+            // comes up there, not in the window under it.
+            self.take_pointer_from_clients();
         }
+    }
+
+    /// Whether `object` belongs to the client holding the session lock.
+    pub(crate) fn of_session_locker(
+        &self,
+        object: &smithay::reexports::wayland_server::backend::ObjectId,
+    ) -> bool {
+        self.session_locker
+            .as_ref()
+            .and_then(|locker| locker.client())
+            .zip(self.display_handle.get_client(object.clone()).ok())
+            .is_some_and(|(locker, client)| locker.id() == client.id())
     }
 
     pub fn session_lock_surface_for_output(&self, output: &Output) -> Option<LockSurface> {

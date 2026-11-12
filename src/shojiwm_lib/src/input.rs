@@ -865,10 +865,9 @@ impl ShojiWM {
     /// The session is back on its VT.
     pub fn resume_input_session(&mut self) {
         self.tty_session_active = true;
-        // Keys and buttons let go on another VT sent us no release.
+        // Keys let go on another VT sent us no release. A button held across
+        // the switch stays marked: its release still goes nowhere.
         self.modifier_tap.reset();
-        self.consumed_pointer_buttons.clear();
-        self.input_grab_pointer_buttons.clear();
     }
 
     /// Stop repeating a held binding: another key went down, its own key
@@ -2156,8 +2155,11 @@ impl ShojiWM {
                     }
                     return;
                 }
-                if self.consumed_pointer_buttons.contains(&button_key) {
-                    return;
+                // A press of a button still marked lost its release on another VT:
+                // it starts a click of its own.
+                if button_state == ButtonState::Pressed {
+                    self.consumed_pointer_buttons.remove(&button_key);
+                    self.input_grab_pointer_buttons.remove(&button_key);
                 }
 
                 // A pointer button press cancels a pending modifier tap (e.g. Super+drag).
@@ -3580,6 +3582,14 @@ impl ShojiWM {
         // minimized window look like "activate an unminimized, still-focused
         // window", which the minimize-raise toggle then immediately
         // re-minimized (visible as a one-frame flash of the window).
+        // Handled, by refusing: no caller falls back to focusing it either.
+        if self.session_lock_active {
+            tracing::info!(
+                ?source,
+                "refused a window activation under the session lock"
+            );
+            return true;
+        }
         let snapshot = self.snapshot_window(window);
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         let event = crate::ssd::WindowActivateRequestEventSnapshot {

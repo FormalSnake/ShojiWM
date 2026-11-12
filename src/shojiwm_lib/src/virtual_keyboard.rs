@@ -168,12 +168,7 @@ impl ShojiWM {
         // An input method's virtual keyboard on a second connection looks like wvkbd: it types.
         !self.session_lock_active
             || !self.of_input_method_client(keyboard)
-            || self
-                .session_locker
-                .as_ref()
-                .and_then(|locker| locker.client())
-                .zip(self.display_handle.get_client(keyboard.clone()).ok())
-                .is_some_and(|(locker, client)| locker.id() == client.id())
+            || self.of_session_locker(keyboard)
     }
 
     /// Hand `f` each `wl_keyboard` of the focused client.
