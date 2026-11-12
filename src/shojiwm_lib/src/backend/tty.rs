@@ -5760,7 +5760,7 @@ fn render_surface(
                     headless.render_frame(&output, &elements)
                 }
                 SurfaceTarget::Drm(drm_output) => {
-                    if let Some(scanout_renderer) = cross_gpu_scanout_renderer.as_deref_mut()
+                    if let Some(scanout_renderer) = cross_gpu_scanout_renderer
                         && let Some(target) = surface.cross_gpu.as_mut()
                     {
                         timescope::scope!("tty render_frame cross-gpu");
