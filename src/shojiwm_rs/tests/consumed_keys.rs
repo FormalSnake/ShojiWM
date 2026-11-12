@@ -3,11 +3,17 @@
 //! or the grab changed, and a key a client got down always comes back up in
 //! it, also when its keyboard goes away or the session leaves its VT. The
 //! client's modifiers follow the seat's whether or not the key that changed
-//! them reached it.
+//! them reached it. Under the session lock only the locker hears a key: no
+//! keyboard grab, no input method, and no key pressed in the locker reaches
+//! anything else after the unlock.
 
 mod common;
 
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    io::Write,
+    os::fd::AsFd,
+};
 
 use shojiwm_lib::virtual_input::{VirtualButton, VirtualDevice, VirtualInput, VirtualKey};
 use shojiwm_rs::prelude::*;
@@ -18,14 +24,20 @@ use smithay::{
 };
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
-    protocol::{wl_compositor, wl_keyboard, wl_pointer, wl_seat},
+    protocol::{wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_seat},
 };
 use wayland_protocols::ext::session_lock::v1::client::{
-    ext_session_lock_manager_v1, ext_session_lock_v1,
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
 use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_wm_base};
-use wayland_protocols_misc::zwp_input_method_v2::client::{
-    zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
+use wayland_protocols_misc::{
+    zwp_input_method_v2::client::{
+        zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
+    },
+    zwp_virtual_keyboard_v1::client::{
+        zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+        zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    },
 };
 
 /// evdev codes.
@@ -38,6 +50,7 @@ const L: u32 = 38;
 const X: u32 = 45;
 const SHIFT: u32 = 42;
 const SUPER: u32 = 125;
+const F1: u32 = 59;
 const BTN_LEFT: u32 = 0x110;
 
 /// Depressed modifier masks of the default keymap.
@@ -60,8 +73,12 @@ enum Seen {
 thread_local! {
     static FIRED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
-    /// Keys the input method's keyboard grab was sent.
+    /// What the input method's keyboard grab was sent.
     static IM_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    /// What the locker's keyboard was sent.
+    static LOCKER_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    /// The lock surface's last configure: width and height.
+    static LOCK_SIZE: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
     static GRAB: RefCell<Option<InputGrab>> = const { RefCell::new(None) };
     static BUTTON_SERIAL: Cell<u32> = const { Cell::new(0) };
 }
@@ -85,6 +102,12 @@ fn setup() {
         COMPOSITOR.window.list()[1].focus();
     });
     COMPOSITOR.key.bind("taken", "Super+L", fired("taken"));
+    COMPOSITOR.key.bind_with(
+        "repeat",
+        "F1",
+        KeyBindOptions::new().repeat(),
+        fired("repeat"),
+    );
     COMPOSITOR.key.bind_with(
         "on-release",
         "Super+X",
@@ -152,12 +175,31 @@ fn unplug(session: &mut common::Session, keyboard: &str) {
     session.roundtrip();
 }
 
+/// The session locked by a client of its own with a lock surface on the
+/// output, which has the keyboard. Returns the lock.
 fn lock(session: &mut common::Session) -> ext_session_lock_v1::ExtSessionLockV1 {
+    let locker = session.connect("locker");
+    let peer = &session.peers[locker];
+    let qh = peer.queue.handle();
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    seat.get_keyboard(&qh, ());
+    let compositor: wl_compositor::WlCompositor = peer.bind("wl_compositor", 1);
+    let output: wl_output::WlOutput = peer.bind("wl_output", 1);
     let manager: ext_session_lock_manager_v1::ExtSessionLockManagerV1 =
-        session.bind("ext_session_lock_manager_v1", 1);
-    let lock = manager.lock(&session.queue.handle(), ());
+        peer.bind("ext_session_lock_manager_v1", 1);
+    let lock = manager.lock(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    lock.get_lock_surface(&surface, &output, &qh, ());
     session.roundtrip();
     assert!(session.state.session_lock_active);
+    let (width, height) = LOCK_SIZE.get();
+    session.peers[locker].attach_buffer(&surface, width as i32, height as i32);
+    session.roundtrip();
+    let seen = take(&LOCKER_SEEN);
+    assert!(
+        matches!(seen[0], Seen::Enter(_)),
+        "the locker has no keyboard: {seen:?}"
+    );
     lock
 }
 
@@ -167,15 +209,53 @@ fn unlock(session: &mut common::Session, lock: ext_session_lock_v1::ExtSessionLo
     assert!(!session.state.session_lock_active);
 }
 
-/// An input method that grabs the keyboard.
-fn grab_keyboard_for_input_method(session: &mut common::Session) {
+/// An input method, a client of its own, that grabbed the keyboard.
+fn input_method(session: &mut common::Session) -> (usize, zwp_input_method_v2::ZwpInputMethodV2) {
+    let im = session.connect("input-method");
+    let peer = &session.peers[im];
     let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
-        session.bind("zwp_input_method_manager_v2", 1);
-    let seat: wl_seat::WlSeat = session.bind("wl_seat", 1);
-    let input_method = manager.get_input_method(&seat, &session.queue.handle(), ());
-    input_method.grab_keyboard(&session.queue.handle(), ());
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let input_method = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    input_method.grab_keyboard(&peer.queue.handle(), ());
     session.roundtrip();
-    take(&IM_SEEN);
+    // The grab starts with the seat's modifiers.
+    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    (im, input_method)
+}
+
+/// What fcitx5 and ibus do when they are activated: grab the keyboard again.
+fn grab_again(
+    session: &mut common::Session,
+    im: usize,
+    input_method: &zwp_input_method_v2::ZwpInputMethodV2,
+) {
+    input_method.grab_keyboard(&session.peers[im].queue.handle(), ());
+    session.roundtrip();
+}
+
+/// One key, `k`, on keycode 9, like wtype's or wvkbd's keymap.
+const VIRTUAL_KEYMAP: &str = r#"xkb_keymap {
+xkb_keycodes "(unnamed)" { minimum = 8; maximum = 9; <K1> = 9; };
+xkb_types "(unnamed)" { include "complete" };
+xkb_compat "(unnamed)" { include "complete" };
+xkb_symbols "(unnamed)" { key <K1> {[k]}; };
+};
+"#;
+/// The key of the keymap above, as the virtual keyboard sends it.
+const VIRTUAL_K: u32 = 1;
+
+fn virtual_keyboard(session: &mut common::Session, peer: usize) -> ZwpVirtualKeyboardV1 {
+    let peer = &session.peers[peer];
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let manager: ZwpVirtualKeyboardManagerV1 = peer.bind("zwp_virtual_keyboard_manager_v1", 1);
+    let keyboard = manager.create_virtual_keyboard(&seat, &peer.queue.handle(), ());
+    let mut file = common::tempfile("keymap");
+    file.write_all(VIRTUAL_KEYMAP.as_bytes()).unwrap();
+    file.write_all(&[0]).unwrap();
+    keyboard.keymap(1, file.as_fd(), VIRTUAL_KEYMAP.len() as u32 + 1);
+    session.roundtrip();
+    keyboard
 }
 
 fn focused_session() -> common::Session {
@@ -323,38 +403,66 @@ fn a_modifier_an_input_grab_took_is_let_go_in_the_client() {
 }
 
 #[test]
-fn the_client_has_the_seats_modifiers_after_the_lock() {
+fn a_modifier_held_across_the_unlock_comes_up_in_the_window_without_its_key() {
     let mut session = focused_session();
 
-    press(&mut session, SUPER);
-    press(&mut session, L);
-    press(&mut session, SHIFT);
     let locked = lock(&mut session);
-    release(&mut session, L);
-    release(&mut session, SUPER);
+    press(&mut session, SHIFT);
     unlock(&mut session, locked);
-    assert_eq!(take(&FIRED), vec!["taken"]);
+    release(&mut session, SHIFT);
+    assert_eq!(
+        take(&LOCKER_SEEN),
+        vec![
+            Seen::Mods(SHIFT_MASK),
+            Seen::Down(SHIFT),
+            Seen::Up(SHIFT),
+            Seen::Leave
+        ]
+    );
+    // The window never saw Shift go down: it learns of it as a modifier, and
+    // of its release the same way.
     assert_eq!(
         take(&SEEN),
         vec![
-            Seen::Mods(SUPER_MASK),
-            Seen::Down(SUPER),
-            Seen::Mods(SUPER_MASK | SHIFT_MASK),
-            Seen::Down(SHIFT),
             Seen::Leave,
-            Seen::Enter(1),
-            Seen::Mods(SHIFT_MASK)
+            Seen::Enter(0),
+            Seen::Mods(SHIFT_MASK),
+            Seen::Mods(0)
         ]
     );
+}
 
-    release(&mut session, SHIFT);
-    assert_eq!(take(&SEEN), vec![Seen::Mods(0), Seen::Up(SHIFT)]);
+#[test]
+fn a_key_held_across_the_unlock_reaches_neither_the_window_nor_an_input_method() {
+    let mut session = focused_session();
+    let (_im, _input_method) = input_method(&mut session);
+
+    let locked = lock(&mut session);
+    take(&SEEN);
+    press(&mut session, K);
+    unlock(&mut session, locked);
+    release(&mut session, K);
+    assert_eq!(
+        take(&LOCKER_SEEN),
+        vec![Seen::Down(K), Seen::Up(K), Seen::Leave]
+    );
+    assert_eq!(take(&IM_SEEN), vec![]);
+    assert!(
+        !take(&SEEN)
+            .iter()
+            .any(|seen| matches!(seen, Seen::Down(K) | Seen::Up(K) | Seen::Enter(1..))),
+    );
+
+    // Its next press is an ordinary one.
+    press(&mut session, K);
+    release(&mut session, K);
+    assert_eq!(take(&SEEN), vec![Seen::Down(K), Seen::Up(K)]);
 }
 
 #[test]
 fn an_input_method_hears_no_key_while_the_session_is_locked() {
     let mut session = focused_session();
-    grab_keyboard_for_input_method(&mut session);
+    let (im, input_method) = input_method(&mut session);
 
     press(&mut session, A);
     release(&mut session, A);
@@ -364,27 +472,150 @@ fn an_input_method_hears_no_key_while_the_session_is_locked() {
     press(&mut session, K);
     release(&mut session, K);
     assert_eq!(take(&IM_SEEN), vec![]);
+    assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
 
+    // The grab it held went with the lock; it hears keys again once it grabs
+    // again.
     unlock(&mut session, locked);
     press(&mut session, A);
     release(&mut session, A);
-    assert_eq!(take(&IM_SEEN), vec![Seen::Down(A), Seen::Up(A)]);
+    assert_eq!(take(&IM_SEEN), vec![]);
+    grab_again(&mut session, im, &input_method);
+    press(&mut session, A);
+    release(&mut session, A);
+    assert_eq!(
+        take(&IM_SEEN),
+        vec![Seen::Mods(0), Seen::Down(A), Seen::Up(A)]
+    );
 }
 
 #[test]
 fn an_input_method_that_grabs_the_keyboard_under_the_lock_hears_no_key() {
     let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
 
     let locked = lock(&mut session);
-    grab_keyboard_for_input_method(&mut session);
+    grab_again(&mut session, im, &input_method);
     press(&mut session, K);
     release(&mut session, K);
-    assert_eq!(take(&IM_SEEN), vec![]);
-
+    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
     unlock(&mut session, locked);
+}
+
+#[test]
+fn an_input_method_that_grabs_again_under_the_lock_hears_no_release_the_lock_makes() {
+    let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
+
+    let locked = lock(&mut session);
+    press(&mut session, K);
+    grab_again(&mut session, im, &input_method);
+    // The session leaves its VT with K down in the locker.
+    session.state.pause_input_session();
+    session.roundtrip();
+    session.state.resume_input_session();
+    session.roundtrip();
+    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+    unlock(&mut session, locked);
+}
+
+#[test]
+fn an_input_method_never_hears_a_key_with_modifiers_from_before_the_lock() {
+    let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
+
+    press(&mut session, SHIFT);
+    // Smithay sends an input method's grab the key, then the modifiers.
+    assert_eq!(
+        take(&IM_SEEN),
+        vec![Seen::Down(SHIFT), Seen::Mods(SHIFT_MASK)]
+    );
+    let locked = lock(&mut session);
+    release(&mut session, SHIFT);
+    unlock(&mut session, locked);
+    // Its grab from before the lock would read this `a` as shifted.
     press(&mut session, A);
     release(&mut session, A);
-    assert_eq!(take(&IM_SEEN), vec![Seen::Down(A), Seen::Up(A)]);
+    assert_eq!(take(&IM_SEEN), vec![]);
+
+    // A new grab starts with the seat's modifiers.
+    grab_again(&mut session, im, &input_method);
+    press(&mut session, A);
+    release(&mut session, A);
+    assert_eq!(
+        take(&IM_SEEN),
+        vec![Seen::Mods(0), Seen::Down(A), Seen::Up(A)]
+    );
+}
+
+#[test]
+fn an_input_methods_virtual_keyboard_cannot_type_into_the_lock() {
+    let mut session = focused_session();
+    let (im, _input_method) = input_method(&mut session);
+    let keyboard = virtual_keyboard(&mut session, im);
+
+    let locked = lock(&mut session);
+    keyboard.modifiers(SHIFT_MASK, 0, 0, 0);
+    keyboard.key(0, VIRTUAL_K, 1);
+    keyboard.key(0, VIRTUAL_K, 0);
+    keyboard.modifiers(0, 0, 0, 0);
+    session.roundtrip();
+    assert_eq!(take(&LOCKER_SEEN), vec![]);
+    unlock(&mut session, locked);
+}
+
+/// An on-screen keyboard such as wvkbd: a virtual keyboard of a client that
+/// is no input method types into the lock like a keyboard.
+#[test]
+fn an_on_screen_keyboard_types_into_the_lock() {
+    let mut session = focused_session();
+    let osk = session.connect("on-screen-keyboard");
+    let keyboard = virtual_keyboard(&mut session, osk);
+
+    let locked = lock(&mut session);
+    keyboard.key(0, VIRTUAL_K, 1);
+    keyboard.key(0, VIRTUAL_K, 0);
+    session.roundtrip();
+    let seen = take(&LOCKER_SEEN);
+    assert!(
+        seen.ends_with(&[Seen::Down(VIRTUAL_K), Seen::Up(VIRTUAL_K)]),
+        "{seen:?}"
+    );
+    unlock(&mut session, locked);
+}
+
+#[test]
+fn a_virtual_keyboard_destroyed_with_a_key_down_lets_it_go() {
+    let mut session = focused_session();
+    let osk = session.connect("on-screen-keyboard");
+    let keyboard = virtual_keyboard(&mut session, osk);
+
+    keyboard.key(0, VIRTUAL_K, 1);
+    session.roundtrip();
+    keyboard.destroy();
+    session.roundtrip();
+    let seen = take(&SEEN);
+    let down = seen.iter().position(|seen| *seen == Seen::Down(VIRTUAL_K));
+    let up = seen.iter().position(|seen| *seen == Seen::Up(VIRTUAL_K));
+    assert!(down.is_some() && up > down, "{seen:?}");
+}
+
+#[test]
+fn a_repeating_bind_repeats_on_while_another_keyboard_taps_its_key() {
+    let mut session = focused_session();
+    session.state.keyboard_repeat_info = (25, 600);
+
+    send_from(&mut session, "first", F1, KeyState::Pressed);
+    assert_eq!(take(&FIRED), vec!["repeat"]);
+    assert!(session.state.key_binding_repeat.is_some());
+    send_from(&mut session, "second", F1, KeyState::Pressed);
+    send_from(&mut session, "second", F1, KeyState::Released);
+    assert!(session.state.key_binding_repeat.is_some());
+    send_from(&mut session, "first", F1, KeyState::Released);
+    assert!(session.state.key_binding_repeat.is_none());
+    assert_eq!(take(&FIRED), Vec::<&str>::new());
 }
 
 fn button(session: &mut common::Session, state: ButtonState) {
@@ -563,7 +794,7 @@ fn seen_key(key: u32, state: WEnum<wl_keyboard::KeyState>) -> Seen {
 
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for common::Client {
     fn event(
-        _: &mut Self,
+        client: &mut Self,
         _: &wl_keyboard::WlKeyboard,
         event: wl_keyboard::Event,
         _: &(),
@@ -577,7 +808,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for common::Client {
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => Seen::Mods(mods_depressed),
             _ => return,
         };
-        SEEN.with(|seen_list| seen_list.borrow_mut().push(seen));
+        let list = match client.name {
+            "" => &SEEN,
+            "locker" => &LOCKER_SEEN,
+            _ => return,
+        };
+        list.with(|seen_list| seen_list.borrow_mut().push(seen));
     }
 }
 
@@ -607,8 +843,36 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwp_input_method_keyboard_grab_v2::Event::Key { key, state, .. } = event {
-            IM_SEEN.with(|seen| seen.borrow_mut().push(seen_key(key, state)));
+        let seen = match event {
+            zwp_input_method_keyboard_grab_v2::Event::Key { key, state, .. } => {
+                seen_key(key, state)
+            }
+            zwp_input_method_keyboard_grab_v2::Event::Modifiers { mods_depressed, .. } => {
+                Seen::Mods(mods_depressed)
+            }
+            _ => return,
+        };
+        IM_SEEN.with(|seen_list| seen_list.borrow_mut().push(seen));
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ()> for common::Client {
+    fn event(
+        _: &mut Self,
+        surface: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_session_lock_surface_v1::Event::Configure {
+            serial,
+            width,
+            height,
+        } = event
+        {
+            surface.ack_configure(serial);
+            LOCK_SIZE.set((width, height));
         }
     }
 }

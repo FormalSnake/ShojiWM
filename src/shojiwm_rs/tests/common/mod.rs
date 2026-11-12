@@ -36,6 +36,8 @@ pub struct Session {
     pub queue: EventQueue<Client>,
     pub client: Client,
     pub registry: wl_registry::WlRegistry,
+    /// Clients of their own beside this one, from [`Session::connect`].
+    pub peers: Vec<Peer>,
     /// Backing files of shm buffers; their fds must outlive the requests.
     files: Vec<File>,
     _runtime_dir: PathBuf,
@@ -87,6 +89,7 @@ impl Session {
             queue,
             client: Client::default(),
             registry,
+            peers: Vec::new(),
             files: Vec::new(),
             _runtime_dir: runtime_dir,
         };
@@ -99,6 +102,9 @@ impl Session {
     pub fn roundtrip(&mut self) {
         for _ in 0..5 {
             self.connection.flush().unwrap();
+            for peer in &mut self.peers {
+                peer.connection.flush().unwrap();
+            }
             self.event_loop
                 .dispatch(Some(Duration::from_millis(5)), &mut self.state)
                 .unwrap();
@@ -107,6 +113,12 @@ impl Session {
                 let _ = guard.read();
             }
             self.queue.dispatch_pending(&mut self.client).unwrap();
+            for peer in &mut self.peers {
+                if let Some(guard) = peer.queue.prepare_read() {
+                    let _ = guard.read();
+                }
+                peer.queue.dispatch_pending(&mut peer.client).unwrap();
+            }
         }
     }
 
@@ -121,6 +133,27 @@ impl Session {
             &self.queue.handle(),
             (),
         )
+    }
+
+    /// Another client on the compositor's socket, named `name`, moved by
+    /// every roundtrip from now on. Returns its index in `peers`.
+    pub fn connect(&mut self, name: &'static str) -> usize {
+        let socket = UnixStream::connect(self._runtime_dir.join(&self.state.socket_name)).unwrap();
+        let connection = Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue();
+        let registry = connection.display().get_registry(&queue.handle(), ());
+        self.peers.push(Peer {
+            connection,
+            queue,
+            client: Client {
+                name,
+                ..Client::default()
+            },
+            registry,
+            files: Vec::new(),
+        });
+        self.roundtrip();
+        self.peers.len() - 1
     }
 
     /// Maps an xdg toplevel. ShojiWM maps it into the space as soon as the
@@ -255,8 +288,50 @@ impl Session {
     }
 }
 
+/// A client of its own beside the session's, from [`Session::connect`].
+pub struct Peer {
+    pub connection: Connection,
+    pub queue: EventQueue<Client>,
+    pub client: Client,
+    pub registry: wl_registry::WlRegistry,
+    files: Vec<File>,
+}
+
+impl Peer {
+    pub fn bind<I>(&self, interface: &str, version: u32) -> I
+    where
+        I: Proxy + 'static,
+        Client: Dispatch<I, ()>,
+    {
+        self.registry.bind::<I, _, _>(
+            self.client.global(interface),
+            version,
+            &self.queue.handle(),
+            (),
+        )
+    }
+
+    /// Attaches a `width`x`height` shm buffer to `surface` and commits.
+    pub fn attach_buffer(&mut self, surface: &wl_surface::WlSurface, width: i32, height: i32) {
+        let qh = self.queue.handle();
+        let shm: wl_shm::WlShm = self.bind("wl_shm", 1);
+        let stride = width * 4;
+        let file = tempfile("shm");
+        file.set_len((stride * height) as u64).unwrap();
+        let pool = shm.create_pool(file.as_fd(), stride * height, &qh, ());
+        let buffer =
+            pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, &qh, ());
+        self.files.push(file);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage(0, 0, width, height);
+        surface.commit();
+    }
+}
+
 #[derive(Default)]
 pub struct Client {
+    /// Which of the test's clients this is, for events it records.
+    pub name: &'static str,
     globals: Vec<(String, u32)>,
     /// Layer surfaces the compositor sent `closed`.
     pub closed_layers: usize,

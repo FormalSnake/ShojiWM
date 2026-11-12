@@ -21,10 +21,7 @@ use smithay::{
         wayland_server::{Resource, protocol::wl_surface::WlSurface},
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
-    wayland::{
-        input_method::{InputMethodKeyboardGrab, InputMethodSeat},
-        pointer_constraints::{PointerConstraint, with_pointer_constraint},
-    },
+    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 use std::{collections::HashSet, time::Instant};
 use tracing::{debug, info, warn};
@@ -334,9 +331,27 @@ impl ShojiWM {
             KeysymHandle<'_>,
         ) -> FilterResult<KeyboardAction>,
     ) -> Option<KeyboardAction> {
+        // Every key event under the lock comes through here, a release this
+        // compositor makes up included: none may reach a keyboard grab.
+        if self.session_lock_active {
+            self.take_keyboard_from_grabs();
+        }
         let keyboard = self.seat.get_keyboard().unwrap();
         let modifiers = keyboard.modifier_state();
-        let action = keyboard.input_from_source(source, self, keycode, state, serial, time, filter);
+        let action = keyboard.input_from_source(
+            source,
+            self,
+            keycode,
+            state,
+            serial,
+            time,
+            |data, modifiers, handle| {
+                // Smithay runs the filter only when the seat's key goes down
+                // or up, not for a key another keyboard holds already.
+                data.stop_key_binding_repeat_for_key(keycode, state);
+                filter(data, modifiers, handle)
+            },
+        );
         // Smithay sends a modifier change only with the key that made it, and
         // a key the filter took goes nowhere: the focused client would keep a
         // modifier the seat has let go.
@@ -377,33 +392,44 @@ impl ShojiWM {
     }
 
     /// The session is locked: no keyboard grab may take what is typed into
-    /// the locker. An input method's grab is put back at unlock; any other
-    /// (a popup's) ends.
+    /// the locker. An input method's grab is dropped, not kept for after the
+    /// unlock: the input method would hear keys pressed in the locker come
+    /// up, and read the next ones with the modifiers it last heard before the
+    /// lock. fcitx5 and ibus grab the keyboard again when they are activated,
+    /// and a new grab starts with the seat's keymap and modifiers.
     pub(crate) fn take_keyboard_from_grabs(&mut self) {
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && keyboard.is_grabbed()
+        {
+            keyboard.unset_grab(self);
+        }
+    }
+
+    /// The lock is lifting with keys down. The locker had each one (or a
+    /// window that has had a `leave` since): the locker gets its release now,
+    /// and its own release goes nowhere, so nothing after the lock hears a
+    /// key typed into it.
+    pub(crate) fn let_go_of_keys_held_under_lock(&mut self) {
+        self.take_keyboard_from_grabs();
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
         };
-        if !keyboard.is_grabbed() {
-            return;
-        }
-        if let Some(grab) = keyboard
-            .with_grab(|_, grab| grab.downcast_ref::<InputMethodKeyboardGrab>().cloned())
-            .flatten()
-        {
-            self.input_method_grab_under_lock = Some(grab);
-        }
-        keyboard.unset_grab(self);
-    }
-
-    pub(crate) fn give_back_input_method_grab(&mut self) {
-        let Some(grab) = self.input_method_grab_under_lock.take() else {
-            return;
-        };
-        // The input method may have let go of the keyboard meanwhile.
-        if let Some(keyboard) = self.seat.get_keyboard()
-            && self.seat.input_method().keyboard_grabbed()
-        {
-            keyboard.set_grab(self, grab, SERIAL_COUNTER.next_serial());
+        let mut held = keyboard
+            .pressed_keys()
+            .into_iter()
+            .filter(|keycode| !self.consumed_keys.contains(keycode))
+            .collect::<Vec<_>>();
+        held.sort_by_key(|keycode| keycode.raw());
+        for keycode in held {
+            keyboard.input_forward(
+                self,
+                keycode,
+                KeyState::Released,
+                SERIAL_COUNTER.next_serial(),
+                0,
+                false,
+            );
+            self.consumed_keys.insert(keycode);
         }
     }
 
@@ -730,8 +756,6 @@ impl ShojiWM {
             .filter(|binding| binding.locked)
             .cloned()
             .collect::<Vec<_>>();
-        // A grab taken under the lock would hear the password.
-        self.take_keyboard_from_grabs();
         let action = self.keyboard_input(
             &event.device().id(),
             event.key_code(),
@@ -1592,7 +1616,6 @@ impl ShojiWM {
                 let device = event.device();
                 crate::runtime_input::apply_keyboard_config_for_backend_device(self, &device);
                 let serial = SERIAL_COUNTER.next_serial();
-                self.stop_key_binding_repeat_for_key(event.key_code(), event.state());
                 if self.session_lock_active {
                     self.forward_locked_keyboard_event::<I>(&event, serial);
                     return;

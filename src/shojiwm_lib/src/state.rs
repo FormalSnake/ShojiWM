@@ -573,10 +573,6 @@ pub struct ShojiWM {
     /// device id: the seat lets a key up when the last keyboard holding it
     /// lets go.
     pub keyboard_devices: HashMap<String, crate::input::KeyboardDevice>,
-    /// An input method's keyboard grab, taken off the keyboard while the
-    /// session is locked and put back after.
-    pub input_method_grab_under_lock:
-        Option<smithay::wayland::input_method::InputMethodKeyboardGrab>,
     pub modifier_tap: crate::modifier_tap::ModifierTapTracker,
     pub pending_tap_binding_ids: Vec<String>,
     /// A binding whose key the keyboard filter left to the client, run right
@@ -883,7 +879,7 @@ impl ShojiWM {
             self.modifier_tap.reset();
             self.take_keyboard_from_grabs();
         } else {
-            self.give_back_input_method_grab();
+            self.let_go_of_keys_held_under_lock();
         }
     }
 
@@ -2042,7 +2038,6 @@ impl ShojiWM {
             consumed_pointer_buttons: HashSet::new(),
             consumed_keys: HashSet::new(),
             keyboard_devices: HashMap::new(),
-            input_method_grab_under_lock: None,
             modifier_tap: Default::default(),
             pending_tap_binding_ids: Vec::new(),
             non_consuming_key_binding_id: None,
