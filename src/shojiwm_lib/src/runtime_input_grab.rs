@@ -25,11 +25,19 @@ use crate::ssd::{
 pub struct RuntimeInputGrabUpdate {
     pub id: u64,
     pub active: bool,
+    /// The pointer stays with the top and overlay layers' surfaces while it
+    /// is over one.
+    #[serde(default)]
+    pub layers: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeInputGrabState {
     pub id: u64,
+    pub layers: bool,
+    /// Buttons pressed into the grab and not yet let go: until the last is,
+    /// the grab keeps the pointer wherever it goes.
+    pub held: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

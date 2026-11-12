@@ -99,6 +99,7 @@ pub struct InputGrabOptions {
     on_scroll: Handler<InputGrabScrollEvent>,
     on_swipe: Handler<GestureSwipeEventSnapshot>,
     on_cancel: Handler<InputGrabCancelReason>,
+    layers: bool,
 }
 
 impl InputGrabOptions {
@@ -128,6 +129,15 @@ impl InputGrabOptions {
 
     pub fn on_swipe(mut self, f: impl Fn(&GestureSwipeEventSnapshot) + 'static) -> Self {
         self.on_swipe = Some(Rc::new(f));
+        self
+    }
+
+    /// Over a surface on the top or overlay layer the pointer stays that
+    /// client's: its motion, buttons and wheel go there and not to the grab,
+    /// unless a button the grab took is still down. For a grab drawn under
+    /// those layers, whose surfaces should still answer the pointer.
+    pub fn leave_layers_the_pointer(mut self) -> Self {
+        self.layers = true;
         self
     }
 
@@ -168,7 +178,7 @@ impl InputGrab {
             }
         });
         if released {
-            send(self.id, false);
+            send(self.id, false, false);
         }
     }
 
@@ -182,17 +192,19 @@ impl InputGrab {
     }
 }
 
-fn send(id: u64, active: bool) {
+fn send(id: u64, active: bool, layers: bool) {
     runtime::send(HostMessage::InputGrab(RuntimeInputGrabUpdate {
         id,
         active,
+        layers,
     }));
 }
 
 pub(crate) fn grab(options: InputGrabOptions) -> InputGrab {
     let id = NEXT_ID.with(|next| next.replace(next.get() + 1));
+    let layers = options.layers;
     let previous = CURRENT.with(|current| current.borrow_mut().replace(ActiveGrab { id, options }));
-    send(id, true);
+    send(id, true, layers);
     if let Some(on_cancel) = previous.and_then(|previous| previous.options.on_cancel) {
         on_cancel(&InputGrabCancelReason::Replaced);
     }

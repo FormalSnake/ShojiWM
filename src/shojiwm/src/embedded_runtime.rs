@@ -781,6 +781,7 @@ fn op_shoji_input_grab(id: u32, active: bool) {
             shojiwm_lib::runtime_input_grab::RuntimeInputGrabUpdate {
                 id: u64::from(id),
                 active,
+                layers: false,
             },
         ));
     }

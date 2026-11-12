@@ -1305,7 +1305,7 @@ impl ShojiWM {
 
         let time = std::time::Duration::from(self.clock.now()).as_millis() as u32;
         let serial = SERIAL_COUNTER.next_serial();
-        if self.runtime_input_grab.is_some() {
+        if self.runtime_input_grab.is_some() && !self.input_grab_passes_pointer(&pointer, pos) {
             // The grab owns the pointer: move the cursor, focus nothing.
             pointer.motion(
                 self,
@@ -1400,22 +1400,32 @@ impl ShojiWM {
             }
             return;
         }
+        let state = RuntimeInputGrabState {
+            id: update.id,
+            layers: update.layers,
+            held: 0,
+        };
         if self.session_lock_active {
             // The lock owns input; tell the config its grab never started.
-            self.runtime_input_grab = Some(RuntimeInputGrabState { id: update.id });
+            self.runtime_input_grab = Some(state);
             self.end_runtime_input_grab(Some("sessionLock"));
             return;
         }
         if let Some(grab) = self.runtime_input_grab.as_mut() {
             grab.id = update.id;
+            grab.layers = update.layers;
+            self.refresh_pointer_focus(self.input_grab_now_ms() as u32);
             return;
         }
-        self.runtime_input_grab = Some(RuntimeInputGrabState { id: update.id });
+        self.runtime_input_grab = Some(state);
         info!(grab_id = update.id, "input grab started");
+        let pointer = self.seat.get_pointer().unwrap();
+        if self.input_grab_passes_pointer(&pointer, pointer.current_location()) {
+            return;
+        }
 
         // Clients lose the pointer for the duration: hover states clear and
         // the cursor goes back to the default arrow.
-        let pointer = self.seat.get_pointer().unwrap();
         let location = pointer.current_location();
         self.pointer_contents = Default::default();
         pointer.motion(
@@ -1501,7 +1511,32 @@ impl ShojiWM {
         )
     }
 
-    /// Pointer motion under a grab: move the cursor, focus nothing.
+    /// Whether the pointer at `pos` is a client's under the grab: one that
+    /// leaves the layers the pointer has it over a top or overlay layer
+    /// surface, or still pressed on one, and no button it took is down.
+    fn input_grab_passes_pointer(
+        &self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        let Some(grab) = self.runtime_input_grab.as_ref() else {
+            return false;
+        };
+        if !grab.layers || grab.held > 0 {
+            return false;
+        }
+        pointer.is_grabbed()
+            || self.pointer_contents_at(pos).layer.is_some_and(|layer| {
+                matches!(
+                    layer.layer(),
+                    smithay::wayland::shell::wlr_layer::Layer::Top
+                        | smithay::wayland::shell::wlr_layer::Layer::Overlay
+                )
+            })
+    }
+
+    /// Pointer motion under a grab: move the cursor, focus nothing, or the
+    /// layer surface the grab leaves it to.
     fn input_grab_pointer_motion(
         &mut self,
         previous: Point<f64, Logical>,
@@ -1509,6 +1544,23 @@ impl ShojiWM {
         time_msec: u32,
     ) {
         let pointer = self.seat.get_pointer().unwrap();
+        if self.input_grab_passes_pointer(&pointer, pos) {
+            self.pointer_contents = self.pointer_contents_at(pos);
+            let under = self.pointer_contents.surface.clone();
+            pointer.motion(
+                self,
+                under,
+                &MotionEvent {
+                    location: pos,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: time_msec,
+                },
+            );
+            pointer.frame(self);
+            self.request_redraw_for_pointer_motion();
+            return;
+        }
+        self.pointer_contents = Default::default();
         pointer.motion(
             self,
             None,
@@ -1534,6 +1586,12 @@ impl ShojiWM {
     }
 
     fn input_grab_pointer_button(&mut self, button: u32, state: ButtonState, time_msec: u32) {
+        if let Some(grab) = self.runtime_input_grab.as_mut() {
+            grab.held = match state {
+                ButtonState::Pressed => grab.held + 1,
+                ButtonState::Released => grab.held.saturating_sub(1),
+            };
+        }
         let (position, output_name) = self.input_grab_pointer_point();
         self.dispatch_input_grab_event(InputGrabEventSnapshot::PointerButton {
             button,
@@ -2055,7 +2113,9 @@ impl ShojiWM {
                     );
                     return;
                 }
-                if self.runtime_input_grab.is_some() {
+                if self.runtime_input_grab.is_some()
+                    && !self.input_grab_passes_pointer(&pointer, pointer.current_location())
+                {
                     self.input_grab_pointer_button(button, button_state, event.time_msec());
                     // A grab can start while a button is held: a decoration's press handler
                     // starts it. That press opened the pointer's implicit grab, and only the
@@ -2745,7 +2805,9 @@ impl ShojiWM {
                     let _ = self.display_handle.flush_clients();
                     return;
                 }
-                if self.runtime_input_grab.is_some() {
+                if self.runtime_input_grab.is_some()
+                    && !self.input_grab_passes_pointer(&pointer, pointer.current_location())
+                {
                     let (position, output_name) = self.input_grab_pointer_point();
                     self.dispatch_input_grab_event(InputGrabEventSnapshot::Scroll {
                         delta_x: horizontal_amount,
@@ -4198,7 +4260,10 @@ impl ShojiWM {
             .active
             .as_ref()
             .is_some_and(|drag| drag.device == crate::dnd::DragDevice::Pointer);
-        if (pointer.is_grabbed() && !dragging) || self.runtime_input_grab.is_some() {
+        if (pointer.is_grabbed() && !dragging)
+            || (self.runtime_input_grab.is_some()
+                && !self.input_grab_passes_pointer(&pointer, pointer.current_location()))
+        {
             return;
         }
         if self.active_pointer_lock_focus(&pointer).is_some() {
