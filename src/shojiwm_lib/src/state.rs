@@ -563,10 +563,20 @@ pub struct ShojiWM {
     pub pending_input_grab_key_event: Option<crate::runtime_input_grab::InputGrabEventSnapshot>,
     pub current_keyboard_modifiers: ModifiersState,
     pub consumed_pointer_buttons: HashSet<(String, u32)>,
-    /// Keys whose last press the keyboard filter took. Entries outlive a lost
-    /// release (a VT switch): an entry is only read on a release, after the
-    /// key's next press has rewritten it.
+    /// Keys whose last press the keyboard filter took. A key leaves it with
+    /// its release, or with the release of every key its keyboard holds when
+    /// the keyboard goes away or the session leaves its VT
+    /// (`ShojiWM::release_held_keys`), so a press the seat would take for a
+    /// repeat never finds one here.
     pub consumed_keys: HashSet<smithay::input::keyboard::Keycode>,
+    /// Each keyboard's own source on the seat and the keys it holds, by
+    /// device id: the seat lets a key up when the last keyboard holding it
+    /// lets go.
+    pub keyboard_devices: HashMap<String, crate::input::KeyboardDevice>,
+    /// An input method's keyboard grab, taken off the keyboard while the
+    /// session is locked and put back after.
+    pub input_method_grab_under_lock:
+        Option<smithay::wayland::input_method::InputMethodKeyboardGrab>,
     pub modifier_tap: crate::modifier_tap::ModifierTapTracker,
     pub pending_tap_binding_ids: Vec<String>,
     /// A binding whose key the keyboard filter left to the client, run right
@@ -871,6 +881,9 @@ impl ShojiWM {
         // The releases of the keys down now go to the locker.
         if active {
             self.modifier_tap.reset();
+            self.take_keyboard_from_grabs();
+        } else {
+            self.give_back_input_method_grab();
         }
     }
 
@@ -2028,6 +2041,8 @@ impl ShojiWM {
             current_keyboard_modifiers: ModifiersState::default(),
             consumed_pointer_buttons: HashSet::new(),
             consumed_keys: HashSet::new(),
+            keyboard_devices: HashMap::new(),
+            input_method_grab_under_lock: None,
             modifier_tap: Default::default(),
             pending_tap_binding_ids: Vec::new(),
             non_consuming_key_binding_id: None,

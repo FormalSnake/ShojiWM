@@ -10,7 +10,7 @@ use smithay::{
     },
     desktop::{Window, WindowSurfaceType},
     input::{
-        keyboard::{FilterResult, keysyms},
+        keyboard::{FilterResult, KeyboardSource, KeysymHandle, ModifiersState, keysyms},
         pointer::{
             AxisFrame, ButtonEvent, CursorIcon, GrabStartData as PointerGrabStartData, MotionEvent,
             RelativeMotionEvent,
@@ -21,7 +21,10 @@ use smithay::{
         wayland_server::{Resource, protocol::wl_surface::WlSurface},
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
-    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    wayland::{
+        input_method::{InputMethodKeyboardGrab, InputMethodSeat},
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    },
 };
 use std::{collections::HashSet, time::Instant};
 use tracing::{debug, info, warn};
@@ -44,6 +47,14 @@ use crate::{
     },
     state::{ShojiWM, TrackedDecorationInteractionTarget},
 };
+
+/// A keyboard as the seat sees it: a source of its own, so a key two
+/// keyboards hold comes up when the last of them lets go, and the keys it
+/// holds, so they can be let go when it goes away.
+pub struct KeyboardDevice {
+    source: KeyboardSource,
+    held: HashSet<Keycode>,
+}
 
 /// A `repeat` key binding whose key is held down.
 pub struct KeyBindingRepeat {
@@ -279,6 +290,121 @@ impl ShojiWM {
         self.non_consuming_key_binding_id
             .take()
             .map(KeyboardAction::RuntimeKeyBinding)
+    }
+
+    /// A key from the keyboard `device` into the seat, through `filter`.
+    fn keyboard_input(
+        &mut self,
+        device: &str,
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+        filter: impl FnOnce(
+            &mut Self,
+            &ModifiersState,
+            KeysymHandle<'_>,
+        ) -> FilterResult<KeyboardAction>,
+    ) -> Option<KeyboardAction> {
+        let keyboard = self
+            .keyboard_devices
+            .entry(device.to_owned())
+            .or_insert_with(|| KeyboardDevice {
+                source: KeyboardSource::new_auxiliary(),
+                held: HashSet::new(),
+            });
+        match state {
+            KeyState::Pressed => keyboard.held.insert(keycode),
+            KeyState::Released => keyboard.held.remove(&keycode),
+        };
+        let source = keyboard.source;
+        self.keyboard_input_from(source, keycode, state, serial, time, filter)
+    }
+
+    fn keyboard_input_from(
+        &mut self,
+        source: KeyboardSource,
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+        filter: impl FnOnce(
+            &mut Self,
+            &ModifiersState,
+            KeysymHandle<'_>,
+        ) -> FilterResult<KeyboardAction>,
+    ) -> Option<KeyboardAction> {
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let modifiers = keyboard.modifier_state();
+        let action = keyboard.input_from_source(source, self, keycode, state, serial, time, filter);
+        // Smithay sends a modifier change only with the key that made it, and
+        // a key the filter took goes nowhere: the focused client would keep a
+        // modifier the seat has let go.
+        if action.is_some() && keyboard.modifier_state() != modifiers {
+            keyboard.advertise_modifier_state(self);
+        }
+        action
+    }
+
+    /// Lets go of every key the keyboard `device` holds, as if it had sent
+    /// the releases, and forgets it: the client gets the release of each key
+    /// it got down, no binding runs, and the next press of any of them is a
+    /// press. For a keyboard that went away, and the session leaving its VT,
+    /// where the releases arrive late or never: libinput sends them as it
+    /// suspends or removes a device, but they wait in its queue and the
+    /// session drops input while it is paused.
+    pub(crate) fn release_held_keys(&mut self, device: &str) {
+        let Some(keyboard) = self.keyboard_devices.remove(device) else {
+            return;
+        };
+        let mut held = keyboard.held.into_iter().collect::<Vec<_>>();
+        held.sort_by_key(|keycode| keycode.raw());
+        for keycode in held {
+            self.keyboard_input_from(
+                keyboard.source,
+                keycode,
+                KeyState::Released,
+                SERIAL_COUNTER.next_serial(),
+                0,
+                |data, _, _| {
+                    data.pair_key_event(keycode, KeyState::Released, FilterResult::Forward)
+                },
+            );
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            self.current_keyboard_modifiers = keyboard.modifier_state();
+        }
+    }
+
+    /// The session is locked: no keyboard grab may take what is typed into
+    /// the locker. An input method's grab is put back at unlock; any other
+    /// (a popup's) ends.
+    pub(crate) fn take_keyboard_from_grabs(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if !keyboard.is_grabbed() {
+            return;
+        }
+        if let Some(grab) = keyboard
+            .with_grab(|_, grab| grab.downcast_ref::<InputMethodKeyboardGrab>().cloned())
+            .flatten()
+        {
+            self.input_method_grab_under_lock = Some(grab);
+        }
+        keyboard.unset_grab(self);
+    }
+
+    pub(crate) fn give_back_input_method_grab(&mut self) {
+        let Some(grab) = self.input_method_grab_under_lock.take() else {
+            return;
+        };
+        // The input method may have let go of the keyboard meanwhile.
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && self.seat.input_method().keyboard_grabbed()
+        {
+            keyboard.set_grab(self, grab, SERIAL_COUNTER.next_serial());
+        }
     }
 
     /// [`pair_with_press`] on the seat's keyboard.
@@ -604,8 +730,10 @@ impl ShojiWM {
             .filter(|binding| binding.locked)
             .cloned()
             .collect::<Vec<_>>();
-        let action = self.seat.get_keyboard().unwrap().input(
-            self,
+        // A grab taken under the lock would hear the password.
+        self.take_keyboard_from_grabs();
+        let action = self.keyboard_input(
+            &event.device().id(),
             event.key_code(),
             event.state(),
             serial,
@@ -641,6 +769,25 @@ impl ShojiWM {
             _ => {}
         }
         let _ = self.display_handle.flush_clients();
+    }
+
+    /// The session went to another VT: input stops until it comes back.
+    pub fn pause_input_session(&mut self) {
+        self.tty_session_active = false;
+        self.stop_key_binding_repeat();
+        let devices = self.keyboard_devices.keys().cloned().collect::<Vec<_>>();
+        for device in devices {
+            self.release_held_keys(&device);
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+
+    /// The session is back on its VT.
+    pub fn resume_input_session(&mut self) {
+        self.tty_session_active = true;
+        // Keys and buttons let go on another VT sent us no release.
+        self.modifier_tap.reset();
+        self.consumed_pointer_buttons.clear();
     }
 
     /// Stop repeating a held binding: another key went down, its own key
@@ -1438,6 +1585,8 @@ impl ShojiWM {
                 let device_id = device.id();
                 self.consumed_pointer_buttons
                     .retain(|(id, _)| id != &device_id);
+                self.release_held_keys(&device_id);
+                let _ = self.display_handle.flush_clients();
             }
             InputEvent::Keyboard { event, .. } => {
                 let device = event.device();
@@ -1469,11 +1618,8 @@ impl ShojiWM {
                 let runtime_key_bindings = self.runtime_key_bindings.clone();
 
                 let action = self
-                    .seat
-                    .get_keyboard()
-                    .unwrap()
-                    .input(
-                        self,
+                    .keyboard_input(
+                        &event.device().id(),
                         event.key_code(),
                         event.state(),
                         serial,
@@ -4381,15 +4527,5 @@ mod key_pairing_tests {
         let mut consumed = HashSet::new();
         let release = pair_with_press(&mut consumed, H, KeyState::Released, FilterResult::Forward);
         assert!(reaches_client(&release));
-    }
-
-    #[test]
-    fn the_next_press_overrides_a_taken_press_whose_release_was_lost() {
-        let mut consumed = HashSet::new();
-        pair_with_press(&mut consumed, H, KeyState::Pressed, taken());
-        pair_with_press(&mut consumed, H, KeyState::Pressed, FilterResult::Forward);
-        let release = pair_with_press(&mut consumed, H, KeyState::Released, FilterResult::Forward);
-        assert!(reaches_client(&release));
-        assert!(consumed.is_empty());
     }
 }

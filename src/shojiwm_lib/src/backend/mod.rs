@@ -158,17 +158,13 @@ pub fn run_tty_udev(
         move |event, &mut (), state| match event {
             SessionEvent::PauseSession => {
                 info!("pausing tty session");
-                state.tty_session_active = false;
-                state.stop_key_binding_repeat();
+                state.pause_input_session();
                 libinput.suspend();
                 pause_tty_session(state);
             }
             SessionEvent::ActivateSession => {
                 info!("resuming tty session");
-                state.tty_session_active = true;
-                // Keys and buttons let go on another VT sent us no release.
-                state.modifier_tap.reset();
-                state.consumed_pointer_buttons.clear();
+                state.resume_input_session();
                 if let Err(err) = libinput.resume() {
                     warn!(?err, "failed to resume libinput context");
                 }

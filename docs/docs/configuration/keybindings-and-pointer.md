@@ -142,7 +142,10 @@ COMPOSITOR.key.bind_with(
 A binding takes its key or button: the focused client never sees it, the
 key's release included, even when the binding moved the focus to another
 window. A key whose press reached the client gets its release there too, also
-when an `on: "release"` binding fires on it.
+when an `on: "release"` binding fires on it. The client's modifiers follow the
+keyboard's even when a binding took the modifier key, and a keyboard unplugged
+or a switch to another VT lets go of the keys it held in the client. While
+the session is locked, no input method or menu keyboard grab hears a key.
 `nonConsuming: true` runs the handler and still delivers the key or the button
 to the client it was meant for, so a config can watch a press without
 taking it, for example close a menu it shows on `Escape` while the window

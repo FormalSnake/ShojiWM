@@ -299,6 +299,7 @@ impl VirtualKeyboardHandler for ShojiWM {
         let Some(virtual_keyboard) = self.virtual_keyboards.remove(keyboard) else {
             return;
         };
+        self.release_held_keys(&virtual_keyboard.device.id);
         if self
             .active_virtual_keymap
             .as_ref()
