@@ -1,6 +1,6 @@
 //! The config is told which window has the seat's keyboard, and that none
 //! has while a layer surface holds it, where `is_focused` keeps naming the
-//! window the layer borrowed it from.
+//! window the layer borrowed it from; that window is told with it.
 
 mod common;
 
@@ -10,20 +10,24 @@ use shojiwm_rs::prelude::*;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::KeyboardInteractivity;
 
 thread_local! {
-    static HEARD: RefCell<Vec<Option<String>>> = const { RefCell::new(Vec::new()) };
+    static HEARD: RefCell<Vec<Focus>> = const { RefCell::new(Vec::new()) };
 }
+
+/// The window that has the keyboard and the one it is meant for.
+type Focus = (Option<String>, Option<String>);
 
 fn setup() {
     COMPOSITOR.window.composition(|_| ClientWindow::new());
     COMPOSITOR.event.on_keyboard_focus_change(|focus| {
-        HEARD.with(|heard| heard.borrow_mut().push(focus.window_id.clone()))
+        let focus = (focus.window_id.clone(), focus.focused_window_id.clone());
+        HEARD.with(|heard| heard.borrow_mut().push(focus))
     });
     // What the test asks of a window from outside a callback is collected
     // on the scheduler's next turn, and a timer keeps it turning.
     set_interval(1.0, || {});
 }
 
-fn heard() -> Vec<Option<String>> {
+fn heard() -> Vec<Focus> {
     HEARD.with(|heard| heard.borrow().clone())
 }
 
@@ -50,7 +54,7 @@ fn the_window_with_the_keyboard_reaches_the_config() {
     b.focus();
     session.roundtrip();
     assert_eq!(held(), Some(b.id()));
-    assert_eq!(heard().last(), Some(&Some(b.id())));
+    assert_eq!(heard().last(), Some(&(Some(b.id()), Some(b.id()))));
 
     // A panel that takes the keyboard on demand: the window is still the
     // focused one, and the keys are no longer its.
@@ -76,9 +80,20 @@ fn the_window_with_the_keyboard_reaches_the_config() {
     assert_eq!(held(), None);
 
     // Every change was heard once, and nothing in between.
-    let moves: Vec<Option<String>> = heard().into_iter().skip_while(Option::is_none).collect();
+    let moves: Vec<Focus> = heard()
+        .into_iter()
+        .skip_while(|focus| *focus == (None, None))
+        .collect();
+    let (a, b) = (Some(a.id()), Some(b.id()));
     assert_eq!(
         moves,
-        [Some(a.id()), Some(b.id()), None, Some(b.id()), None]
+        [
+            (a.clone(), a),
+            (b.clone(), b.clone()),
+            (None, None),
+            (None, b.clone()),
+            (b.clone(), b),
+            (None, None)
+        ]
     );
 }

@@ -875,6 +875,9 @@ pub enum WaylandWindowAction {
     Fullscreen,
     Unfullscreen,
     Focus,
+    /// Focus the window because it was asked for by name. Unlike `Focus`,
+    /// it is not refused in favour of a window that opened later.
+    FocusOnRequest,
     /// Take the keyboard from the window if it has it. No window has it
     /// then, until one is focused.
     Unfocus,
