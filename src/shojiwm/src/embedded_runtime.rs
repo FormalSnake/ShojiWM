@@ -725,8 +725,8 @@ fn op_shoji_clear_color(state: &mut OpState, r: f64, g: f64, b: f64, a: f64) {
     }
 }
 
-/// `COMPOSITOR.output.create` / `remove`. The SDK picks the name and checks the
-/// size; a `scale` of 0 is none.
+/// `COMPOSITOR.output.create` / `resize` / `remove`. The SDK picks the name
+/// and checks the size; a `scale` of 0 is none.
 #[op2(fast)]
 fn op_shoji_headless_output(
     #[string] action: &str,
@@ -743,6 +743,11 @@ fn op_shoji_headless_output(
             width,
             height,
             scale: (scale > 0.0).then_some(scale),
+        },
+        "resize" => RuntimeHeadlessOutputRequest::Resize {
+            name,
+            width,
+            height,
         },
         "remove" => RuntimeHeadlessOutputRequest::Remove { name },
         _ => {
