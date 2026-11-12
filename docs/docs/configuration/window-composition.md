@@ -246,9 +246,23 @@ Place one per window.
 | `opacity`        | `number`                 | `0.0`–`1.0`                                              |
 | `transform`      | `ManagedWindowTransform` | Extra GPU transform                                      |
 | `allowTearing`   | `boolean`                | Permit tearing while fullscreen + direct-scanout (games) |
+| `confinePointer` | `boolean`                | Keep the pointer inside the window while it has focus    |
 
 All props accept signals for reactive layout. `rect`, `zIndex`, etc. are usually
 driven by your window-manager logic.
+
+`confinePointer` keeps the pointer inside the window's client area while the
+window has keyboard focus: motion that starts over the window stops at its edge,
+and the client still receives the relative motion. The client does not have to
+ask for it, which is what X11 games such as Minecraft need: they grab the
+pointer and warp it back to the centre, and without a confinement the cursor
+drifts out of the window between warps. Releasing app pointer locks
+(`COMPOSITOR.cursor.setAppLockIgnored`, `bindAppLockIgnoreModifier`) releases
+this too. Absolute devices such as tablets are not clamped.
+
+```tsx
+<ManagedWindow confinePointer={window.appId.value?.startsWith("Minecraft") === true}>
+```
 
 `opacity` multiplies with the alpha a client sets on its own surfaces through
 `wp_alpha_modifier_v1`: a window at `opacity` 0.5 whose client fades a surface
