@@ -5,6 +5,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::state::ShojiWM;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KeyboardFocusSnapshot {
     /// The window whose surface, or whose popup, receives the keys; `None`
     /// while a layer surface, the lock screen or nothing does.

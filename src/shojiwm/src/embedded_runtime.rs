@@ -295,6 +295,8 @@ pub struct NativeSchedulerRequest {
     pub keyboard_layout: Option<shojiwm_lib::keyboard_layout::KeyboardLayoutSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lid_switch: Option<shojiwm_lib::lid_switch::LidSwitchSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyboard_focus: Option<shojiwm_lib::keyboard_focus::KeyboardFocusSnapshot>,
 }
 
 enum BridgeRequest {
