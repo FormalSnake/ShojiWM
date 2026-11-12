@@ -20,13 +20,15 @@ use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::{
     zwp_input_method_v2,
 };
 use smithay::reexports::wayland_server::backend::{
-    ClientId, Handle, ObjectData, ObjectId, protocol::Message,
+    ClientId, Handle, ObjectData, ObjectId,
+    protocol::{Argument, Message},
 };
 use smithay::reexports::wayland_server::{
     Client, DataInit, DisplayHandle, New, Resource, ResourceData,
 };
 use smithay::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 
+use super::forward_request;
 use crate::state::ShojiWM;
 
 /// The version smithay implements.
@@ -62,24 +64,6 @@ impl GlobalDispatch2<ZwpInputMethodManagerV2, ShojiWM> for InputMethodManagerGlo
     }
 }
 
-/// Smithay's dispatch of a request reads the object data back from the
-/// backend, so `inner` stands in for `shim` while it runs.
-fn forward(
-    shim: Arc<dyn ObjectData<ShojiWM>>,
-    inner: Arc<dyn ObjectData<ShojiWM>>,
-    handle: &Handle,
-    state: &mut ShojiWM,
-    client_id: ClientId,
-    msg: Message<ObjectId, OwnedFd>,
-) -> Option<Arc<dyn ObjectData<ShojiWM>>> {
-    let id = msg.sender_id.clone();
-    let _ = handle.set_object_data(id.clone(), inner.clone());
-    let new_object = inner.request(handle, state, client_id, msg);
-    // A destructor has already removed the object.
-    let _ = handle.set_object_data(id, shim);
-    new_object
-}
-
 /// The manager's object data: puts [`InputMethodShim`] in front of each
 /// input method smithay makes.
 struct ManagerShim {
@@ -94,9 +78,20 @@ impl ObjectData<ShojiWM> for ManagerShim {
         client_id: ClientId,
         msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData<ShojiWM>>> {
+        let new_id = msg.args.iter().find_map(|arg| match arg {
+            Argument::NewId(id) => Some(id.clone()),
+            _ => None,
+        });
         let inner = self.inner.clone();
-        forward(self, inner, handle, state, client_id, msg)
-            .map(|inner| Arc::new(InputMethodShim { inner }) as Arc<dyn ObjectData<ShojiWM>>)
+        let input_method = forward_request(self, inner, handle, state, client_id, msg)?;
+        // Smithay's seat keeps the first live input method and marks later
+        // ones unavailable.
+        if state.input_method_object.is_none() {
+            state.input_method_object = new_id;
+        }
+        Some(Arc::new(InputMethodShim {
+            inner: input_method,
+        }))
     }
 
     fn destroyed(
@@ -141,7 +136,7 @@ impl ObjectData<ShojiWM> for InputMethodShim {
             }
         }
         let inner = self.inner.clone();
-        forward(self, inner, handle, state, client_id, msg)
+        forward_request(self, inner, handle, state, client_id, msg)
     }
 
     fn destroyed(
@@ -151,6 +146,8 @@ impl ObjectData<ShojiWM> for InputMethodShim {
         client_id: ClientId,
         object_id: ObjectId,
     ) {
+        // Smithay's seat forgets its input method when any of them goes.
+        state.input_method_object = None;
         self.inner
             .clone()
             .destroyed(handle, state, client_id, object_id);

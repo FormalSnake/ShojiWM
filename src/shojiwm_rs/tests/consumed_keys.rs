@@ -92,6 +92,8 @@ thread_local! {
     static IM_GRAB_EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     /// What the locker's text input was sent, by name.
     static LOCKER_TEXT: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    /// What the input methods were sent, by name.
+    static IM_EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
 fn fired(name: &'static str) -> impl Fn() + 'static {
@@ -1082,6 +1084,59 @@ fn an_input_method_popup_does_not_map_over_the_lock() {
     unlock(&mut session, locked);
 }
 
+/// The locker's password field sends its state on: the input method of
+/// another client hears none of it, and after the unlock it starts again
+/// from a deactivate.
+#[test]
+fn an_input_method_hears_nothing_of_the_lockers_text_input() {
+    let mut session = focused_session();
+    let (_im, _input_method) = input_method(&mut session);
+    let qh = session.queue.handle();
+    let seat: wl_seat::WlSeat = session.bind("wl_seat", 1);
+    let manager: zwp_text_input_manager_v3::ZwpTextInputManagerV3 =
+        session.bind("zwp_text_input_manager_v3", 1);
+    let window_text = manager.get_text_input(&seat, &qh, ());
+    session.roundtrip();
+    window_text.enable();
+    window_text.commit();
+    session.roundtrip();
+    let heard = take(&IM_EVENTS);
+    assert!(heard.contains(&"activate"), "{heard:?}");
+
+    let locked = lock(&mut session);
+    take(&IM_EVENTS);
+    let text_input = locker_text_input(&mut session);
+    text_input.set_content_type(
+        zwp_text_input_v3::ContentHint::SensitiveData,
+        zwp_text_input_v3::ContentPurpose::Password,
+    );
+    text_input.set_surrounding_text("hunter2".into(), 7, 7);
+    text_input.set_text_change_cause(zwp_text_input_v3::ChangeCause::Other);
+    text_input.set_cursor_rectangle(10, 10, 1, 20);
+    text_input.commit();
+    session.roundtrip();
+    let heard = take(&IM_EVENTS);
+    assert!(
+        !heard.iter().any(|event| matches!(
+            *event,
+            "activate" | "surrounding_text" | "content_type" | "text_change_cause"
+        )),
+        "{heard:?}"
+    );
+
+    unlock(&mut session, locked);
+    let heard = take(&IM_EVENTS);
+    assert_eq!(heard.first(), Some(&"deactivate"), "{heard:?}");
+    assert!(!heard.contains(&"activate"), "{heard:?}");
+    window_text.enable();
+    window_text.set_surrounding_text("abc".into(), 3, 3);
+    window_text.commit();
+    session.roundtrip();
+    let heard = take(&IM_EVENTS);
+    assert_eq!(heard.first(), Some(&"activate"), "{heard:?}");
+    assert!(heard.contains(&"surrounding_text"), "{heard:?}");
+}
+
 fn seen_key(key: u32, state: WEnum<wl_keyboard::KeyState>) -> Seen {
     match state {
         WEnum::Value(wl_keyboard::KeyState::Pressed) => Seen::Down(key),
@@ -1168,6 +1223,29 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
     }
 }
 
+impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for common::Client {
+    fn event(
+        _: &mut Self,
+        _: &zwp_input_method_v2::ZwpInputMethodV2,
+        event: zwp_input_method_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let name = match event {
+            zwp_input_method_v2::Event::Activate => "activate",
+            zwp_input_method_v2::Event::Deactivate => "deactivate",
+            zwp_input_method_v2::Event::SurroundingText { .. } => "surrounding_text",
+            zwp_input_method_v2::Event::TextChangeCause { .. } => "text_change_cause",
+            zwp_input_method_v2::Event::ContentType { .. } => "content_type",
+            zwp_input_method_v2::Event::Done => "done",
+            zwp_input_method_v2::Event::Unavailable => "unavailable",
+            _ => return,
+        };
+        IM_EVENTS.with(|events| events.borrow_mut().push(name));
+    }
+}
+
 impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for common::Client {
     fn event(
         client: &mut Self,
@@ -1227,7 +1305,6 @@ ignore_events!(
     ext_session_lock_manager_v1::ExtSessionLockManagerV1,
     ext_session_lock_v1::ExtSessionLockV1,
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-    zwp_input_method_v2::ZwpInputMethodV2,
     zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
     zwp_text_input_manager_v3::ZwpTextInputManagerV3
 );

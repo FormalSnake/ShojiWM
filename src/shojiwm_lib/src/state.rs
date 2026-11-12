@@ -78,7 +78,6 @@ use smithay::{
         shm::ShmState,
         single_pixel_buffer::SinglePixelBufferState,
         socket::ListeningSocketSource,
-        text_input::TextInputManagerState,
         viewporter::ViewporterState,
         xdg_activation::XdgActivationState,
         xwayland_shell::XWaylandShellState,
@@ -541,6 +540,8 @@ pub struct ShojiWM {
     /// connected, also after they destroy it.
     pub input_method_clients:
         std::collections::HashSet<smithay::reexports::wayland_server::backend::ClientId>,
+    /// The `zwp_input_method_v2` smithay's seat uses, as smithay picks it.
+    pub input_method_object: Option<smithay::reexports::wayland_server::backend::ObjectId>,
     pub runtime_active_keyboard_device: Option<RuntimeInputDeviceSnapshot>,
     pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
     pub runtime_libinput_devices: HashMap<String, input::Device>,
@@ -907,6 +908,13 @@ impl ShojiWM {
         self.display_handle
             .get_client(object.clone())
             .is_ok_and(|client| self.client_holds_session_lock(&client.id()))
+    }
+
+    /// Whether the seat's input method belongs to the locker.
+    pub(crate) fn input_method_is_lockers(&self) -> bool {
+        self.input_method_object
+            .as_ref()
+            .is_some_and(|input_method| self.of_session_locker(input_method))
     }
 
     pub(crate) fn client_holds_session_lock(
@@ -1786,7 +1794,7 @@ impl ShojiWM {
             smithay::wayland::alpha_modifier::AlphaModifierState::new::<Self>(&dh);
         let fixes_state = FixesState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
-        TextInputManagerState::new::<Self>(&dh);
+        crate::protocols::text_input::TextInputManagerGlobal::create(&dh);
         crate::protocols::input_method::InputMethodManagerGlobal::create(&dh);
         crate::protocols::virtual_keyboard::VirtualKeyboardManagerState::new::<Self>(&dh);
         RelativePointerManagerState::new::<Self>(&dh);
@@ -2060,6 +2068,7 @@ impl ShojiWM {
             next_virtual_keymap_serial: 0,
             bind_keycode_override: None,
             input_method_clients: Default::default(),
+            input_method_object: None,
             runtime_active_keyboard_device: None,
             runtime_input_devices: Default::default(),
             runtime_libinput_devices: Default::default(),

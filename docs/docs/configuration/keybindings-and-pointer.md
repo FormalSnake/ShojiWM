@@ -160,7 +160,10 @@ Under the lock no other client can open a menu grab, start a drag, set the
 cursor, lock the pointer or be activated; its input method gets no keyboard
 grab (the grab object exists and hears nothing, so the input method grabs
 again when it is next activated), cannot write into the locker's text input,
-and shows no popup over the lock screen; and a panel mapped on demand behind
+and shows no popup over the lock screen. No input method but the locker's
+hears a text input's state under the lock (activation, content type,
+surrounding text, cursor rectangle), so a password field reaches none of
+them; after the unlock the input method starts again from a deactivate; and a panel mapped on demand behind
 the lock screen does not take the keyboard at the unlock. A button held on the
 lock screen at the unlock comes up there, and its own release goes nowhere.
 `nonConsuming: true` runs the handler and still delivers the key or the button
