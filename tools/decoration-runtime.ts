@@ -353,6 +353,7 @@ import {
   type InputDeviceInfo,
   type KeyboardLayoutChangeEvent,
   type LidSwitchEvent,
+  type KeyboardFocusChangeEvent,
   type WindowCompositionFunction,
   type OutputStateSnapshot,
   type OutputInfo,
@@ -557,6 +558,7 @@ interface SchedulerTickRequest {
   inputState?: Record<string, InputDeviceInfo>;
   keyboardLayout?: KeyboardLayoutChangeEvent;
   lidSwitch?: LidSwitchEvent;
+  keyboardFocus?: { windowId: string | null };
 }
 
 interface WindowClosedRequest {
@@ -1953,6 +1955,13 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
             }
             if (request.lidSwitch) {
               events.emitLidSwitch(request.lidSwitch);
+            }
+            if (request.keyboardFocus) {
+              const focus: KeyboardFocusChangeEvent =
+                request.keyboardFocus.windowId == null
+                  ? {}
+                  : { windowId: request.keyboardFocus.windowId };
+              events.emitKeyboardFocusChange(focus);
             }
             const tick = processSchedulerTick(request.output);
             if (statsEnabled && tick.dirty) stats.schedulerTickDirty++;

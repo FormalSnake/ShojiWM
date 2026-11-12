@@ -108,6 +108,26 @@ an unsubscribe function. In a Rust config it is
 `COMPOSITOR.input.lid_switch()` is a signal holding the last state (`None`
 before the first report).
 
+## Which window has the keyboard
+
+`COMPOSITOR.event.onKeyboardFocusChange` reports the window the keys go to, by
+its own surface or a popup, and `windowId: undefined` while a layer surface,
+the lock screen or nothing has the keyboard. A window stays `isFocused` while a
+panel borrows the keyboard; this event says who actually gets the keys:
+
+```ts
+COMPOSITOR.event.onKeyboardFocusChange(({windowId}) => {
+  ipc.broadcast('keyboard-focus', windowId ?? null);
+});
+```
+
+It arrives on a scheduler tick like the lid: the current window on the first
+tick after enable or a reload, then each move, with moves between two ticks
+coalesced. In a Rust config it is
+`COMPOSITOR.event.on_keyboard_focus_change(|focus| ...)`, and
+`COMPOSITOR.input.keyboard_focus()` is a signal holding the last report
+(`focus.window_id`).
+
 ## Pointer (mouse) settings
 
 `pointer` — an `InputDeviceConfig.pointer` object.

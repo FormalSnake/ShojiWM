@@ -43,6 +43,7 @@ use shojiwm_lib::ssd::{
 use shojiwm_lib::{
     activation_environment::RuntimeEnvUpdates,
     config::RuntimeDisplayConfigUpdate,
+    keyboard_focus::KeyboardFocusSnapshot,
     keyboard_layout::KeyboardLayoutSnapshot,
     lid_switch::LidSwitchSnapshot,
     runtime_debug::RuntimeDebugConfigUpdate,
@@ -67,6 +68,7 @@ pub struct EmbeddedDecorationEvaluator {
     input_state: Arc<Mutex<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>>,
     keyboard_layout: Arc<Mutex<Option<KeyboardLayoutSnapshot>>>,
     lid_switch: Arc<Mutex<Option<LidSwitchSnapshot>>>,
+    keyboard_focus: Arc<Mutex<Option<KeyboardFocusSnapshot>>>,
     runtime_state_generation: Arc<AtomicU64>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
     host: RuntimeHost,
@@ -111,6 +113,7 @@ struct EmbeddedDecorationRuntime {
     last_sent_runtime_state_generation: u64,
     last_sent_keyboard_layout: Option<KeyboardLayoutSnapshot>,
     last_sent_lid_switch: Option<LidSwitchSnapshot>,
+    last_sent_keyboard_focus: Option<KeyboardFocusSnapshot>,
 }
 
 #[derive(serde::Serialize)]
@@ -894,6 +897,7 @@ impl EmbeddedDecorationEvaluator {
             input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             keyboard_layout: Arc::new(Mutex::new(None)),
             lid_switch: Arc::new(Mutex::new(None)),
+            keyboard_focus: Arc::new(Mutex::new(None)),
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             host: RuntimeHost::detached(),
@@ -910,6 +914,7 @@ impl EmbeddedDecorationEvaluator {
             input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             keyboard_layout: Arc::new(Mutex::new(None)),
             lid_switch: Arc::new(Mutex::new(None)),
+            keyboard_focus: Arc::new(Mutex::new(None)),
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             host: RuntimeHost::detached(),
@@ -986,6 +991,12 @@ impl EmbeddedDecorationEvaluator {
     pub fn set_lid_switch(&self, lid: LidSwitchSnapshot) {
         if let Ok(mut current) = self.lid_switch.lock() {
             *current = Some(lid);
+        }
+    }
+
+    pub fn set_keyboard_focus(&self, focus: KeyboardFocusSnapshot) {
+        if let Ok(mut current) = self.keyboard_focus.lock() {
+            *current = Some(focus);
         }
     }
 
@@ -1296,6 +1307,7 @@ impl EmbeddedDecorationEvaluator {
             last_sent_runtime_state_generation: 0,
             last_sent_keyboard_layout: None,
             last_sent_lid_switch: None,
+            last_sent_keyboard_focus: None,
         })
     }
 
@@ -1893,6 +1905,7 @@ impl Clone for EmbeddedDecorationEvaluator {
             input_state: Arc::clone(&self.input_state),
             keyboard_layout: Arc::clone(&self.keyboard_layout),
             lid_switch: Arc::clone(&self.lid_switch),
+            keyboard_focus: Arc::clone(&self.keyboard_focus),
             runtime_state_generation: Arc::clone(&self.runtime_state_generation),
             pointer_move_async: Arc::clone(&self.pointer_move_async),
             host: self.host.clone(),
@@ -2914,9 +2927,16 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
         let lid_switch = self.lid_switch.lock().map(|lid| *lid).unwrap_or_default();
         let layout_changed = runtime.last_sent_keyboard_layout != keyboard_layout;
         let lid_changed = runtime.last_sent_lid_switch != lid_switch;
+        let keyboard_focus = self
+            .keyboard_focus
+            .lock()
+            .map(|focus| focus.clone())
+            .unwrap_or_default();
+        let focus_changed = runtime.last_sent_keyboard_focus != keyboard_focus;
         if runtime.last_sent_runtime_state_generation == runtime_state_generation
             && !layout_changed
             && !lid_changed
+            && !focus_changed
         {
             runtime.write_scheduler_fast_request(
                 request_id,
@@ -2950,6 +2970,11 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
                     None
                 },
                 lid_switch: if lid_changed { lid_switch } else { None },
+                keyboard_focus: if focus_changed {
+                    keyboard_focus.clone()
+                } else {
+                    None
+                },
             })?;
             runtime.last_sent_runtime_state_generation = runtime_state_generation;
         }
@@ -2996,6 +3021,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
 
         runtime.last_sent_keyboard_layout = keyboard_layout;
         runtime.last_sent_lid_switch = lid_switch;
+        runtime.last_sent_keyboard_focus = keyboard_focus;
 
         if managed_rect_debug_enabled() {
             info!(
@@ -6949,6 +6975,63 @@ COMPOSITOR.event.onDisable((event) => event.persist("lids", lids));
         reloaded.scheduler_tick(6.0, None, &[]).unwrap();
         let state = reloaded.lifecycle_disable("shutdown").unwrap();
         assert_eq!(state["lids"], serde_json::json!([true]));
+        drop(reloaded);
+        drop(evaluator);
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn embedded_runtime_reports_keyboard_focus_and_reload() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-keyboard-focus-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r#"
+import { COMPOSITOR, Label } from "shoji_wm";
+COMPOSITOR.window.composition = () => <Label text="focus test" />;
+const focus = [];
+COMPOSITOR.event.onEnable(() => {
+  COMPOSITOR.event.onKeyboardFocusChange((event) => focus.push(event.windowId ?? "none"));
+});
+COMPOSITOR.event.onDisable((event) => event.persist("focus", focus));
+"#,
+        )
+        .unwrap();
+        let focus = |window: Option<&str>| KeyboardFocusSnapshot {
+            window_id: window.map(str::to_owned),
+        };
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&repository_root);
+        evaluator.lifecycle_enable("initial", None).unwrap();
+        evaluator.scheduler_tick(1.0, None, &[]).unwrap();
+        for (tick, window) in [
+            (2.0, Some("1")),
+            (3.0, Some("1")),
+            (4.0, None),
+            (5.0, Some("2")),
+        ] {
+            evaluator.set_keyboard_focus(focus(window));
+            evaluator.scheduler_tick(tick, None, &[]).unwrap();
+        }
+        let state = evaluator.lifecycle_disable("reload").unwrap();
+        assert_eq!(state["focus"], serde_json::json!(["1", "none", "2"]));
+        let reloaded = evaluator.fresh_like();
+        reloaded.lifecycle_enable("reload", None).unwrap();
+        reloaded.scheduler_tick(6.0, None, &[]).unwrap();
+        reloaded.scheduler_tick(7.0, None, &[]).unwrap();
+        let state = reloaded.lifecycle_disable("shutdown").unwrap();
+        assert_eq!(state["focus"], serde_json::json!(["2"]));
         drop(reloaded);
         drop(evaluator);
         std::fs::remove_dir_all(test_dir).unwrap();
