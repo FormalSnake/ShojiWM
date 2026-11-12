@@ -794,6 +794,7 @@ export type {
   CursorPosition,
   CursorPositionTarget,
   CursorKind,
+  CursorTransform,
   HotCorner,
   HotCornerOptions,
   InputAccelProfile,
