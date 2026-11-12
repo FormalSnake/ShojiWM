@@ -13,10 +13,20 @@
 //! A `code:N` bind names a key of the session's layout, and a virtual
 //! keyboard's keycodes are its own, so for its keys the bind compares N with
 //! the session layout's key for the same keysym (plain or shifted level).
+//!
+//! The one exception is a virtual keyboard of the input method's own client.
+//! An input method (fcitx5) grabs the keyboard and sends the keys it does not
+//! handle back through a virtual keyboard; through the input path they would
+//! land in its grab again, forever. Those keys go straight to the focused
+//! client, in the session keymap they came from, as sway does.
 
 use smithay::backend::input::{InputEvent, KeyState, Keycode};
 use smithay::input::keyboard::ModifiersState;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
+use smithay::reexports::wayland_server::protocol::wl_keyboard;
+use smithay::utils::SERIAL_COUNTER;
+use smithay::wayland::input_method::InputMethodSeat;
 use tracing::warn;
 use xkbcommon::xkb;
 
@@ -134,6 +144,29 @@ impl ShojiWM {
             keycode_for_keysym(keymap, xkb.active_layout().0, keysym).map(|(code, _)| code + 8)
         })
     }
+
+    /// `keyboard` belongs to the client running the input method, whose keys
+    /// skip the input path (see the module docs).
+    fn from_input_method(&self, keyboard: &ObjectId) -> bool {
+        self.seat.input_method().has_instance()
+            && self
+                .display_handle
+                .get_client(keyboard.clone())
+                .is_ok_and(|client| self.input_method_clients.contains(&client.id()))
+    }
+
+    /// Hand `f` each `wl_keyboard` of the focused client.
+    fn for_each_focused_wl_keyboard(&self, mut f: impl FnMut(&wl_keyboard::WlKeyboard)) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let Some(client) = keyboard.current_focus().and_then(|focus| focus.client()) else {
+            return;
+        };
+        for wl_keyboard in keyboard.client_keyboards(&client) {
+            f(&wl_keyboard);
+        }
+    }
 }
 
 impl VirtualKeyboardHandler for ShojiWM {
@@ -181,6 +214,18 @@ impl VirtualKeyboardHandler for ShojiWM {
         key: u32,
         pressed: bool,
     ) {
+        if self.from_input_method(keyboard) {
+            let serial = SERIAL_COUNTER.next_serial().into();
+            let state = if pressed {
+                wl_keyboard::KeyState::Pressed
+            } else {
+                wl_keyboard::KeyState::Released
+            };
+            self.for_each_focused_wl_keyboard(|wl_keyboard| {
+                wl_keyboard.key(serial, time_msec, key, state);
+            });
+            return;
+        }
         let keycode = key + 8;
         let session_keycode = self.session_keycode_for(keyboard, keycode);
         if !self.activate_virtual_keymap(keyboard) {
@@ -222,6 +267,13 @@ impl VirtualKeyboardHandler for ShojiWM {
         locked: u32,
         group: u32,
     ) {
+        if self.from_input_method(keyboard) {
+            let serial = SERIAL_COUNTER.next_serial().into();
+            self.for_each_focused_wl_keyboard(|wl_keyboard| {
+                wl_keyboard.modifiers(serial, depressed, latched, locked, group);
+            });
+            return;
+        }
         if !self.activate_virtual_keymap(keyboard) {
             return;
         }

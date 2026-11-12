@@ -211,6 +211,11 @@ types, the focused window runs its keymap; your layout comes back with the
 next key from another keyboard or when the tool exits, and the layout reported
 to the config does not change.
 
+An input method such as fcitx5 grabs the keyboard and sends the keys it does
+not handle back through a virtual keyboard of its own. Those keys go straight
+to the focused window in your layout, without key bindings, since the key
+already passed them on its way to the input method.
+
 ### Virtual pointers
 
 ShojiWM offers `zwlr_virtual_pointer_manager_v1` (version 2), so
