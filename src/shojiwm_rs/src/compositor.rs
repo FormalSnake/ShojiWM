@@ -477,6 +477,9 @@ pub struct KeyBindOptions {
     /// A bare modifier on release: fire whenever it goes up, also after a
     /// chord such as Alt+Tab, not only after a tap.
     pub transparent: bool,
+    /// A key or a mouse button: the handler runs and the event still reaches
+    /// the client.
+    pub non_consuming: bool,
 }
 
 impl KeyBindOptions {
@@ -501,6 +504,11 @@ impl KeyBindOptions {
 
     pub fn transparent(mut self) -> Self {
         self.transparent = true;
+        self
+    }
+
+    pub fn non_consuming(mut self) -> Self {
+        self.non_consuming = true;
         self
     }
 }
@@ -541,6 +549,7 @@ impl KeyController {
                 locked: false,
                 repeat: false,
                 transparent: false,
+                non_consuming: false,
             },
             handler,
         );
@@ -574,6 +583,7 @@ impl KeyController {
                 locked: options.locked,
                 repeat: options.repeat,
                 transparent: options.transparent,
+                non_consuming: options.non_consuming,
             },
             handler,
         );
@@ -592,6 +602,7 @@ impl KeyController {
                 locked: false,
                 repeat: false,
                 transparent: false,
+                non_consuming: false,
             },
             handler,
         );
