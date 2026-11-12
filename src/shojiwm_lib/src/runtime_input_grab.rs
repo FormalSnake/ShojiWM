@@ -12,10 +12,7 @@
 //! config reloads, and when the runtime fails to handle a grab event, so a
 //! broken config can never keep the desktop unreachable.
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
-use smithay::input::keyboard::Keycode;
 
 use crate::ssd::{
     GestureSwipeEventSnapshot, PointerModifierStateSnapshot, PointerMovePointSnapshot,
@@ -33,9 +30,6 @@ pub struct RuntimeInputGrabUpdate {
 #[derive(Debug, Clone)]
 pub struct RuntimeInputGrabState {
     pub id: u64,
-    /// Keys that were down when the grab started. Their releases still reach
-    /// the focused client (and the grab).
-    pub held_keys: HashSet<Keycode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

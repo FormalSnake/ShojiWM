@@ -139,7 +139,10 @@ COMPOSITOR.key.bind_with(
 
 ### Leaving the event to the client (`nonConsuming`)
 
-A binding takes its key or button: the focused client never sees it.
+A binding takes its key or button: the focused client never sees it, the
+key's release included, even when the binding moved the focus to another
+window. A key whose press reached the client gets its release there too, also
+when an `on: "release"` binding fires on it.
 `nonConsuming: true` runs the handler and still delivers the key or the button
 to the client it was meant for, so a config can watch a press without
 taking it, for example close a menu it shows on `Escape` while the window
@@ -362,7 +365,9 @@ const grab = COMPOSITOR.input.grab({
 - **Keys held when the grab starts** deliver their release to the client that
   saw the press, as well as to the grab, so a modifier held to open the grab
   (`Super` in `Super` + `Tab`) is not left stuck in the focused window. Its
-  release is also how a "hold to keep open" UI notices the user let go.
+  release is also how a "hold to keep open" UI notices the user let go. A key
+  the client never saw go down, such as the `Tab` a binding took to open the
+  grab or a key pressed under it, never comes up in the client.
 - **Key names** are xkb keysym names, as in shortcuts: `"Tab"`, `"Return"`,
   `"space"`, `"Escape"`, `"Left"`, `"Super_L"`, `"a"`.
 - **The compositor ends the grab on its own** when the screen locks, when a

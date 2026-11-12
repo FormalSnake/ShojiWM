@@ -23,7 +23,7 @@ use smithay::{
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -84,6 +84,39 @@ fn vt_switch_target(
         keysyms::KEY_F11 => Some(11),
         keysyms::KEY_F12 => Some(12),
         _ => None,
+    }
+}
+
+/// Sends a key's release where its press went, whatever the filter answered
+/// for the release: a client never gets the release of a press it did not
+/// see, and always gets the release of one it did, or the key stays down in
+/// it. `consumed` holds the keys whose press the filter took. A binding the
+/// filter matched on a release that goes to the client is returned, to run
+/// beside it.
+fn pair_with_press(
+    consumed: &mut HashSet<Keycode>,
+    keycode: Keycode,
+    state: KeyState,
+    result: FilterResult<KeyboardAction>,
+) -> (FilterResult<KeyboardAction>, Option<String>) {
+    match state {
+        KeyState::Pressed => {
+            if matches!(result, FilterResult::Intercept(_)) {
+                consumed.insert(keycode);
+            } else {
+                consumed.remove(&keycode);
+            }
+            (result, None)
+        }
+        KeyState::Released => match (consumed.remove(&keycode), result) {
+            (true, FilterResult::Forward) => {
+                (FilterResult::Intercept(KeyboardAction::Forward), None)
+            }
+            (false, FilterResult::Intercept(KeyboardAction::RuntimeKeyBinding(id))) => {
+                (FilterResult::Forward, Some(id))
+            }
+            (_, result) => (result, None),
+        },
     }
 }
 
@@ -246,6 +279,161 @@ impl ShojiWM {
         self.non_consuming_key_binding_id
             .take()
             .map(KeyboardAction::RuntimeKeyBinding)
+    }
+
+    /// [`pair_with_press`] on the seat's keyboard.
+    fn pair_key_event(
+        &mut self,
+        keycode: Keycode,
+        state: KeyState,
+        result: FilterResult<KeyboardAction>,
+    ) -> FilterResult<KeyboardAction> {
+        let (result, binding) = pair_with_press(&mut self.consumed_keys, keycode, state, result);
+        if binding.is_some() {
+            self.non_consuming_key_binding_id = binding;
+        }
+        result
+    }
+
+    /// Where the keyboard filter sends a key outside the session lock: to the
+    /// input grab, an `Auto` popup, a binding, the compositor's own chords, or
+    /// the focused client.
+    fn filter_unlocked_key(
+        &mut self,
+        modifiers: &smithay::input::keyboard::ModifiersState,
+        handle: &smithay::input::keyboard::KeysymHandle<'_>,
+        key_phase: crate::runtime_key_binding::RuntimeKeyBindingPhase,
+        time: u32,
+        runtime_key_bindings: &[crate::runtime_key_binding::CompiledRuntimeKeyBinding],
+    ) -> FilterResult<KeyboardAction> {
+        // An input grab takes every press, except the compositor's own
+        // escape hatches (quit, reload, VT switch). Releases are left to
+        // `pair_key_event`: a key held when the grab started was pressed in
+        // the focused client, which gets its release.
+        if self.runtime_input_grab.is_some() {
+            self.modifier_tap.interrupt();
+            let raw = handle.raw_latin_sym_or_raw_current_sym();
+            let builtin = matches!(
+                key_phase,
+                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+            ) && raw.is_some_and(|raw| {
+                let raw = raw.raw();
+                (modifiers.logo
+                    && modifiers.shift
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && (raw == keysyms::KEY_q || raw == keysyms::KEY_r))
+                    || (modifiers.ctrl
+                        && modifiers.alt
+                        && (keysyms::KEY_F1..=keysyms::KEY_F12).contains(&raw))
+            });
+            if !builtin {
+                let released = matches!(
+                    key_phase,
+                    crate::runtime_key_binding::RuntimeKeyBindingPhase::Release,
+                );
+                self.pending_input_grab_key_event = Some(InputGrabEventSnapshot::Key {
+                    key: raw
+                        .map(smithay::input::keyboard::xkb::keysym_get_name)
+                        .unwrap_or_default(),
+                    keycode: handle.raw_code().raw(),
+                    state: if released {
+                        InputGrabStateSnapshot::Released
+                    } else {
+                        InputGrabStateSnapshot::Pressed
+                    },
+                    modifiers: PointerModifierStateSnapshot {
+                        logo: modifiers.logo,
+                        alt: modifiers.alt,
+                        ctrl: modifiers.ctrl,
+                        shift: modifiers.shift,
+                    },
+                    timestamp: u64::from(time),
+                });
+                return if released {
+                    FilterResult::Forward
+                } else {
+                    FilterResult::Intercept(KeyboardAction::Forward)
+                };
+            }
+        }
+
+        // An open `Auto` popup takes Escape before the focused client (light
+        // dismiss).
+        if matches!(
+            key_phase,
+            crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+        ) && !modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.logo
+            && handle
+                .raw_latin_sym_or_raw_current_sym()
+                .is_some_and(|raw| raw.raw() == keysyms::KEY_Escape)
+            && self.popup_takes_escape()
+        {
+            return FilterResult::Intercept(KeyboardAction::DismissPopup);
+        }
+
+        if let Some(binding) = runtime_key_bindings.iter().find(|binding| {
+            binding.matches(key_phase, modifiers, handle, self.bind_keycode(handle))
+        }) {
+            return self.key_binding_filter_result(binding);
+        }
+
+        if matches!(
+            key_phase,
+            crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+        ) && modifiers.logo
+            && modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
+            && raw.raw() == keysyms::KEY_q
+        {
+            FilterResult::Intercept(KeyboardAction::Quit)
+        } else if matches!(
+            key_phase,
+            crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+        ) && modifiers.logo
+            && modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
+            && raw.raw() == keysyms::KEY_r
+        {
+            FilterResult::Intercept(KeyboardAction::ReloadConfig)
+        } else if matches!(
+            key_phase,
+            crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+        ) && modifiers.logo
+            && modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt
+            && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
+            && let Some(digit) = match raw.raw() {
+                keysyms::KEY_0 => Some(0u8),
+                keysyms::KEY_1 => Some(1),
+                keysyms::KEY_2 => Some(2),
+                keysyms::KEY_3 => Some(3),
+                keysyms::KEY_4 => Some(4),
+                keysyms::KEY_5 => Some(5),
+                keysyms::KEY_6 => Some(6),
+                keysyms::KEY_7 => Some(7),
+                keysyms::KEY_8 => Some(8),
+                keysyms::KEY_9 => Some(9),
+                _ => None,
+            }
+        {
+            FilterResult::Intercept(KeyboardAction::LogMarker(digit))
+        } else if matches!(
+            key_phase,
+            crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+        ) && let Some(vt) = vt_switch_target(modifiers, handle)
+        {
+            FilterResult::Intercept(KeyboardAction::ChangeVt(vt))
+        } else {
+            FilterResult::Forward
+        }
     }
 
     /// Run the modifier bindings queued by key input or a modifier change.
@@ -427,15 +615,18 @@ impl ShojiWM {
                 // VT switching stays available: it shows another VT, not the
                 // session, and it is the way out when the locker never shows
                 // up (e.g. a session started locked whose locker failed).
-                if let Some(vt) = vt_switch_target(modifiers, &handle).filter(|_| pressed) {
-                    return FilterResult::Intercept(KeyboardAction::ChangeVt(vt));
-                }
-                match locked_bindings.iter().find(|binding| {
-                    binding.matches(phase, modifiers, &handle, data.bind_keycode(&handle))
-                }) {
-                    Some(binding) => data.key_binding_filter_result(binding),
-                    None => FilterResult::Forward,
-                }
+                let result =
+                    if let Some(vt) = vt_switch_target(modifiers, &handle).filter(|_| pressed) {
+                        FilterResult::Intercept(KeyboardAction::ChangeVt(vt))
+                    } else {
+                        match locked_bindings.iter().find(|binding| {
+                            binding.matches(phase, modifiers, &handle, data.bind_keycode(&handle))
+                        }) {
+                            Some(binding) => data.key_binding_filter_result(binding),
+                            None => FilterResult::Forward,
+                        }
+                    };
+                data.pair_key_event(handle.raw_code(), event.state(), result)
             },
         );
         let action = self.take_non_consuming_key_binding().or(action);
@@ -985,10 +1176,7 @@ impl ShojiWM {
         }
         if self.session_lock_active {
             // The lock owns input; tell the config its grab never started.
-            self.runtime_input_grab = Some(RuntimeInputGrabState {
-                id: update.id,
-                held_keys: Default::default(),
-            });
+            self.runtime_input_grab = Some(RuntimeInputGrabState { id: update.id });
             self.end_runtime_input_grab(Some("sessionLock"));
             return;
         }
@@ -996,15 +1184,7 @@ impl ShojiWM {
             grab.id = update.id;
             return;
         }
-        let held_keys = self
-            .seat
-            .get_keyboard()
-            .map(|keyboard| keyboard.pressed_keys())
-            .unwrap_or_default();
-        self.runtime_input_grab = Some(RuntimeInputGrabState {
-            id: update.id,
-            held_keys,
-        });
+        self.runtime_input_grab = Some(RuntimeInputGrabState { id: update.id });
         info!(grab_id = update.id, "input grab started");
 
         // Clients lose the pointer for the duration: hover states clear and
@@ -1336,142 +1516,14 @@ impl ShojiWM {
                                 }
                             }
 
-                            // An input grab takes every key, except the
-                            // compositor's own escape hatches (quit, reload,
-                            // VT switch). Releases of keys held when the grab
-                            // started also reach the client that saw the press.
-                            if let Some(grab) = data.runtime_input_grab.as_mut() {
-                                data.modifier_tap.interrupt();
-                                let raw = handle.raw_latin_sym_or_raw_current_sym();
-                                let builtin = matches!(
-                                    key_phase,
-                                    crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                                ) && raw.is_some_and(|raw| {
-                                    let raw = raw.raw();
-                                    (modifiers.logo
-                                        && modifiers.shift
-                                        && !modifiers.ctrl
-                                        && !modifiers.alt
-                                        && (raw == keysyms::KEY_q || raw == keysyms::KEY_r))
-                                        || (modifiers.ctrl
-                                            && modifiers.alt
-                                            && (keysyms::KEY_F1..=keysyms::KEY_F12).contains(&raw))
-                                });
-                                if !builtin {
-                                    let released = matches!(
-                                        key_phase,
-                                        crate::runtime_key_binding::RuntimeKeyBindingPhase::Release,
-                                    );
-                                    let held_release =
-                                        released && grab.held_keys.remove(&handle.raw_code());
-                                    data.pending_input_grab_key_event =
-                                        Some(InputGrabEventSnapshot::Key {
-                                            key: raw
-                                                .map(smithay::input::keyboard::xkb::keysym_get_name)
-                                                .unwrap_or_default(),
-                                            keycode: handle.raw_code().raw(),
-                                            state: if released {
-                                                InputGrabStateSnapshot::Released
-                                            } else {
-                                                InputGrabStateSnapshot::Pressed
-                                            },
-                                            modifiers: PointerModifierStateSnapshot {
-                                                logo: modifiers.logo,
-                                                alt: modifiers.alt,
-                                                ctrl: modifiers.ctrl,
-                                                shift: modifiers.shift,
-                                            },
-                                            timestamp: u64::from(time),
-                                        });
-                                    return if held_release {
-                                        FilterResult::Forward
-                                    } else {
-                                        FilterResult::Intercept(KeyboardAction::Forward)
-                                    };
-                                }
-                            }
-
-                            // An open `Auto` popup takes Escape before the
-                            // focused client (light dismiss).
-                            if matches!(
+                            let result = data.filter_unlocked_key(
+                                modifiers,
+                                &handle,
                                 key_phase,
-                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                            ) && !modifiers.ctrl
-                                && !modifiers.alt
-                                && !modifiers.logo
-                                && handle
-                                    .raw_latin_sym_or_raw_current_sym()
-                                    .is_some_and(|raw| raw.raw() == keysyms::KEY_Escape)
-                                && data.popup_takes_escape()
-                            {
-                                return FilterResult::Intercept(KeyboardAction::DismissPopup);
-                            }
-
-                            if let Some(binding) = runtime_key_bindings.iter().find(|binding| {
-                                binding.matches(
-                                    key_phase,
-                                    modifiers,
-                                    &handle,
-                                    data.bind_keycode(&handle),
-                                )
-                            }) {
-                                return data.key_binding_filter_result(binding);
-                            }
-
-                            if matches!(
-                                key_phase,
-                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                            ) && modifiers.logo
-                                && modifiers.shift
-                                && !modifiers.ctrl
-                                && !modifiers.alt
-                                && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
-                                && raw.raw() == keysyms::KEY_q
-                            {
-                                FilterResult::Intercept(KeyboardAction::Quit)
-                            } else if matches!(
-                                key_phase,
-                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                            ) && modifiers.logo
-                                && modifiers.shift
-                                && !modifiers.ctrl
-                                && !modifiers.alt
-                                && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
-                                && raw.raw() == keysyms::KEY_r
-                            {
-                                FilterResult::Intercept(KeyboardAction::ReloadConfig)
-                            } else if matches!(
-                                key_phase,
-                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                            ) && modifiers.logo
-                                && modifiers.shift
-                                && !modifiers.ctrl
-                                && !modifiers.alt
-                                && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
-                                && let Some(digit) = match raw.raw() {
-                                    keysyms::KEY_0 => Some(0u8),
-                                    keysyms::KEY_1 => Some(1),
-                                    keysyms::KEY_2 => Some(2),
-                                    keysyms::KEY_3 => Some(3),
-                                    keysyms::KEY_4 => Some(4),
-                                    keysyms::KEY_5 => Some(5),
-                                    keysyms::KEY_6 => Some(6),
-                                    keysyms::KEY_7 => Some(7),
-                                    keysyms::KEY_8 => Some(8),
-                                    keysyms::KEY_9 => Some(9),
-                                    _ => None,
-                                }
-                            {
-                                FilterResult::Intercept(KeyboardAction::LogMarker(digit))
-                            } else if matches!(
-                                key_phase,
-                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
-                            ) && let Some(vt) = vt_switch_target(modifiers, &handle)
-                            {
-                                FilterResult::Intercept(KeyboardAction::ChangeVt(vt))
-                            } else {
-                                FilterResult::Forward
-                            }
+                                time,
+                                &runtime_key_bindings,
+                            );
+                            data.pair_key_event(handle.raw_code(), event.state(), result)
                         },
                     )
                     .unwrap_or(KeyboardAction::Forward);
@@ -4260,5 +4312,84 @@ mod pointer_motion_space_tests {
                 "scale {scale} produced a multi-pixel step: {steps:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod key_pairing_tests {
+    use super::{KeyboardAction, pair_with_press};
+    use smithay::backend::input::{KeyState, Keycode};
+    use smithay::input::keyboard::FilterResult;
+    use std::collections::HashSet;
+
+    const H: Keycode = Keycode::new(43);
+
+    fn taken() -> FilterResult<KeyboardAction> {
+        FilterResult::Intercept(KeyboardAction::RuntimeKeyBinding("bind".into()))
+    }
+
+    fn reaches_client(result: &(FilterResult<KeyboardAction>, Option<String>)) -> bool {
+        matches!(result.0, FilterResult::Forward)
+    }
+
+    #[test]
+    fn the_release_of_a_taken_press_is_taken() {
+        let mut consumed = HashSet::new();
+        assert!(!reaches_client(&pair_with_press(
+            &mut consumed,
+            H,
+            KeyState::Pressed,
+            taken()
+        )));
+        let release = pair_with_press(&mut consumed, H, KeyState::Released, FilterResult::Forward);
+        assert!(matches!(
+            release,
+            (FilterResult::Intercept(KeyboardAction::Forward), None)
+        ));
+        assert!(consumed.is_empty());
+    }
+
+    #[test]
+    fn the_release_of_a_forwarded_press_reaches_the_client() {
+        let mut consumed = HashSet::new();
+        pair_with_press(&mut consumed, H, KeyState::Pressed, FilterResult::Forward);
+        let release = pair_with_press(&mut consumed, H, KeyState::Released, FilterResult::Forward);
+        assert!(matches!(release, (FilterResult::Forward, None)));
+    }
+
+    #[test]
+    fn a_release_binding_on_a_forwarded_press_runs_and_the_client_gets_the_release() {
+        let mut consumed = HashSet::new();
+        pair_with_press(&mut consumed, H, KeyState::Pressed, FilterResult::Forward);
+        let release = pair_with_press(&mut consumed, H, KeyState::Released, taken());
+        assert!(matches!(release, (FilterResult::Forward, Some(ref id)) if id == "bind"));
+    }
+
+    #[test]
+    fn a_release_binding_on_a_taken_press_keeps_the_release() {
+        let mut consumed = HashSet::new();
+        pair_with_press(&mut consumed, H, KeyState::Pressed, taken());
+        let release = pair_with_press(&mut consumed, H, KeyState::Released, taken());
+        assert!(matches!(
+            release,
+            (FilterResult::Intercept(KeyboardAction::RuntimeKeyBinding(ref id)), None) if id == "bind"
+        ));
+    }
+
+    #[test]
+    fn a_release_with_no_press_seen_reaches_the_client() {
+        let mut consumed = HashSet::new();
+        let release = pair_with_press(&mut consumed, H, KeyState::Released, FilterResult::Forward);
+        assert!(reaches_client(&release));
+    }
+
+    #[test]
+    fn the_next_press_overrides_a_taken_press_whose_release_was_lost() {
+        let mut consumed = HashSet::new();
+        pair_with_press(&mut consumed, H, KeyState::Pressed, taken());
+        pair_with_press(&mut consumed, H, KeyState::Pressed, FilterResult::Forward);
+        let release = pair_with_press(&mut consumed, H, KeyState::Released, FilterResult::Forward);
+        assert!(reaches_client(&release));
+        assert!(consumed.is_empty());
     }
 }

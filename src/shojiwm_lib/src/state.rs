@@ -563,6 +563,10 @@ pub struct ShojiWM {
     pub pending_input_grab_key_event: Option<crate::runtime_input_grab::InputGrabEventSnapshot>,
     pub current_keyboard_modifiers: ModifiersState,
     pub consumed_pointer_buttons: HashSet<(String, u32)>,
+    /// Keys whose last press the keyboard filter took. Entries outlive a lost
+    /// release (a VT switch): an entry is only read on a release, after the
+    /// key's next press has rewritten it.
+    pub consumed_keys: HashSet<smithay::input::keyboard::Keycode>,
     pub modifier_tap: crate::modifier_tap::ModifierTapTracker,
     pub pending_tap_binding_ids: Vec<String>,
     /// A binding whose key the keyboard filter left to the client, run right
@@ -2023,6 +2027,7 @@ impl ShojiWM {
             pending_input_grab_key_event: None,
             current_keyboard_modifiers: ModifiersState::default(),
             consumed_pointer_buttons: HashSet::new(),
+            consumed_keys: HashSet::new(),
             modifier_tap: Default::default(),
             pending_tap_binding_ids: Vec::new(),
             non_consuming_key_binding_id: None,
