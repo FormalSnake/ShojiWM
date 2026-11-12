@@ -676,6 +676,93 @@ mod tests {
     }
 
     #[test]
+    fn repeat_needs_a_key_on_press() {
+        let repeat = |shortcut: &str, on| RuntimeKeyBindingEntry {
+            repeat: true,
+            ..entry(shortcut, on)
+        };
+        let binding = repeat("XF86AudioRaiseVolume", RuntimeKeyBindingPhase::Press)
+            .compile()
+            .unwrap();
+        assert!(binding.repeat && !binding.locked);
+        for (shortcut, on) in [
+            ("XF86AudioRaiseVolume", RuntimeKeyBindingPhase::Release),
+            ("Super", RuntimeKeyBindingPhase::Release),
+            ("Super+WheelScrollUp", RuntimeKeyBindingPhase::Press),
+            ("Super+MouseBack", RuntimeKeyBindingPhase::Press),
+        ] {
+            assert!(matches!(
+                repeat(shortcut, on).compile(),
+                Err(RuntimeKeyBindingParseError::RepeatRequiresKeyPress(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn keycode_shortcuts_name_the_physical_key() {
+        let shortcut = parse_runtime_key_shortcut("Super+Shift+code:10").unwrap();
+        assert_eq!(shortcut.keycode, Some(10));
+        assert!(shortcut.keysym.is_none());
+        assert!(shortcut.logo && shortcut.shift);
+        assert!(!shortcut.is_modifier_only());
+        assert_eq!(
+            parse_runtime_key_shortcut("CODE:19").unwrap().keycode,
+            Some(19)
+        );
+        assert!(
+            entry("Super+code:10", RuntimeKeyBindingPhase::Press)
+                .compile()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn keycodes_below_eight_and_extra_keys_are_rejected() {
+        for shortcut in ["Super+code:7", "Super+code:x", "Super+code:", "code:10+a"] {
+            assert!(
+                parse_runtime_key_shortcut(shortcut).is_err(),
+                "{shortcut} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn locked_needs_a_key() {
+        let locked = |shortcut: &str, on| RuntimeKeyBindingEntry {
+            locked: true,
+            ..entry(shortcut, on)
+        };
+        for on in [
+            RuntimeKeyBindingPhase::Press,
+            RuntimeKeyBindingPhase::Release,
+        ] {
+            assert!(locked("XF86MonBrightnessUp", on).compile().unwrap().locked);
+        }
+        for (shortcut, on) in [
+            ("Super", RuntimeKeyBindingPhase::Release),
+            ("Super+WheelScrollUp", RuntimeKeyBindingPhase::Press),
+            ("Super+MouseForward", RuntimeKeyBindingPhase::Press),
+        ] {
+            assert!(matches!(
+                locked(shortcut, on).compile(),
+                Err(RuntimeKeyBindingParseError::LockedRequiresKey(_)),
+            ));
+        }
+    }
+
+    #[test]
+    fn options_default_off_on_the_wire() {
+        let entry: RuntimeKeyBindingEntry =
+            serde_json::from_str(r#"{"id":"a","shortcut":"Super+T","on":"press"}"#).unwrap();
+        assert!(!entry.locked && !entry.repeat);
+        let entry: RuntimeKeyBindingEntry = serde_json::from_str(
+            r#"{"id":"a","shortcut":"XF86AudioMute","locked":true,"repeat":true}"#,
+        )
+        .unwrap();
+        assert!(entry.locked && entry.repeat);
+    }
+
+    #[test]
     fn combo_shortcut_has_keysym() {
         let shortcut = parse_runtime_key_shortcut("Super+A").unwrap();
         assert!(!shortcut.is_modifier_only());

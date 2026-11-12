@@ -7615,6 +7615,10 @@ fn collect_text_buffers(
         text_align: node.style.text_align.clone(),
         text_overflow: node.style.text_overflow.clone(),
         line_height: node.style.line_height.map(|value| value as f32),
+        text_shadow: node.style.text_shadow.map(|shadow| crate::ssd::TextShadow {
+            color: shadow.color.with_opacity(node.style.opacity),
+            ..shadow
+        }),
         raster_scale,
     };
 
@@ -8637,7 +8641,7 @@ mod tests {
 
         // Border ring outer curve: corner circle at root-local physical
         // (r_out, r_out) with r_out = snapped outer radius.
-        let r_out = ((10.0 * scale).round()) as f64; // 18 px
+        let r_out = (10.0 * scale).round(); // 18 px
         let (ccx, ccy) = (r_out, r_out);
         let mut worst: Option<(f64, f32)> = None;
         let mut worst_raw: Option<(f64, f32)> = None;

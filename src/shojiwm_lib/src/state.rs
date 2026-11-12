@@ -68,8 +68,8 @@ use smithay::{
         presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
         selection::{
-            data_device::DataDeviceState, primary_selection::PrimarySelectionState,
-            wlr_data_control::DataControlState,
+            data_device::DataDeviceState, ext_data_control::DataControlState as ExtDataControlState,
+            primary_selection::PrimarySelectionState, wlr_data_control::DataControlState,
         },
         session_lock::{LockSurface, SessionLockManagerState},
         shell::kde::decoration::KdeDecorationState,
@@ -354,6 +354,9 @@ pub struct ShojiWM {
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
+    /// `ext-data-control-v1`, the standard form of `wlr-data-control`:
+    /// clipboard managers such as Vicinae's history bind only this one.
+    pub ext_data_control_state: ExtDataControlState,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
@@ -578,6 +581,7 @@ pub struct ShojiWM {
     pub layer_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub popup_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub config_error_report: Option<crate::config_error::ConfigErrorReport>,
+    pub failed_frame_evaluations: crate::config_error::FailedFrameEvaluations,
     pub layer_backdrop_cache: HashMap<String, crate::backend::shader_effect::CachedBackdropTexture>,
     pub layer_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
@@ -1737,6 +1741,8 @@ impl ShojiWM {
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        let ext_data_control_state =
+            ExtDataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
 
         // A seat is a group of keyboards, pointer and touch devices.
         // A seat typically has a pointer and maintains a keyboard focus and a pointer focus.
@@ -1898,6 +1904,7 @@ impl ShojiWM {
             data_device_state,
             primary_selection_state,
             data_control_state,
+            ext_data_control_state,
             popups,
             seat,
 
@@ -2027,6 +2034,7 @@ impl ShojiWM {
             layer_effect_evaluation_cache: HashMap::new(),
             popup_effect_evaluation_cache: HashMap::new(),
             config_error_report,
+            failed_frame_evaluations: Default::default(),
             layer_backdrop_cache: HashMap::new(),
             layer_framebuffer_effect_states: HashMap::new(),
             layer_effect_cache: HashMap::new(),
@@ -3455,6 +3463,7 @@ impl ShojiWM {
         self.runtime_scheduler_enabled = true;
         self.mark_all_window_decoration_policies_reloaded();
         self.config_error_report = None;
+        self.failed_frame_evaluations.clear();
         // The overlay was just cleared: effect failures that are still there must show up again.
         crate::backend::shader_effect::reset_effect_error_reports();
         self.runtime_poll_dirty = true;
@@ -3531,6 +3540,7 @@ impl ShojiWM {
         }
 
         self.config_error_report = None;
+        self.failed_frame_evaluations.clear();
         // The overlay was just cleared: effect failures that are still there must show up again.
         crate::backend::shader_effect::reset_effect_error_reports();
         self.runtime_poll_dirty = true;

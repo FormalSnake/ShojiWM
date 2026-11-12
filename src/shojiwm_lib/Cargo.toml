@@ -8,17 +8,9 @@ edition = "2024"
 libc = "0.2.183"
 bitflags = "2.11.0"
 thiserror = "2.0.12"
-smithay = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "c1253794ee2a7c466e88bb20dfdaabb4ccbfb2aa",
-    features = ["use_system_lib", "xwayland"]
-}
-smithay-drm-extras = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "c1253794ee2a7c466e88bb20dfdaabb4ccbfb2aa",
-    package = "smithay-drm-extras",
-    default-features = false
-}
+# The fork's rev is in the workspace's Cargo.toml.
+smithay = { workspace = true, features = ["use_system_lib", "xwayland"] }
+smithay-drm-extras = { workspace = true }
 # xwayland-satellite, run in-process on its own thread (see
 # `xwayland_satellite.rs`). Renamed so the crate does not clash with that module.
 satellite = {
@@ -67,11 +59,7 @@ wayland-client = "0.31.14"
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 # DummyRenderer, for building surface render elements without a GPU.
-smithay = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "c1253794ee2a7c466e88bb20dfdaabb4ccbfb2aa",
-    features = ["renderer_test"]
-}
+smithay = { workspace = true, features = ["renderer_test"] }
 
 [features]
 # Hardened allocator for chasing heap corruption:
