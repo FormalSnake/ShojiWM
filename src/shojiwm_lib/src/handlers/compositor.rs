@@ -841,10 +841,14 @@ impl CompositorHandler for ShojiWM {
             self.refresh_idle_inhibit_state();
         }
 
-        if cursor_surface_committed
-            || dnd_icon_committed
-            || self.is_session_lock_surface_tree_surface(surface)
-        {
+        let lock_surface = self.is_session_lock_surface_tree_surface(surface);
+        if lock_surface {
+            // A lock surface mapping under a still pointer takes it here, as
+            // a layer surface does: otherwise the locker's first pointer event
+            // is the enter a move brings, never a motion.
+            self.refresh_pointer_focus(Duration::from(self.clock.now()).as_millis() as u32);
+        }
+        if cursor_surface_committed || dnd_icon_committed || lock_surface {
             self.schedule_redraw();
         }
     }

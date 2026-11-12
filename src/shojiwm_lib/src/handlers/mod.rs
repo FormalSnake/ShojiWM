@@ -299,6 +299,7 @@ impl SessionLockHandler for ShojiWM {
         self.session_locker = None;
         self.session_lock_surfaces.clear();
         self.pointer_contents = crate::state::PointerContents::default();
+        self.queue_pointer_focus_refresh();
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(
                 self,
