@@ -153,6 +153,9 @@ has been an input method cannot type, even after it gave the input method up;
 any other, such as an on-screen keyboard, types into the locker. ShojiWM knows
 an input method by its connection, so a virtual keyboard an input method opens
 on a second connection is one of those others and types into the locker too.
+The pointer under the lock reaches a lock surface or nothing, also where no lock
+surface has mapped yet: a button held in a window when the lock goes up comes
+up in that window at once, a drag is cancelled and a pointer lock lets go.
 `nonConsuming: true` runs the handler and still delivers the key or the button
 to the client it was meant for, so a config can watch a press without
 taking it, for example close a menu it shows on `Escape` while the window
@@ -371,7 +374,13 @@ const grab = COMPOSITOR.input.grab({
   except the compositor's own (`Super` + `Shift` + `R` / `Q`, `Ctrl` + `Alt` +
   `F1`–`F12`). Positions are global logical pixels.
 - **The pointer still moves the cursor.** Clients lose pointer focus for the
-  duration (hover states clear) and get it back when the grab ends.
+  duration (hover states clear) and get it back when the grab ends. A button
+  held in a client when the grab starts comes up in that client at once; one
+  pressed under the grab comes up in the grab, or nowhere if the grab ended
+  first.
+- **The keyboard focus waits for the grab to end.** A window focused, or a
+  layer surface that asks for the keyboard, while the grab is held gets it
+  when the grab is released.
 - **Keys held when the grab starts** deliver their release to the client that
   saw the press, as well as to the grab, so a modifier held to open the grab
   (`Super` in `Super` + `Tab`) is not left stuck in the focused window. Its
@@ -388,6 +397,7 @@ const grab = COMPOSITOR.input.grab({
 - Touch input is not grabbed.
 
 Calls that act on windows (`window.focus()`, activating a window through your
-window manager) work in the handlers as they do in key bindings. Inside a 3D
+window manager) work in the handlers as they do in key bindings; the keyboard
+moves once the grab is released. Inside a 3D
 layout, [`pickPlane`](./output-composition-reference.md#picking) finds the
 plane under the pointer.

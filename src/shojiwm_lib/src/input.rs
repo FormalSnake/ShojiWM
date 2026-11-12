@@ -858,6 +858,7 @@ impl ShojiWM {
         for device in devices {
             self.release_held_keys(&device);
         }
+        self.take_pointer_from_clients();
         let _ = self.display_handle.flush_clients();
     }
 
@@ -867,6 +868,7 @@ impl ShojiWM {
         // Keys and buttons let go on another VT sent us no release.
         self.modifier_tap.reset();
         self.consumed_pointer_buttons.clear();
+        self.input_grab_pointer_buttons.clear();
     }
 
     /// Stop repeating a held binding: another key went down, its own key
@@ -965,7 +967,7 @@ impl ShojiWM {
 
     fn forward_locked_pointer_button(
         &mut self,
-        button: u32,
+        button_key: &(String, u32),
         state: ButtonState,
         serial: Serial,
         time: u32,
@@ -981,19 +983,89 @@ impl ShojiWM {
                 time,
             },
         );
+        self.send_pointer_button(&pointer, button_key, state, serial, time);
+        pointer.frame(self);
+        self.focus_session_lock_surface(serial);
+        let _ = self.display_handle.flush_clients();
+        self.schedule_redraw();
+    }
+
+    /// Every button smithay hears goes through here, so a press a client got
+    /// can still come up in it when the lock or an input grab takes the
+    /// pointer away (`take_pointer_from_clients`).
+    fn send_pointer_button(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        button_key: &(String, u32),
+        state: ButtonState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match state {
+            ButtonState::Pressed => {
+                self.pointer_buttons_down.insert(button_key.clone());
+            }
+            ButtonState::Released => {
+                self.pointer_buttons_down.remove(button_key);
+            }
+        }
         pointer.button(
             self,
             &ButtonEvent {
-                button,
+                button: button_key.1,
                 state,
                 serial,
                 time,
             },
         );
+    }
+
+    /// The lock goes up, or an input grab takes the pointer from a client: a
+    /// drag in progress is cancelled (smithay drops it on a release), the
+    /// client that has a button down gets its release now, and its own
+    /// release goes nowhere; any other pointer grab ends, and the pointer
+    /// leaves the surface it is on, which lets go of a pointer constraint.
+    pub(crate) fn take_pointer_from_clients(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let time = std::time::Duration::from(self.clock.now()).as_millis() as u32;
+        let dragging = self
+            .dnd
+            .active
+            .as_ref()
+            .is_some_and(|drag| drag.device == crate::dnd::DragDevice::Pointer);
+        if dragging && pointer.is_grabbed() {
+            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
+        }
+        let mut held = self.pointer_buttons_down.drain().collect::<Vec<_>>();
+        held.sort();
+        for button_key in held {
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    button: button_key.1,
+                    state: ButtonState::Released,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            self.consumed_pointer_buttons.insert(button_key);
+        }
+        if pointer.is_grabbed() {
+            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
+        }
+        self.pointer_contents = Default::default();
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
         pointer.frame(self);
-        self.focus_session_lock_surface(serial);
-        let _ = self.display_handle.flush_clients();
-        self.schedule_redraw();
     }
 
     /// Invoke a runtime key binding handler by id and apply the resulting
@@ -1426,18 +1498,7 @@ impl ShojiWM {
 
         // Clients lose the pointer for the duration: hover states clear and
         // the cursor goes back to the default arrow.
-        let location = pointer.current_location();
-        self.pointer_contents = Default::default();
-        pointer.motion(
-            self,
-            None,
-            &MotionEvent {
-                location,
-                serial: SERIAL_COUNTER.next_serial(),
-                time: self.input_grab_now_ms() as u32,
-            },
-        );
-        pointer.frame(self);
+        self.take_pointer_from_clients();
         // A point off every output: decoration hover handlers see a leave.
         self.update_decoration_hover_target(Point::from((-1.0e9, -1.0e9)));
         self.cursor_override = None;
@@ -1470,6 +1531,7 @@ impl ShojiWM {
             }
         }
         self.refresh_pointer_focus(self.input_grab_now_ms() as u32);
+        self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
         self.schedule_redraw();
     }
 
@@ -1525,14 +1587,21 @@ impl ShojiWM {
         if !grab.layers || grab.held > 0 {
             return false;
         }
-        pointer.is_grabbed()
-            || self.pointer_contents_at(pos).layer.is_some_and(|layer| {
-                matches!(
-                    layer.layer(),
-                    smithay::wayland::shell::wlr_layer::Layer::Top
-                        | smithay::wayland::shell::wlr_layer::Layer::Overlay
-                )
-            })
+        let passes = |layer: smithay::desktop::LayerSurface| {
+            matches!(
+                layer.layer(),
+                smithay::wayland::shell::wlr_layer::Layer::Top
+                    | smithay::wayland::shell::wlr_layer::Layer::Overlay
+            )
+        };
+        // A press keeps the pointer where it began, if that is such a layer.
+        if let Some(start) = pointer.grab_start_data() {
+            return start
+                .focus
+                .and_then(|(surface, _)| self.layer_surface_for_hit_surface(&surface))
+                .is_some_and(passes);
+        }
+        self.pointer_contents_at(pos).layer.is_some_and(passes)
     }
 
     /// Pointer motion under a grab: move the cursor, focus nothing, or the
@@ -1847,7 +1916,8 @@ impl ShojiWM {
                 let mut pointer_confined = false;
                 let mut confine_region = None;
 
-                if let Some((surface, surface_origin)) = under.as_ref()
+                if !self.session_lock_active
+                    && let Some((surface, surface_origin)) = under.as_ref()
                     && pointer.current_focus().as_ref() == Some(surface)
                 {
                     with_pointer_constraint(surface, &pointer, |constraint| {
@@ -2076,6 +2146,16 @@ impl ShojiWM {
                 {
                     return;
                 }
+                // A press the input grab took comes up in the grab, or nowhere once the
+                // grab is gone.
+                if button_state == ButtonState::Released
+                    && self.input_grab_pointer_buttons.remove(&button_key)
+                {
+                    if self.runtime_input_grab.is_some() {
+                        self.input_grab_pointer_button(button, button_state, event.time_msec());
+                    }
+                    return;
+                }
                 if self.consumed_pointer_buttons.contains(&button_key) {
                     return;
                 }
@@ -2106,7 +2186,7 @@ impl ShojiWM {
 
                 if self.session_lock_active {
                     self.forward_locked_pointer_button(
-                        button,
+                        &button_key,
                         button_state,
                         serial,
                         event.time_msec(),
@@ -2116,23 +2196,11 @@ impl ShojiWM {
                 if self.runtime_input_grab.is_some()
                     && !self.input_grab_passes_pointer(&pointer, pointer.current_location())
                 {
-                    self.input_grab_pointer_button(button, button_state, event.time_msec());
-                    // A grab can start while a button is held: a decoration's press handler
-                    // starts it. That press opened the pointer's implicit grab, and only the
-                    // release ends it; kept from the pointer, the release left it open, and the
-                    // next press was taken for a press of a button already down and lost. The
-                    // grab took the pointer's focus, so the release reaches no client.
-                    if button_state == ButtonState::Released && pointer.is_grabbed() {
-                        pointer.button(
-                            self,
-                            &ButtonEvent {
-                                button,
-                                state: button_state,
-                                serial,
-                                time: event.time_msec(),
-                            },
-                        );
-                        pointer.frame(self);
+                    // A release here had its press somewhere else, and comes up there or
+                    // nowhere (`take_pointer_from_clients`).
+                    if button_state == ButtonState::Pressed {
+                        self.input_grab_pointer_buttons.insert(button_key);
+                        self.input_grab_pointer_button(button, button_state, event.time_msec());
                     }
                     return;
                 }
@@ -2166,14 +2234,12 @@ impl ShojiWM {
                 // testing before a button event can briefly change that focus while the client
                 // updates its surface tree, deactivating the lock and leaking one absolute move.
                 if self.active_pointer_lock_focus(&pointer).is_some() {
-                    pointer.button(
-                        self,
-                        &ButtonEvent {
-                            button,
-                            state: button_state,
-                            serial,
-                            time: event.time_msec(),
-                        },
+                    self.send_pointer_button(
+                        &pointer,
+                        &button_key,
+                        button_state,
+                        serial,
+                        event.time_msec(),
                     );
                     pointer.frame(self);
                     // The locked client will commit its visual response itself. Avoid submitting
@@ -2469,14 +2535,12 @@ impl ShojiWM {
 
                         match hit {
                             DecorationHitTestResult::Action(WindowAction::Close) => {
-                                pointer.button(
-                                    self,
-                                    &ButtonEvent {
-                                        button,
-                                        state: button_state,
-                                        serial,
-                                        time: event.time_msec(),
-                                    },
+                                self.send_pointer_button(
+                                    &pointer,
+                                    &button_key,
+                                    button_state,
+                                    serial,
+                                    event.time_msec(),
                                 );
                                 if let Err(error) =
                                     crate::backend::capture_live_snapshot_for_close(self, &window)
@@ -2491,14 +2555,12 @@ impl ShojiWM {
                                 }
                             }
                             DecorationHitTestResult::Action(WindowAction::Maximize) => {
-                                pointer.button(
-                                    self,
-                                    &ButtonEvent {
-                                        button,
-                                        state: button_state,
-                                        serial,
-                                        time: event.time_msec(),
-                                    },
+                                self.send_pointer_button(
+                                    &pointer,
+                                    &button_key,
+                                    button_state,
+                                    serial,
+                                    event.time_msec(),
                                 );
                                 self.request_window_maximize(
                                     &window,
@@ -2507,14 +2569,12 @@ impl ShojiWM {
                                 );
                             }
                             DecorationHitTestResult::Action(WindowAction::Unmaximize) => {
-                                pointer.button(
-                                    self,
-                                    &ButtonEvent {
-                                        button,
-                                        state: button_state,
-                                        serial,
-                                        time: event.time_msec(),
-                                    },
+                                self.send_pointer_button(
+                                    &pointer,
+                                    &button_key,
+                                    button_state,
+                                    serial,
+                                    event.time_msec(),
                                 );
                                 self.request_window_maximize(
                                     &window,
@@ -2523,14 +2583,12 @@ impl ShojiWM {
                                 );
                             }
                             DecorationHitTestResult::Action(WindowAction::Minimize) => {
-                                pointer.button(
-                                    self,
-                                    &ButtonEvent {
-                                        button,
-                                        state: button_state,
-                                        serial,
-                                        time: event.time_msec(),
-                                    },
+                                self.send_pointer_button(
+                                    &pointer,
+                                    &button_key,
+                                    button_state,
+                                    serial,
+                                    event.time_msec(),
                                 );
                                 self.request_window_minimize(
                                     &window,
@@ -2541,14 +2599,12 @@ impl ShojiWM {
                             DecorationHitTestResult::Action(WindowAction::RuntimeHandler(
                                 handler_id,
                             )) => {
-                                pointer.button(
-                                    self,
-                                    &ButtonEvent {
-                                        button,
-                                        state: button_state,
-                                        serial,
-                                        time: event.time_msec(),
-                                    },
+                                self.send_pointer_button(
+                                    &pointer,
+                                    &button_key,
+                                    button_state,
+                                    serial,
+                                    event.time_msec(),
                                 );
 
                                 let window_id = self.snapshot_window(&window).id;
@@ -2643,14 +2699,12 @@ impl ShojiWM {
                                 }
                             }
                             DecorationHitTestResult::ClientArea => {
-                                pointer.button(
-                                    self,
-                                    &ButtonEvent {
-                                        button,
-                                        state: button_state,
-                                        serial,
-                                        time: event.time_msec(),
-                                    },
+                                self.send_pointer_button(
+                                    &pointer,
+                                    &button_key,
+                                    button_state,
+                                    serial,
+                                    event.time_msec(),
                                 );
                             }
                             DecorationHitTestResult::Outside => {}
@@ -2720,14 +2774,12 @@ impl ShojiWM {
                     }
                 };
 
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button,
-                        state: button_state,
-                        serial,
-                        time: event.time_msec(),
-                    },
+                self.send_pointer_button(
+                    &pointer,
+                    &button_key,
+                    button_state,
+                    serial,
+                    event.time_msec(),
                 );
                 pointer.frame(self);
                 let _ = self.display_handle.flush_clients();
@@ -2871,7 +2923,12 @@ impl ShojiWM {
                 pointer.axis(self, frame);
                 pointer.frame(self);
             }
+            // Gestures go to the config only; under the lock, like key binds,
+            // they go nowhere. One begun before the lock runs to its end.
             InputEvent::GestureSwipeBegin { event, .. } => {
+                if self.session_lock_active {
+                    return;
+                }
                 let grabbed = self.runtime_input_grab.is_some();
                 if !grabbed
                     && !self.runtime_gesture_swipe_enabled
@@ -3043,6 +3100,9 @@ impl ShojiWM {
             }
             // Pinches go to the config only (no client takes them).
             InputEvent::GesturePinchBegin { event, .. } => {
+                if self.session_lock_active {
+                    return;
+                }
                 self.runtime_gesture_pinch_fingers = event.fingers();
                 self.dispatch_gesture_pinch(
                     GestureSwipePhaseSnapshot::Begin,
@@ -3054,6 +3114,9 @@ impl ShojiWM {
                 );
             }
             InputEvent::GesturePinchUpdate { event, .. } => {
+                if self.runtime_gesture_pinch_fingers == 0 {
+                    return;
+                }
                 self.dispatch_gesture_pinch(
                     GestureSwipePhaseSnapshot::Update,
                     u64::from(event.time_msec()),
@@ -3064,6 +3127,9 @@ impl ShojiWM {
                 );
             }
             InputEvent::GesturePinchEnd { event, .. } => {
+                if self.runtime_gesture_pinch_fingers == 0 {
+                    return;
+                }
                 let phase = if event.cancelled() {
                     GestureSwipePhaseSnapshot::Cancel
                 } else {

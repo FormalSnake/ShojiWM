@@ -564,6 +564,11 @@ pub struct ShojiWM {
     pub pending_input_grab_key_event: Option<crate::runtime_input_grab::InputGrabEventSnapshot>,
     pub current_keyboard_modifiers: ModifiersState,
     pub consumed_pointer_buttons: HashSet<(String, u32)>,
+    /// Buttons, by device, whose press smithay sent a client and whose
+    /// release it has not.
+    pub pointer_buttons_down: HashSet<(String, u32)>,
+    /// Buttons, by device, whose press the input grab took.
+    pub input_grab_pointer_buttons: HashSet<(String, u32)>,
     /// Keys whose last press the keyboard filter took. A key leaves it with
     /// its release, or with the release of every key its keyboard holds when
     /// the keyboard goes away or the session leaves its VT
@@ -823,9 +828,14 @@ impl ShojiWM {
     }
 
     pub fn pointer_contents_at(&self, pos: Point<f64, Logical>) -> PointerContents {
-        let surface = self
-            .session_lock_surface_under(pos)
-            .or_else(|| self.surface_under(pos));
+        // Under the lock a lock surface or nothing: an output whose lock
+        // surface has not mapped, or a hole in its input region, shows
+        // nothing underneath to the pointer.
+        let surface = if self.session_lock_active {
+            self.session_lock_surface_under(pos)
+        } else {
+            self.surface_under(pos)
+        };
         let layer = surface
             .as_ref()
             .and_then(|(surface, _)| self.layer_surface_for_hit_surface(surface));
@@ -875,10 +885,12 @@ impl ShojiWM {
     pub(crate) fn set_session_lock_active(&mut self, active: bool) {
         self.session_lock_active = active;
         crate::backend::lock_scene::set_locked(active);
-        // The releases of the keys down now go to the locker.
+        // The releases of the keys down now go to the locker; the pointer
+        // leaves every client.
         if active {
             self.modifier_tap.reset();
             self.take_keyboard_from_grabs();
+            self.take_pointer_from_clients();
         } else {
             self.let_go_of_keys_held_under_lock();
         }
@@ -1557,6 +1569,11 @@ impl ShojiWM {
             self.focus_session_lock_surface(serial);
             return;
         }
+        // The input grab owns the keyboard: what changed meanwhile applies
+        // when it ends (`end_runtime_input_grab`).
+        if self.runtime_input_grab.is_some() {
+            return;
+        }
 
         self.prune_keyboard_focus_targets();
 
@@ -2037,6 +2054,8 @@ impl ShojiWM {
             pending_input_grab_key_event: None,
             current_keyboard_modifiers: ModifiersState::default(),
             consumed_pointer_buttons: HashSet::new(),
+            pointer_buttons_down: HashSet::new(),
+            input_grab_pointer_buttons: HashSet::new(),
             consumed_keys: HashSet::new(),
             keyboard_devices: HashMap::new(),
             modifier_tap: Default::default(),
