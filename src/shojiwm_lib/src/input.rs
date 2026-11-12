@@ -18,10 +18,14 @@ use smithay::{
     },
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
         wayland_server::{Resource, protocol::wl_surface::WlSurface},
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial},
-    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    wayland::{
+        input_method::InputMethodKeyboardGrab,
+        pointer_constraints::{PointerConstraint, with_pointer_constraint},
+    },
 };
 use std::{collections::HashSet, time::Instant};
 use tracing::{debug, info, warn};
@@ -356,9 +360,60 @@ impl ShojiWM {
         // a key the filter took goes nowhere: the focused client would keep a
         // modifier the seat has let go.
         if action.is_some() && keyboard.modifier_state() != modifiers {
-            keyboard.advertise_modifier_state(self);
+            self.advertise_modifiers();
         }
         action
+    }
+
+    /// Sends the seat's modifiers to the focused client and, while an input
+    /// method holds the keyboard, to its grab, which smithay tells only after
+    /// a key it forwards: it would read the next key with the old ones.
+    pub(crate) fn advertise_modifiers(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        keyboard.advertise_modifier_state(self);
+        if !self.input_method_holds_keyboard() {
+            return;
+        }
+        let mods = keyboard.modifier_state().serialized;
+        for grab in self.input_method_keyboard_grabs() {
+            // A serial of the seat's own, as smithay sends when the grab starts.
+            grab.modifiers(
+                SERIAL_COUNTER.next_serial().into(),
+                mods.depressed,
+                mods.latched,
+                mods.locked,
+                mods.layout_effective,
+            );
+        }
+    }
+
+    /// The seat's keyboard grab is an input method's. Its
+    /// `zwp_input_method_keyboard_grab_v2` outlives it when the lock drops
+    /// the grab, so smithay's `keyboard_grabbed()` says too much.
+    pub(crate) fn input_method_holds_keyboard(&self) -> bool {
+        self.seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.with_grab(|_, grab| grab.is::<InputMethodKeyboardGrab>()))
+            .unwrap_or(false)
+    }
+
+    /// The input method clients' keyboard grab objects, which smithay keeps
+    /// to itself.
+    fn input_method_keyboard_grabs(&self) -> Vec<ZwpInputMethodKeyboardGrabV2> {
+        let backend = self.display_handle.backend_handle();
+        let mut objects = Vec::new();
+        for client in &self.input_method_clients {
+            // The backend is locked while this runs: collect, then look up.
+            let _ = backend.with_all_objects_for(client.clone(), |object| objects.push(object));
+        }
+        objects
+            .into_iter()
+            .filter_map(|object| {
+                ZwpInputMethodKeyboardGrabV2::from_id(&self.display_handle, object).ok()
+            })
+            .collect()
     }
 
     /// Lets go of every key the keyboard `device` holds, as if it had sent

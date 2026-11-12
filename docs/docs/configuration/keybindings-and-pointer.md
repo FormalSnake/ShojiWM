@@ -148,8 +148,11 @@ or a switch to another VT lets go of the keys it held in the client. While
 the session is locked, no input method or menu keyboard grab hears a key, and
 an input method has to grab the keyboard again after the unlock (fcitx5 and
 ibus do when they are next activated). A key held across the unlock goes no
-further than the locker. Under the lock an input method's virtual keyboard
-cannot type; any other, such as an on-screen keyboard, types into the locker.
+further than the locker. Under the lock the virtual keyboard of a client that
+has been an input method cannot type, even after it gave the input method up;
+any other, such as an on-screen keyboard, types into the locker. ShojiWM knows
+an input method by its connection, so a virtual keyboard an input method opens
+on a second connection is one of those others and types into the locker too.
 `nonConsuming: true` runs the handler and still delivers the key or the button
 to the client it was meant for, so a config can watch a press without
 taking it, for example close a menu it shows on `Escape` while the window

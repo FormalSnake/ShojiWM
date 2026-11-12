@@ -21,6 +21,7 @@ use smithay::{
     backend::input::{ButtonState, InputEvent, KeyState, Keycode},
     input::pointer::MotionEvent,
     utils::SERIAL_COUNTER,
+    wayland::input_method::InputMethodSeat,
 };
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum,
@@ -29,7 +30,7 @@ use wayland_client::{
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
-use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_wm_base};
 use wayland_protocols_misc::{
     zwp_input_method_v2::client::{
         zwp_input_method_keyboard_grab_v2, zwp_input_method_manager_v2, zwp_input_method_v2,
@@ -77,6 +78,8 @@ thread_local! {
     static IM_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
     /// What the locker's keyboard was sent.
     static LOCKER_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    /// The size of each keymap the locker's keyboard was sent.
+    static LOCKER_KEYMAPS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// The lock surface's last configure: width and height.
     static LOCK_SIZE: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
     static GRAB: RefCell<Option<InputGrab>> = const { RefCell::new(None) };
@@ -200,6 +203,7 @@ fn lock(session: &mut common::Session) -> ext_session_lock_v1::ExtSessionLockV1 
         matches!(seen[0], Seen::Enter(_)),
         "the locker has no keyboard: {seen:?}"
     );
+    take(&LOCKER_KEYMAPS);
     lock
 }
 
@@ -250,12 +254,22 @@ fn virtual_keyboard(session: &mut common::Session, peer: usize) -> ZwpVirtualKey
     let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
     let manager: ZwpVirtualKeyboardManagerV1 = peer.bind("zwp_virtual_keyboard_manager_v1", 1);
     let keyboard = manager.create_virtual_keyboard(&seat, &peer.queue.handle(), ());
+    send_keymap(session, &keyboard);
+    keyboard
+}
+
+fn send_keymap(session: &mut common::Session, keyboard: &ZwpVirtualKeyboardV1) {
     let mut file = common::tempfile("keymap");
     file.write_all(VIRTUAL_KEYMAP.as_bytes()).unwrap();
     file.write_all(&[0]).unwrap();
     keyboard.keymap(1, file.as_fd(), VIRTUAL_KEYMAP.len() as u32 + 1);
     session.roundtrip();
-    keyboard
+}
+
+fn tap_virtual_k(session: &mut common::Session, keyboard: &ZwpVirtualKeyboardV1) {
+    keyboard.key(0, VIRTUAL_K, 1);
+    keyboard.key(0, VIRTUAL_K, 0);
+    session.roundtrip();
 }
 
 fn focused_session() -> common::Session {
@@ -551,6 +565,66 @@ fn an_input_method_never_hears_a_key_with_modifiers_from_before_the_lock() {
 }
 
 #[test]
+fn an_input_method_grabbing_again_after_the_unlock_hears_no_release_from_the_locker() {
+    let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
+
+    let locked = lock(&mut session);
+    take(&SEEN);
+    press(&mut session, K);
+    unlock(&mut session, locked);
+    grab_again(&mut session, im, &input_method);
+    release(&mut session, K);
+    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    assert_eq!(
+        take(&LOCKER_SEEN),
+        vec![Seen::Down(K), Seen::Up(K), Seen::Leave]
+    );
+    assert!(
+        !take(&SEEN)
+            .iter()
+            .any(|seen| matches!(seen, Seen::Down(K) | Seen::Up(K))),
+    );
+
+    press(&mut session, K);
+    release(&mut session, K);
+    assert_eq!(take(&IM_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+}
+
+/// Smithay tells an input method's grab of the modifiers only after a key it
+/// forwards; Shift going down under an input grab reaches it before `a`.
+#[test]
+fn an_input_method_hears_a_modifier_a_grab_took_before_the_next_key() {
+    let mut session = focused_session();
+    let (_im, _input_method) = input_method(&mut session);
+
+    press(&mut session, SUPER);
+    press(&mut session, G);
+    release(&mut session, G);
+    release(&mut session, SUPER);
+    press(&mut session, SHIFT);
+    press(&mut session, ESCAPE);
+    release(&mut session, ESCAPE);
+    assert!(session.state.runtime_input_grab.is_none());
+    press(&mut session, A);
+    release(&mut session, A);
+    release(&mut session, SHIFT);
+    assert_eq!(
+        take(&IM_SEEN),
+        vec![
+            Seen::Down(SUPER),
+            Seen::Mods(SUPER_MASK),
+            Seen::Up(SUPER),
+            Seen::Mods(0),
+            Seen::Mods(SHIFT_MASK),
+            Seen::Down(A),
+            Seen::Up(A),
+            Seen::Mods(0)
+        ]
+    );
+}
+
+#[test]
 fn an_input_methods_virtual_keyboard_cannot_type_into_the_lock() {
     let mut session = focused_session();
     let (im, _input_method) = input_method(&mut session);
@@ -563,6 +637,73 @@ fn an_input_methods_virtual_keyboard_cannot_type_into_the_lock() {
     keyboard.modifiers(0, 0, 0, 0);
     session.roundtrip();
     assert_eq!(take(&LOCKER_SEEN), vec![]);
+    unlock(&mut session, locked);
+}
+
+/// A client stays an input method for the lock after it destroys its
+/// `zwp_input_method_v2`: its virtual keyboard would otherwise type into the
+/// locker as an on-screen keyboard.
+#[test]
+fn an_input_method_that_destroyed_itself_cannot_type_into_the_lock() {
+    let mut session = focused_session();
+    let (im, input_method) = input_method(&mut session);
+    let keyboard = virtual_keyboard(&mut session, im);
+
+    let locked = lock(&mut session);
+    input_method.destroy();
+    session.roundtrip();
+    assert!(!session.state.seat.input_method().has_instance());
+    send_keymap(&mut session, &keyboard);
+    keyboard.modifiers(SHIFT_MASK, 0, 0, 0);
+    tap_virtual_k(&mut session, &keyboard);
+    keyboard.modifiers(0, 0, 0, 0);
+    session.roundtrip();
+    assert_eq!(take(&LOCKER_SEEN), vec![]);
+    assert_eq!(take(&LOCKER_KEYMAPS), Vec::<u32>::new());
+    unlock(&mut session, locked);
+}
+
+/// The core knows an input method by its client: a virtual keyboard it opens
+/// on a second connection is a client like wvkbd, and types into the locker.
+#[test]
+fn an_input_methods_virtual_keyboard_on_a_second_connection_types_into_the_lock() {
+    let mut session = focused_session();
+    let (_im, _input_method) = input_method(&mut session);
+    let second = session.connect("input-method-second-connection");
+    let keyboard = virtual_keyboard(&mut session, second);
+
+    let locked = lock(&mut session);
+    tap_virtual_k(&mut session, &keyboard);
+    let seen = take(&LOCKER_SEEN);
+    assert!(
+        seen.ends_with(&[Seen::Down(VIRTUAL_K), Seen::Up(VIRTUAL_K)]),
+        "{seen:?}"
+    );
+    unlock(&mut session, locked);
+}
+
+#[test]
+fn a_keymap_sent_under_the_lock_reaches_the_locker_only_from_an_on_screen_keyboard() {
+    let mut session = focused_session();
+    let (im, _input_method) = input_method(&mut session);
+    let im_keyboard = virtual_keyboard(&mut session, im);
+    let osk = session.connect("on-screen-keyboard");
+    let osk_keyboard = virtual_keyboard(&mut session, osk);
+
+    let locked = lock(&mut session);
+    send_keymap(&mut session, &im_keyboard);
+    tap_virtual_k(&mut session, &im_keyboard);
+    assert_eq!(take(&LOCKER_SEEN), vec![]);
+    assert_eq!(take(&LOCKER_KEYMAPS), Vec::<u32>::new());
+
+    send_keymap(&mut session, &osk_keyboard);
+    tap_virtual_k(&mut session, &osk_keyboard);
+    let seen = take(&LOCKER_SEEN);
+    assert!(
+        seen.ends_with(&[Seen::Down(VIRTUAL_K), Seen::Up(VIRTUAL_K)]),
+        "{seen:?}"
+    );
+    assert_eq!(take(&LOCKER_KEYMAPS).len(), 1);
     unlock(&mut session, locked);
 }
 
@@ -635,16 +776,22 @@ fn button(session: &mut common::Session, state: ButtonState) {
     session.roundtrip();
 }
 
-#[test]
-fn a_menu_that_grabbed_the_keyboard_hears_no_key_while_the_session_is_locked() {
-    let mut session = common::Session::new(setup);
+struct Window {
+    compositor: wl_compositor::WlCompositor,
+    shell: xdg_wm_base::XdgWmBase,
+    seat: wl_seat::WlSeat,
+    xdg: xdg_surface::XdgSurface,
+}
+
+/// A focused toplevel of the session's own client with the pointer over it.
+fn window_under_pointer(session: &mut common::Session) -> Window {
     let qh = session.queue.handle();
     let compositor: wl_compositor::WlCompositor = session.bind("wl_compositor", 1);
     let shell: xdg_wm_base::XdgWmBase = session.bind("xdg_wm_base", 1);
     let seat: wl_seat::WlSeat = session.bind("wl_seat", 1);
     let window = compositor.create_surface(&qh, ());
-    let window_xdg = shell.get_xdg_surface(&window, &qh, ());
-    window_xdg.get_toplevel(&qh, ());
+    let xdg = shell.get_xdg_surface(&window, &qh, ());
+    xdg.get_toplevel(&qh, ());
     window.commit();
     session.roundtrip();
     session.attach_buffer(&window, 300, 300);
@@ -670,20 +817,36 @@ fn a_menu_that_grabbed_the_keyboard_hears_no_key_while_the_session_is_locked() {
     );
     pointer.frame(state);
     session.roundtrip();
+    Window {
+        compositor,
+        shell,
+        seat,
+        xdg,
+    }
+}
 
-    // A click opens the menu, which grabs with the click's serial.
-    button(&mut session, ButtonState::Pressed);
-    let positioner = shell.create_positioner(&qh, ());
+/// A click opens a menu, which grabs with the click's serial.
+fn open_menu(session: &mut common::Session, window: &Window) {
+    let qh = session.queue.handle();
+    button(session, ButtonState::Pressed);
+    let positioner = window.shell.create_positioner(&qh, ());
     positioner.set_size(50, 50);
     positioner.set_anchor_rect(0, 0, 10, 10);
-    let menu = compositor.create_surface(&qh, ());
-    let menu_xdg = shell.get_xdg_surface(&menu, &qh, ());
-    let popup = menu_xdg.get_popup(Some(&window_xdg), &positioner, &qh, ());
-    popup.grab(&seat, BUTTON_SERIAL.get());
+    let menu = window.compositor.create_surface(&qh, ());
+    let menu_xdg = window.shell.get_xdg_surface(&menu, &qh, ());
+    let popup = menu_xdg.get_popup(Some(&window.xdg), &positioner, &qh, ());
+    popup.grab(&window.seat, BUTTON_SERIAL.get());
     menu.commit();
     session.roundtrip();
     session.attach_buffer(&menu, 50, 50);
-    button(&mut session, ButtonState::Released);
+    button(session, ButtonState::Released);
+}
+
+#[test]
+fn a_menu_that_grabbed_the_keyboard_hears_no_key_while_the_session_is_locked() {
+    let mut session = common::Session::new(setup);
+    let window = window_under_pointer(&mut session);
+    open_menu(&mut session, &window);
     assert!(session.state.seat.get_keyboard().unwrap().is_grabbed());
     take(&SEEN);
 
@@ -701,6 +864,20 @@ fn a_menu_that_grabbed_the_keyboard_hears_no_key_while_the_session_is_locked() {
     release(&mut session, A);
     let seen = take(&SEEN);
     assert!(seen.ends_with(&[Seen::Down(A), Seen::Up(A)]), "{seen:?}");
+}
+
+/// The input method's grab went with the lock, and the input method has not
+/// grabbed again yet: nothing holds the keyboard, so the menu may.
+#[test]
+fn a_menu_opened_after_the_unlock_grabs_the_keyboard_before_the_input_method_grabs_again() {
+    let mut session = common::Session::new(setup);
+    let window = window_under_pointer(&mut session);
+    let (_im, _input_method) = input_method(&mut session);
+    let locked = lock(&mut session);
+    unlock(&mut session, locked);
+
+    open_menu(&mut session, &window);
+    assert!(session.state.seat.get_keyboard().unwrap().is_grabbed());
 }
 
 #[test]
@@ -801,6 +978,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for common::Client {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_keyboard::Event::Keymap { size, .. } = event {
+            if client.name == "locker" {
+                LOCKER_KEYMAPS.with(|keymaps| keymaps.borrow_mut().push(size));
+            }
+            return;
+        }
         let seen = match event {
             wl_keyboard::Event::Key { key, state, .. } => seen_key(key, state),
             wl_keyboard::Event::Enter { keys, .. } => Seen::Enter(keys.len() / 4),

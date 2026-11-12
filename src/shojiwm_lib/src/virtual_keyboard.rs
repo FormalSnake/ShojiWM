@@ -145,23 +145,29 @@ impl ShojiWM {
         })
     }
 
+    /// `keyboard` belongs to a client that has asked for an input method on
+    /// this seat, whether or not it still has it.
+    fn of_input_method_client(&self, keyboard: &ObjectId) -> bool {
+        self.display_handle
+            .get_client(keyboard.clone())
+            .is_ok_and(|client| self.input_method_clients.contains(&client.id()))
+    }
+
     /// `keyboard` belongs to the client running the input method, whose keys
     /// skip the input path (see the module docs).
     fn from_input_method(&self, keyboard: &ObjectId) -> bool {
-        self.seat.input_method().has_instance()
-            && self
-                .display_handle
-                .get_client(keyboard.clone())
-                .is_ok_and(|client| self.input_method_clients.contains(&client.id()))
+        self.seat.input_method().has_instance() && self.of_input_method_client(keyboard)
     }
 
     /// The input method's keys go straight to the focused client, past the
-    /// seat and the lock: under the lock only a locker that is its own input
-    /// method may send them. Every other virtual keyboard (an on-screen
-    /// keyboard such as wvkbd) types through the seat, into the locker like
-    /// a keyboard.
+    /// seat and the lock: under the lock no client that has been an input
+    /// method may type, unless it is the locker. Every other virtual keyboard
+    /// (an on-screen keyboard such as wvkbd) types through the seat, into the
+    /// locker like a keyboard.
     fn input_method_may_type(&self, keyboard: &ObjectId) -> bool {
+        // An input method's virtual keyboard on a second connection looks like wvkbd: it types.
         !self.session_lock_active
+            || !self.of_input_method_client(keyboard)
             || self
                 .session_locker
                 .as_ref()
@@ -229,10 +235,10 @@ impl VirtualKeyboardHandler for ShojiWM {
         key: u32,
         pressed: bool,
     ) {
+        if !self.input_method_may_type(keyboard) {
+            return;
+        }
         if self.from_input_method(keyboard) {
-            if !self.input_method_may_type(keyboard) {
-                return;
-            }
             let serial = SERIAL_COUNTER.next_serial().into();
             let state = if pressed {
                 wl_keyboard::KeyState::Pressed
@@ -285,10 +291,10 @@ impl VirtualKeyboardHandler for ShojiWM {
         locked: u32,
         group: u32,
     ) {
+        if !self.input_method_may_type(keyboard) {
+            return;
+        }
         if self.from_input_method(keyboard) {
-            if !self.input_method_may_type(keyboard) {
-                return;
-            }
             let serial = SERIAL_COUNTER.next_serial().into();
             self.for_each_focused_wl_keyboard(|wl_keyboard| {
                 wl_keyboard.modifiers(serial, depressed, latched, locked, group);
@@ -310,7 +316,7 @@ impl VirtualKeyboardHandler for ShojiWM {
             return;
         };
         if seat_keyboard.set_modifier_state(modifiers) != 0 {
-            seat_keyboard.advertise_modifier_state(self);
+            self.advertise_modifiers();
         }
         self.set_keyboard_modifiers(seat_keyboard.modifier_state());
         self.run_pending_modifier_bindings();

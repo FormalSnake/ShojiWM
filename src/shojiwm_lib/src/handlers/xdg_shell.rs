@@ -19,7 +19,6 @@ use smithay::{
     utils::{Rectangle, Serial, Size},
     wayland::{
         compositor::with_states,
-        input_method::InputMethodSeat,
         shell::xdg::{
             Configure, PopupSurface, PositionerState, ToplevelSurface, XDG_POPUP_ROLE,
             XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
@@ -570,7 +569,7 @@ impl XdgShellHandler for ShojiWM {
         // ptyxis, libreoffice, ...) received popup_done before its initial
         // configure and never appeared. Keep the IME keyboard grab intact and
         // hand the popup only the pointer grab instead, like niri does.
-        let ime_keyboard_grabbed = seat.input_method().keyboard_grabbed();
+        let ime_keyboard_grabbed = self.input_method_holds_keyboard();
         let can_receive_keyboard_focus = !ime_keyboard_grabbed
             && self
                 .space

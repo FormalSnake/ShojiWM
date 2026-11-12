@@ -537,7 +537,8 @@ pub struct ShojiWM {
     /// The keycode `code:` binds compare for the key being processed, when it
     /// is not the key's own (a virtual keyboard's key).
     pub bind_keycode_override: Option<u32>,
-    /// Clients that asked for a `zwp_input_method_v2`.
+    /// Clients that asked for a `zwp_input_method_v2`, kept while they are
+    /// connected, also after they destroy it.
     pub input_method_clients:
         std::collections::HashSet<smithay::reexports::wayland_server::backend::ClientId>,
     pub runtime_active_keyboard_device: Option<RuntimeInputDeviceSnapshot>,
