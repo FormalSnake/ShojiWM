@@ -184,6 +184,41 @@ impl Session {
         self.roundtrip();
     }
 
+    /// Maps a layer surface with `keyboard_interactivity` and a buffer
+    /// across the top of the first output.
+    pub fn map_keyboard_layer(
+        &mut self,
+        namespace: &str,
+        keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity,
+    ) -> (
+        wl_surface::WlSurface,
+        zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    ) {
+        let qh = self.queue.handle();
+        let compositor: wl_compositor::WlCompositor = self.bind("wl_compositor", 1);
+        let shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = self.bind("zwlr_layer_shell_v1", 4);
+        let surface = compositor.create_surface(&qh, ());
+        let layer = shell.get_layer_surface(
+            &surface,
+            None,
+            zwlr_layer_shell_v1::Layer::Top,
+            namespace.into(),
+            &qh,
+            (),
+        );
+        layer.set_anchor(
+            zwlr_layer_surface_v1::Anchor::Top
+                | zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right,
+        );
+        layer.set_size(0, 40);
+        layer.set_keyboard_interactivity(keyboard_interactivity);
+        surface.commit();
+        self.roundtrip();
+        self.attach_buffer(&surface, 1024, 40);
+        (surface, layer)
+    }
+
     /// Maps a layer surface across the top of the first output.
     pub fn map_layer(&mut self, namespace: &str) -> wl_surface::WlSurface {
         self.map_layer_on(namespace, None)
@@ -297,6 +332,21 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for Client {
     }
 }
 
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Client {
+    fn event(
+        _: &mut Self,
+        layer: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+            layer.ack_configure(serial);
+        }
+    }
+}
+
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for Client {
     fn event(
         _: &mut Self,
@@ -328,7 +378,6 @@ ignore_events!(
     wl_buffer::WlBuffer,
     xdg_toplevel::XdgToplevel,
     zwlr_layer_shell_v1::ZwlrLayerShellV1,
-    zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     wl_seat::WlSeat,
     wl_output::WlOutput,
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
