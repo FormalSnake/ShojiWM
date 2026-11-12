@@ -167,6 +167,40 @@ from `shoji_wm/default-composition` will do) or it falls back to defaults and
 `~/shoji-stable/default-config/tsconfig.json`; the guest has no node, so run
 `tsc` on the macbook.
 
+## Checks that need g815
+
+vkms has no HDR EDID, so `hdr: "auto"` was only checked here up to the
+decision (the `auto HDR: fullscreen HDR content changed` log line). The real
+switch needs an HDR monitor on g815:
+
+1. On g815, in a ShojiWM checkout at the REV under test:
+   `cargo build --profile release-fast -p shoji_wm`.
+2. Find the HDR monitor's connector:
+   `for c in /sys/class/drm/card*-*; do echo "$c $(cat $c/status)"; done`.
+3. Write `/tmp/autohdr/src/index.tsx`:
+
+   ```tsx
+   import { COMPOSITOR } from "shoji_wm";
+   import { defaultWindowComposition } from "shoji_wm/default-composition";
+   COMPOSITOR.window.composition = defaultWindowComposition;
+   COMPOSITOR.output.configure(() => ({ "<connector>": { hdr: "auto" } }));
+   COMPOSITOR.process.once("mpv", {
+     command: "mpv --fs --vo=gpu-next --target-colorspace-hint=yes <an HDR10 clip>",
+     runPolicy: "once-per-session",
+   });
+   ```
+
+4. From a free VT, log in and run
+   `SHOJI_LOG_DIR=/tmp/autohdr-log target/release-fast/shoji_wm --tty --config /tmp/autohdr/src/index.tsx --runtime-dir $PWD`.
+5. mpv starts fullscreen on its own.
+6. Expect within a second: `auto HDR: fullscreen HDR content changed`
+   with `hdr_content=true`, then `output color mode changed by runtime
+   display config`, in `/tmp/autohdr-log/latest.log`; the monitor's OSD
+   reports HDR, and highlights are brighter than SDR white.
+7. Press `f` in mpv to leave fullscreen, then `q` to quit. Expect the same two lines with
+   `hdr_content=false` and the monitor back in SDR.
+8. Run it again with an SDR clip in step 3: no switch, no log line.
+
 ## Known limits
 
 - One output, 1024x768 at 60 Hz, scale 1. No hotplug, no second monitor.
