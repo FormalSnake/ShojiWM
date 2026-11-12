@@ -27,6 +27,7 @@ use shojiwm_lib::{
     config::RuntimeOutputConfig,
     cursor::RuntimeCursorConfigUpdate,
     headless_output::RuntimeHeadlessOutputRequest,
+    keyboard_focus::KeyboardFocusSnapshot,
     keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     lid_switch::LidSwitchSnapshot,
     output_power::RuntimeOutputPowerRequest,
@@ -903,6 +904,13 @@ impl InputController {
         runtime::global().keyboard_locks.read_only()
     }
 
+    /// The window that has the keyboard (`None` until the compositor
+    /// reports it). A window stays `is_focused` while a panel borrows the
+    /// keyboard; this says who the keys go to.
+    pub fn keyboard_focus(&self) -> ReadSignal<Option<KeyboardFocusSnapshot>> {
+        runtime::global().keyboard_focus.read_only()
+    }
+
     /// The laptop lid (`None` until a lid switch reports).
     pub fn lid_switch(&self) -> ReadSignal<Option<LidSwitchSnapshot>> {
         runtime::global().lid_switch.read_only()
@@ -1563,6 +1571,9 @@ listeners! {
     on_keyboard_layout_change => keyboard_layout: &KeyboardLayoutSnapshot;
     /// Caps Lock or Num Lock was switched on or off.
     on_keyboard_locks_change => keyboard_locks: &KeyboardLocksSnapshot;
+    /// The keyboard moved to another window, or to none of them: to a
+    /// layer surface, the lock screen or nothing.
+    on_keyboard_focus_change => keyboard_focus: &KeyboardFocusSnapshot;
     /// The laptop lid was closed or opened.
     on_lid_switch => lid_switch: &LidSwitchSnapshot;
     on_create_layer => create_layer: &WaylandLayerSnapshot;

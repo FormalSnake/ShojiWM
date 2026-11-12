@@ -11,6 +11,7 @@ use super::{
     WindowRequest, WorkspaceRequest,
 };
 use crate::{
+    keyboard_focus::KeyboardFocusSnapshot,
     keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     lid_switch::LidSwitchSnapshot,
     runtime_input::RuntimeInputDeviceSnapshot,
@@ -41,6 +42,7 @@ pub struct RuntimeHandle {
     input_state: Option<BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     keyboard_layout: Option<KeyboardLayoutSnapshot>,
     keyboard_locks: Option<KeyboardLocksSnapshot>,
+    keyboard_focus: Option<KeyboardFocusSnapshot>,
     lid_switch: Option<LidSwitchSnapshot>,
 }
 
@@ -72,6 +74,7 @@ impl RuntimeHandle {
             input_state: None,
             keyboard_layout: None,
             keyboard_locks: None,
+            keyboard_focus: None,
             lid_switch: None,
         }
     }
@@ -152,6 +155,17 @@ impl RuntimeHandle {
         true
     }
 
+    /// Returns whether the window that has the keyboard differs from the
+    /// last one sent.
+    pub fn sync_keyboard_focus(&mut self, focus: &KeyboardFocusSnapshot) -> bool {
+        if self.keyboard_focus.as_ref() == Some(focus) {
+            return false;
+        }
+        self.keyboard_focus = Some(focus.clone());
+        self.post(0.0, RuntimeEvent::KeyboardFocus(focus.clone()));
+        true
+    }
+
     /// Returns whether the lid state differs from the last one sent.
     pub fn sync_lid_switch(&mut self, lid: LidSwitchSnapshot) -> bool {
         if self.lid_switch == Some(lid) {
@@ -169,6 +183,7 @@ impl RuntimeHandle {
         self.input_state = None;
         self.keyboard_layout = None;
         self.keyboard_locks = None;
+        self.keyboard_focus = None;
         self.lid_switch = None;
     }
 

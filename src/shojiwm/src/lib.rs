@@ -221,8 +221,9 @@ impl ConfigRuntime for TypeScriptRuntime {
                 self.evaluator.set_keyboard_layout(layout);
             }
             RuntimeEvent::LidSwitch(lid) => self.evaluator.set_lid_switch(lid),
-            // The TypeScript API has no lock key state.
-            RuntimeEvent::KeyboardLocks(_) => {}
+            // The TypeScript API has no lock key state, and tells the
+            // keyboard's window by `isFocused`.
+            RuntimeEvent::KeyboardLocks(_) | RuntimeEvent::KeyboardFocus(_) => {}
             RuntimeEvent::PointerMove(event) => self.evaluator.pointer_move_async(event, now),
             RuntimeEvent::GestureSwipe(event) => self.evaluator.gesture_swipe_async(event, now),
             // The TypeScript API has no pinch hook.

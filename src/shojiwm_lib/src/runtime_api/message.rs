@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    keyboard_focus::KeyboardFocusSnapshot,
     keyboard_layout::{KeyboardLayoutSnapshot, KeyboardLocksSnapshot},
     lid_switch::LidSwitchSnapshot,
     runtime_input::RuntimeInputDeviceSnapshot,
@@ -200,6 +201,8 @@ pub enum RuntimeEvent {
     KeyboardLayout(KeyboardLayoutSnapshot),
     /// Caps Lock or Num Lock changed.
     KeyboardLocks(KeyboardLocksSnapshot),
+    /// The seat's keyboard moved to another window, or off the windows.
+    KeyboardFocus(KeyboardFocusSnapshot),
     /// The laptop lid was closed or opened.
     LidSwitch(LidSwitchSnapshot),
     /// Pointer hook the config asked to receive asynchronously. A result, if

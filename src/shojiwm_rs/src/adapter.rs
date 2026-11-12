@@ -1328,6 +1328,15 @@ impl ConfigRuntime for ReactiveRuntime {
                         );
                     });
                 }
+                RuntimeEvent::KeyboardFocus(focus) => {
+                    batch(|| {
+                        runtime::global().keyboard_focus.set(Some(focus.clone()));
+                        emit(
+                            |listeners| listeners.keyboard_focus.clone(),
+                            |listener| listener(&focus),
+                        );
+                    });
+                }
                 RuntimeEvent::LidSwitch(lid) => {
                     batch(|| {
                         runtime::global().lid_switch.set(Some(lid));
