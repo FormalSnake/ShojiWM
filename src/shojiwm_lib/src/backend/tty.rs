@@ -225,10 +225,15 @@ const VBLANK_GRID_PROMPT: Duration = Duration::from_millis(1);
 /// An observation may be the time its event was handled rather than a driver timestamp:
 /// never earlier than the real vblank, later by a varying delay (up to most of a frame
 /// while the main thread is busy). Most events are handled promptly, so the grid phase is
-/// the one the most recent observations land just after (within `VBLANK_GRID_PROMPT`),
-/// taken from among the observations themselves; ties go to the one that leaves them
-/// least late in total. A lone offset cannot tell a late event from an early grid, but a
-/// few dozen of them can.
+/// the one the most recent observations land just after, taken from among the observations
+/// themselves: each counts for a phase by how promptly it follows it, fully at the phase and
+/// not at all `VBLANK_GRID_PROMPT` or more later; ties go to the one that leaves them least
+/// late in total. A lone offset cannot tell a late event from an early grid, but a few dozen
+/// of them can. Counting every observation within `VBLANK_GRID_PROMPT` alike let one event
+/// handled just under a millisecond before the next vblank win at 240 Hz, where that
+/// millisecond is a quarter of the period: all the prompt ones fall within it, and it adds
+/// itself. The grid then sat that far early until the event left the history, and the next
+/// flip's grid point read as a duplicate and was bumped a period.
 ///
 /// Returns the vblank the latest flip completed at and the first vblank after the
 /// observation, which is when a frame rendered now can be shown.
@@ -245,14 +250,12 @@ fn vblank_grid(
         (time.as_secs_f64() - phase.as_secs_f64()).rem_euclid(period_s)
     };
     let prompt_s = VBLANK_GRID_PROMPT.as_secs_f64();
-    let fit = |phase: Duration| -> (usize, f64) {
-        let mut prompt = 0;
+    let fit = |phase: Duration| -> (f64, f64) {
+        let mut prompt = 0.0;
         let mut total = 0.0;
         for time in history {
             let late = lateness(*time, phase);
-            if late <= prompt_s {
-                prompt += 1;
-            }
+            prompt += (1.0 - late / prompt_s).max(0.0);
             total += late;
         }
         (prompt, total)
@@ -264,7 +267,7 @@ fn vblank_grid(
             let (left_prompt, left_total) = fit(*left);
             let (right_prompt, right_total) = fit(*right);
             left_prompt
-                .cmp(&right_prompt)
+                .total_cmp(&right_prompt)
                 .then_with(|| right_total.total_cmp(&left_total))
         })
         .unwrap_or(observed);
@@ -2588,6 +2591,37 @@ mod vblank_grid_tests {
                 pair[1],
                 pair[0]
             );
+        }
+    }
+
+    /// At 240 Hz, 31 flips handled 50 to 350 us late, then one handled 3.8 ms late, just
+    /// before the next vblank, then prompt ones again. Every target stays on the vblank grid.
+    #[test]
+    fn an_event_handled_just_before_the_next_vblank_does_not_move_the_grid() {
+        let period_us = 1_000_000.0 / 240.0;
+        let period = us(period_us);
+        let (mut history, mut last_grid_next, mut last_target) = (VecDeque::new(), None, None);
+        for index in 0..64u32 {
+            let delay = match index {
+                31 => 3_800.0,
+                _ => [50.0, 150.0, 250.0, 350.0][index as usize % 4],
+            };
+            let vblank = 1_000_000.0 + f64::from(index) * period_us;
+            let (_, target) = predict_next_frame(
+                &mut history,
+                &mut last_grid_next,
+                &mut last_target,
+                us(vblank + delay),
+                period,
+            );
+            let target = target.as_secs_f64() * 1e6;
+            if index >= 4 {
+                let expected = vblank + period_us + 50.0;
+                assert!(
+                    (target - expected).abs() < 1.0,
+                    "flip {index}: target {target} us, the next vblank is {expected} us"
+                );
+            }
         }
     }
 
