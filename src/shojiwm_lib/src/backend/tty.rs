@@ -370,6 +370,15 @@ fn in_flight_vblank(
 /// renders ahead of it, and the next frame times itself from the flip event. A frame held for
 /// the cursor deadline or rendered ahead is committed later than it was staged, so it goes
 /// through here when it is submitted, not when it is staged.
+///
+/// The grid is an estimate placed on the promptest observations, which are never before their
+/// vblank: it runs late of the real one by up to `VBLANK_GRID_PROMPT` (g815's live events
+/// arrived within 0.36 ms of the vblank in 99%), and a commit just before a vblank can still
+/// miss the driver's cutoff. So a read within that window before an estimated vblank counts
+/// as reaching it: 50 us of phase error would otherwise put a commit at 1010.01, already past
+/// the real 1010 vblank, on the estimated 1010.05 one, a period short. The grid is not early
+/// of the real one, so no window after it: there, commits made right after a flip event are
+/// the frames rendered ahead.
 fn queue_in_flight<E>(
     in_flight: &mut Option<Duration>,
     frame_target: Duration,
@@ -380,7 +389,7 @@ fn queue_in_flight<E>(
 ) -> Result<(), E> {
     let before = clock();
     queue()?;
-    let after = clock();
+    let after = clock() + VBLANK_GRID_PROMPT;
     let earliest = in_flight_vblank(frame_target, last_grid_next, period, before);
     let latest = in_flight_vblank(frame_target, last_grid_next, period, after);
     *in_flight = (earliest == latest).then_some(earliest);
@@ -2760,10 +2769,11 @@ mod vblank_grid_tests {
         assert_eq!(in_flight, Some(ms(1_010.0)));
     }
 
-    /// Queued for 1010 ms from 1008 to 1009: no vblank between the reads, so 1010.
+    /// Queued for 1010 ms from 1007 to 1008: no vblank between the reads or within the guard
+    /// after them, so 1010.
     #[test]
     fn a_commit_with_no_vblank_inside_the_queue_call_flips_at_the_next() {
-        let clock = Cell::new(ms(1_008.0));
+        let clock = Cell::new(ms(1_007.0));
         let mut in_flight = None;
         queue_in_flight(
             &mut in_flight,
@@ -2772,7 +2782,7 @@ mod vblank_grid_tests {
             ms(10.0),
             || clock.get(),
             || {
-                clock.set(ms(1_009.0));
+                clock.set(ms(1_008.0));
                 Ok::<(), ()>(())
             },
         )
@@ -2824,6 +2834,72 @@ mod vblank_grid_tests {
         )
         .unwrap();
         assert_eq!(in_flight, None);
+    }
+
+    /// The grid from 32 flips at 1000 ms + n * 10, each handled 50 us late: the estimate is
+    /// 50 us late of the real vblanks.
+    fn grid_from_late_events() -> (Option<Duration>, Duration) {
+        let period = ms(10.0);
+        let (mut history, mut last_grid_next, mut last_target) = (VecDeque::new(), None, None);
+        let mut target = Duration::ZERO;
+        for index in 0..32u32 {
+            let observed = ms(690.0 + f64::from(index) * 10.0 + 0.05);
+            target = predict_next_frame(
+                &mut history,
+                &mut last_grid_next,
+                &mut last_target,
+                observed,
+                period,
+            )
+            .1;
+        }
+        (last_grid_next, target)
+    }
+
+    /// Queued from 1010.010 to 1010.020 ms for the estimated 1010.050 vblank: the real one was
+    /// at 1010, so the frame flips at 1020. Both reads are before the estimate, so it was put
+    /// at 1010.050 and the frame rendered ahead of it was sampled a period short.
+    #[test]
+    fn a_commit_just_before_an_estimated_vblank_leaves_its_flip_unknown() {
+        let (grid, target) = grid_from_late_events();
+        assert_eq!(grid, Some(ms(1_010.05)));
+        let clock = Cell::new(ms(1_010.01));
+        let mut in_flight = Some(ms(1_000.0));
+        queue_in_flight(
+            &mut in_flight,
+            target,
+            grid,
+            ms(10.0),
+            || clock.get(),
+            || {
+                clock.set(ms(1_010.02));
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(in_flight, None);
+    }
+
+    /// Queued from 1009.000 to 1009.040 ms: the guard after the second read ends at 1010.040,
+    /// before the estimated 1010.050 vblank, so the frame is placed on it.
+    #[test]
+    fn a_commit_clear_of_the_guard_is_placed() {
+        let (grid, target) = grid_from_late_events();
+        let clock = Cell::new(ms(1_009.0));
+        let mut in_flight = None;
+        queue_in_flight(
+            &mut in_flight,
+            target,
+            grid,
+            ms(10.0),
+            || clock.get(),
+            || {
+                clock.set(ms(1_009.04));
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(in_flight, Some(ms(1_010.05)));
     }
 
     /// A rejected commit flips nothing and leaves the frame in flight as it was.
