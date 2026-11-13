@@ -12945,6 +12945,7 @@ fn connector_connected(
         crate::color::drm_metadata::read_edid_identity(
             backend.drm_output_manager.device(),
             &connector,
+            None,
         )
     };
     let (width_mm, height_mm) = connector.size().unwrap_or((0, 0));
@@ -12959,9 +12960,14 @@ fn connector_connected(
             model: identity
                 .as_ref()
                 .map_or("Unknown".into(), |id| id.model.clone()),
-            serial_number: identity.map_or("Unknown".into(), |id| id.serial),
+            serial_number: identity
+                .as_ref()
+                .map_or("Unknown".into(), |id| id.serial.clone()),
         },
     );
+    if let Some(identity) = identity {
+        crate::state::set_output_edid_identity(&output, identity);
+    }
     let wl_mode = WlMode::from(mode);
     let frame_duration = Duration::from_secs_f64(1_000f64 / wl_mode.refresh as f64);
     output.set_preferred(wl_mode);
@@ -13217,19 +13223,22 @@ pub fn device_changed(
                 connector,
                 crtc: Some(crtc),
             } => {
-                if let Some(backend) = state.tty_backends.get_mut(&node) {
+                if let Some(backend) = state.tty_backends.get_mut(&node)
+                    && let Some(surface) = backend.surfaces.get_mut(&crtc)
+                {
+                    surface.available_modes = connector.modes().to_vec();
                     // The EDID too: it can land after a fallback mode did.
+                    let output = surface.output.clone();
+                    let last = crate::state::output_edid_identity(&output);
                     let identity = crate::color::drm_metadata::read_edid_identity(
                         backend.drm_output_manager.device(),
                         &connector,
+                        last.as_ref(),
                     );
-                    if let Some(surface) = backend.surfaces.get_mut(&crtc) {
-                        surface.available_modes = connector.modes().to_vec();
-                        if let Some(identity) = identity
-                            && crate::state::set_output_edid_identity(&surface.output, identity)
-                        {
-                            info!(output = %surface.output.name(), "named the output from an EDID read after it connected");
-                        }
+                    if let Some(identity) = identity
+                        && crate::state::set_output_edid_identity(&output, identity)
+                    {
+                        info!(output = %output.name(), "named the output from an EDID read after it connected");
                     }
                 }
                 state.apply_runtime_display_configuration();

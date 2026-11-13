@@ -797,41 +797,44 @@ fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
     )
 }
 
-/// What an EDID read after the output was made names it. A dock can show a
-/// fallback mode before its EDID is there, and Smithay keeps the make, model
-/// and serial an output was created with, which `wl_output` goes on sending;
-/// the config's snapshot takes these instead.
-struct LateEdidIdentity(std::sync::Mutex<crate::color::drm_metadata::EdidIdentity>);
+/// What the output's EDID names it, from its connect and every read since.
+/// A dock can show a fallback mode before its EDID is there, and Smithay keeps
+/// the make, model and serial an output was created with, which `wl_output`
+/// goes on sending; the config's snapshot takes these instead.
+struct OutputEdidIdentity(std::sync::Mutex<crate::color::drm_metadata::EdidIdentity>);
 
-/// Names `output` by an EDID read since it was made. Says whether that
-/// changed what the config sees.
+/// What the output's EDID last named it, when it has been read.
+pub fn output_edid_identity(output: &Output) -> Option<crate::color::drm_metadata::EdidIdentity> {
+    let named = output.user_data().get::<OutputEdidIdentity>()?;
+    Some(named.0.lock().unwrap().clone())
+}
+
+/// Names `output` by what its EDID says. Says whether that changed what the
+/// config sees.
 pub fn set_output_edid_identity(
     output: &Output,
     identity: crate::color::drm_metadata::EdidIdentity,
 ) -> bool {
-    if output_identity(output)
-        == (
+    let changed = output_identity(output)
+        != (
             identity.make.clone(),
             identity.model.clone(),
             identity.serial.clone(),
-        )
-    {
-        return false;
-    }
+        );
     let user_data = output.user_data();
-    user_data
-        .insert_if_missing_threadsafe(|| LateEdidIdentity(std::sync::Mutex::new(identity.clone())));
-    if let Some(late) = user_data.get::<LateEdidIdentity>() {
-        *late.0.lock().unwrap() = identity;
+    user_data.insert_if_missing_threadsafe(|| {
+        OutputEdidIdentity(std::sync::Mutex::new(identity.clone()))
+    });
+    if let Some(named) = user_data.get::<OutputEdidIdentity>() {
+        *named.0.lock().unwrap() = identity;
     }
-    true
+    changed
 }
 
-/// Make, model and serial: a late EDID's, else what the output was made with.
+/// Make, model and serial: the EDID's, else what the output was made with.
 fn output_identity(output: &Output) -> (String, String, String) {
-    if let Some(late) = output.user_data().get::<LateEdidIdentity>() {
-        let late = late.0.lock().unwrap();
-        return (late.make.clone(), late.model.clone(), late.serial.clone());
+    if let Some(named) = output_edid_identity(output) {
+        return (named.make, named.model, named.serial);
     }
     let physical = output.physical_properties();
     (physical.make, physical.model, physical.serial_number)

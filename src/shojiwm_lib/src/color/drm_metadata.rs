@@ -128,35 +128,44 @@ pub struct EdidIdentity {
     /// The first serial number descriptor with text, else the base block's
     /// serial number as `0x0000ABCD`, empty when that is 0.
     pub serial: String,
+    /// The three-letter PNP ID `make` was looked up by.
+    pub pnp_id: String,
 }
 
+/// `last` is what the EDID named the output before; see
+/// [`parse_edid_identity`].
 pub fn read_edid_identity(
     device: &impl ControlDevice,
     conn: &connector::Info,
+    last: Option<&EdidIdentity>,
 ) -> Option<EdidIdentity> {
     let (_, blob_id) = find_connector_property(device, conn, PROP_EDID)?;
     if blob_id == 0 {
         return None;
     }
     let edid = device.get_property_blob(blob_id).ok()?;
-    parse_edid_identity(&edid, pnp_company)
+    parse_edid_identity(&edid, pnp_company, last)
 }
 
 /// The company hwdata's `pnp.ids` lists for a PNP ID. libdisplay-info builds
-/// the same list in.
-fn pnp_company(id: &str) -> Option<String> {
-    let list = std::fs::read("/usr/share/hwdata/pnp.ids").ok()?;
-    String::from_utf8_lossy(&list).lines().find_map(|line| {
+/// the same list in. `Err` when the list cannot be read, as while hwdata is
+/// being replaced, which is not the same as a maker it does not list.
+fn pnp_company(id: &str) -> io::Result<Option<String>> {
+    let list = std::fs::read("/usr/share/hwdata/pnp.ids")?;
+    Ok(String::from_utf8_lossy(&list).lines().find_map(|line| {
         let (code, company) = line.split_once('\t')?;
         (code == id).then(|| company.trim().to_owned())
-    })
+    }))
 }
 
 /// The base block's vendor and product section and its display
-/// descriptors. `company` names a PNP ID.
+/// descriptors. `company` names a PNP ID. When it cannot read its list,
+/// `last`'s maker stands for the same PNP ID, so a display already named is
+/// not renamed `PNP(AUS)` and lost to the rules that match it.
 pub fn parse_edid_identity(
     edid: &[u8],
-    company: impl Fn(&str) -> Option<String>,
+    company: impl Fn(&str) -> io::Result<Option<String>>,
+    last: Option<&EdidIdentity>,
 ) -> Option<EdidIdentity> {
     const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
     if edid.get(..8)? != HEADER || edid.len() < 128 {
@@ -184,8 +193,19 @@ pub fn parse_edid_identity(
             (!text.is_empty()).then_some(text)
         })
     };
+    let make = match company(&id) {
+        Ok(Some(company)) => company,
+        Ok(None) => format!("PNP({id})"),
+        Err(error) => match last.filter(|last| last.pnp_id == id) {
+            Some(last) => last.make.clone(),
+            None => {
+                warn!(%error, pnp_id = %id, "hwdata's pnp.ids is unreadable, naming the maker by its PNP ID");
+                format!("PNP({id})")
+            }
+        },
+    };
     Some(EdidIdentity {
-        make: company(&id).unwrap_or_else(|| format!("PNP({id})")),
+        make,
         model: text(0xfc).unwrap_or_else(|| format!("0x{product:04X}")),
         serial: text(0xff).unwrap_or_else(|| {
             if number == 0 {
@@ -194,6 +214,7 @@ pub fn parse_edid_identity(
                 format!("0x{number:08X}")
             }
         }),
+        pnp_id: id,
     })
 }
 
@@ -877,18 +898,22 @@ mod tests {
 
     /// The base blocks of g815's three displays, from
     /// /sys/class/drm/card2-*/edid, with the descriptions Hyprland gave them.
+    const PA278CGV: &str = "00ffffffffffff0006b3ed270101010103230103803c22782a9325ad4f44a9260d5054bf4f00714f818081409500a940b300d100e1c0565e00a0a0a029503020350055502100001a000000fd0018901eda3c000a202020202020000000fc0050413237384347560a20202020000000ff0054314c4d51533036333830320a0134";
+
     #[test]
     fn identity_is_spelled_as_libdisplay_info_spells_it() {
-        let company = |id: &str| match id {
-            "AUS" => Some("ASUSTek COMPUTER INC".to_owned()),
-            "BOE" => Some("BOE".to_owned()),
-            _ => None,
+        let company = |id: &str| -> io::Result<Option<String>> {
+            Ok(match id {
+                "AUS" => Some("ASUSTek COMPUTER INC".to_owned()),
+                "BOE" => Some("BOE".to_owned()),
+                _ => None,
+            })
         };
         let described = |edid: &str| {
-            let id = parse_edid_identity(&hex(edid), company).unwrap();
+            let id = parse_edid_identity(&hex(edid), company, None).unwrap();
             format!("{} {} {}", id.make, id.model, id.serial)
         };
-        let pa278cgv = "00ffffffffffff0006b3ed270101010103230103803c22782a9325ad4f44a9260d5054bf4f00714f818081409500a940b300d100e1c0565e00a0a0a029503020350055502100001a000000fd0018901eda3c000a202020202020000000fc0050413237384347560a20202020000000ff0054314c4d51533036333830320a0134";
+        let pa278cgv = PA278CGV;
         let mb16qhg = "00ffffffffffff0006b3f316000000002d200104b52316783a2825ad5143b1270e5054bdef00d1cf818081c0814081009500b300714fe26800a0a0402e603020360059d71000001a000000fd0030781ed23c010a202020202020000000fc004d4231365148470a2020202020000000ff0052434c4d54463033373936340a0103";
         let panel = "00ffffffffffff0009e5e40c000000000c220104b5271878033e15ae5043b0250e505400000001010101010101010101010101010101c07200a0a040c8603020660084f21000001a000000fd0c30f0b1b176010a202020202020000000fe003d4c33303131202020202020ff000000fc004e4531383051444d2d4e5a430a0127";
         assert_eq!(
@@ -906,7 +931,7 @@ mod tests {
         let mut bare = hex(panel);
         bare[8..16].copy_from_slice(&[0x10, 0xac, 0x34, 0x12, 0x78, 0x56, 0, 0]);
         bare[54..126].fill(1);
-        let id = parse_edid_identity(&bare, company).unwrap();
+        let id = parse_edid_identity(&bare, company, None).unwrap();
         assert_eq!(
             (id.make.as_str(), id.model.as_str(), id.serial.as_str()),
             ("PNP(DEL)", "0x1234", "0x00005678")
@@ -924,14 +949,46 @@ mod tests {
             (0xfc, 0xff),
             "the name and serial descriptors"
         );
-        let id = parse_edid_identity(&empty, company).unwrap();
+        let id = parse_edid_identity(&empty, company, None).unwrap();
         assert_eq!(
             (id.model.as_str(), id.serial.as_str()),
             ("0x27ED", "0x00005678")
         );
-        assert_eq!(parse_edid_identity(&bare[..100], company), None);
+        assert_eq!(parse_edid_identity(&bare[..100], company, None), None);
         bare[0] = 1;
-        assert_eq!(parse_edid_identity(&bare, company), None);
+        assert_eq!(parse_edid_identity(&bare, company, None), None);
+    }
+
+    #[test]
+    fn an_unreadable_pnp_list_keeps_the_maker_last_read() {
+        let gone = |_: &str| -> io::Result<Option<String>> { Err(io::ErrorKind::NotFound.into()) };
+        let listed = |id: &str| -> io::Result<Option<String>> {
+            Ok((id == "AUS").then(|| "ASUSTek COMPUTER INC".to_owned()))
+        };
+        let unlisted = |_: &str| -> io::Result<Option<String>> { Ok(None) };
+        let edid = hex(PA278CGV);
+        let known = parse_edid_identity(&edid, listed, None).unwrap();
+        assert_eq!(
+            (known.make.as_str(), known.pnp_id.as_str()),
+            ("ASUSTek COMPUTER INC", "AUS")
+        );
+        // Read again while the list is gone: named as before.
+        assert_eq!(
+            parse_edid_identity(&edid, gone, Some(&known)).unwrap(),
+            known
+        );
+        // Nothing read before, or another maker's: the PNP ID.
+        let gone_make = |last| parse_edid_identity(&edid, gone, last).unwrap().make;
+        assert_eq!(gone_make(None), "PNP(AUS)");
+        let boe = EdidIdentity {
+            make: "BOE".into(),
+            pnp_id: "BOE".into(),
+            ..known.clone()
+        };
+        assert_eq!(gone_make(Some(&boe)), "PNP(AUS)");
+        // A list that reads and does not have it: the PNP ID, whatever came before.
+        let make = |last| parse_edid_identity(&edid, unlisted, last).unwrap().make;
+        assert_eq!(make(Some(&known)), "PNP(AUS)");
     }
 
     /// Base EDID block + one CTA-861 extension carrying an HDR static

@@ -47,6 +47,7 @@ fn an_edid_read_after_the_output_connected_names_it_for_the_config() {
         make: "ASUSTek COMPUTER INC".into(),
         model: "PA278CGV".into(),
         serial: "T1LMQS063802".into(),
+        pnp_id: "AUS".into(),
     };
     assert!(set_output_edid_identity(&output, identity.clone()));
     assert!(
