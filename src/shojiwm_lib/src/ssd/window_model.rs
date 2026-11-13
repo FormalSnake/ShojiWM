@@ -895,6 +895,13 @@ pub struct ManagedWindowState {
     pub z_index: Option<i32>,
     #[serde(default)]
     pub transform: WindowTransform,
+    /// `<ManagedWindow motionBlur>`: the streak the window leaves this frame,
+    /// as its whole length along x and y in logical pixels (its speed times
+    /// the shutter the config picks). Zero draws the window as it is; any
+    /// other value blurs the pixels it covers along that line once it is
+    /// drawn (`backend::motion_blur`).
+    #[serde(default)]
+    pub motion_blur: [f64; 2],
     /// Rendering policy for the window's client surface tree from
     /// `COMPOSITOR.rendering.surfacePolicy` (`kind: "toplevel"`). `None`
     /// keeps compositor defaults. Consumed by the backend client-element
@@ -920,6 +927,7 @@ impl Default for ManagedWindowState {
             above_fullscreen: false,
             z_index: None,
             transform: WindowTransform::default(),
+            motion_blur: [0.0; 2],
             surface_policy: None,
         }
     }

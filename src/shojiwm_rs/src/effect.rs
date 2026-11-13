@@ -19,11 +19,11 @@
 use std::collections::BTreeMap;
 
 use shojiwm_lib::ssd::{
-    BackdropBlur, BlendMode, CompiledEffect, EffectAlphaMode, EffectDependency, EffectInput,
-    EffectInvalidationPolicy, EffectOutsets, EffectRegion, EffectStage, EffectStateResizePolicy,
-    EffectStateTexture, EffectStateTextureFormat, NoiseKind, NoiseStage, ShaderModule,
-    ShaderStage as CompiledShaderStage, ShaderUniformValue, WindowEffectConfig, WindowEffectSlot,
-    WindowSourceInclude,
+    BackdropBlur, BlendMode, CompiledEffect, DirectionalBlur, EffectAlphaMode, EffectDependency,
+    EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectRegion, EffectStage,
+    EffectStateResizePolicy, EffectStateTexture, EffectStateTextureFormat, NoiseKind, NoiseStage,
+    ShaderModule, ShaderStage as CompiledShaderStage, ShaderUniformValue, WindowEffectConfig,
+    WindowEffectSlot, WindowSourceInclude,
 };
 
 use crate::{
@@ -376,6 +376,7 @@ pub enum Stage {
     Shader(ShaderStage),
     Noise(f32),
     Blur(BackdropBlur),
+    Streak(DirectionalBlur),
     Save(String),
     Blend {
         input: Source,
@@ -401,6 +402,12 @@ pub fn dual_kawase_blur(radius: i32, passes: i32) -> Stage {
         radius: radius.max(0),
         passes: passes.clamp(0, 8),
     })
+}
+
+/// A box blur along one line, `x` by `y` logical pixels long in all: what
+/// a shutter open that long leaves of something moving that way.
+pub fn directional_blur(x: f32, y: f32) -> Stage {
+    Stage::Streak(DirectionalBlur { x, y })
 }
 
 pub fn noise(amount: f32) -> Stage {
@@ -619,6 +626,7 @@ impl Stage {
                 amount: *amount,
             }),
             Self::Blur(blur) => EffectStage::DualKawaseBlur(*blur),
+            Self::Streak(blur) => EffectStage::DirectionalBlur(*blur),
             Self::Save(name) => EffectStage::Save(name.clone()),
             Self::Blend { input, mode, alpha } => EffectStage::Blend {
                 input: input.compile(read),

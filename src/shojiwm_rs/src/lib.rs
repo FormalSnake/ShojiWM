@@ -108,9 +108,9 @@ pub mod prelude {
         },
         effect::{
             Effect, Include, Invalidate, PaintShader, ShaderStage, Source, Stage, StateTexture,
-            SurfaceEffect, SurfaceEffects, Uniform, backdrop_source, blend, dual_kawase_blur,
-            image_source, layer_source, noise, paint_shader, popup_source, render_to,
-            render_to_if_dirty, save, saved, shader_input, shader_stage, state_source,
+            SurfaceEffect, SurfaceEffects, Uniform, backdrop_source, blend, directional_blur,
+            dual_kawase_blur, image_source, layer_source, noise, paint_shader, popup_source,
+            render_to, render_to_if_dirty, save, saved, shader_input, shader_stage, state_source,
             state_texture, unit, window_source, xray_backdrop_source,
         },
         input_grab::{

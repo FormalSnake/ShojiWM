@@ -17435,6 +17435,23 @@ fn tty_window_stack_elements(
                     PopupLayer::Window,
                 ));
             }
+            // Only the output's own frame: a render texture showing the window
+            // would share the streak's element state with it.
+            if primary
+                && let Some(element) = crate::backend::motion_blur::element_for_window(
+                    &mut *renderer,
+                    window_decorations,
+                    windows_top_to_bottom,
+                    window,
+                    &output.name(),
+                    output_geo,
+                    scale,
+                )
+            {
+                scene_elements.push(TtyRenderElements::Decoration(
+                    decoration::DecorationSceneElements::Backdrop(element),
+                ));
+            }
             if let Some(in_front_effects) = in_front_effects {
                 if window_effect_debug_enabled() {
                     info!(

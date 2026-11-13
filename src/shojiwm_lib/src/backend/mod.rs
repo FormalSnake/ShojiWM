@@ -15,6 +15,7 @@ pub mod hdr_pipeline;
 pub mod icon;
 pub mod image_copy_capture_render;
 pub mod lock_scene;
+pub mod motion_blur;
 pub mod overlay;
 pub mod paint;
 pub mod scene3d;

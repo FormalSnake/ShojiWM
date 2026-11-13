@@ -1560,6 +1560,8 @@ struct DisplayTextureProgramPreserveAlpha(GlesTexProgram);
 #[derive(Debug)]
 struct NoiseSaltProgram(GlesTexProgram);
 #[derive(Debug)]
+struct DirectionalBlurProgram(GlesTexProgram);
+#[derive(Debug)]
 struct OpaqueFinishProgram(GlesTexProgram);
 #[derive(Debug)]
 struct AlphaPreservingFinishProgram(GlesTexProgram);
@@ -3291,6 +3293,40 @@ fn compile_noise_salt_program(
         .user_data()
         .get::<NoiseSaltProgram>()
         .expect("noise salt shader should be initialized")
+        .0
+        .clone())
+}
+
+fn compile_directional_blur_program(
+    renderer: &mut GlesRenderer,
+) -> Result<GlesTexProgram, ShaderEffectError> {
+    if renderer
+        .egl_context()
+        .user_data()
+        .get::<DirectionalBlurProgram>()
+        .is_none()
+    {
+        use smithay::backend::renderer::gles::UniformType;
+        let program = renderer.compile_custom_texture_shader(
+            wrap_texture_stage_source(include_str!("directional_blur.frag")),
+            &{
+                let mut names = effect_context_uniform_names();
+                names.push(UniformName::new("blur_step_uv", UniformType::_2f));
+                names.push(UniformName::new("blur_taps", UniformType::_1f));
+                names
+            },
+        )?;
+        renderer
+            .egl_context()
+            .user_data()
+            .insert_if_missing(|| DirectionalBlurProgram(program));
+    }
+
+    Ok(renderer
+        .egl_context()
+        .user_data()
+        .get::<DirectionalBlurProgram>()
+        .expect("directional blur shader should be initialized")
         .0
         .clone())
 }
@@ -5245,6 +5281,7 @@ fn run_effect_pipeline_inner(
         let stage_label = match stage {
             EffectStage::Noise(_) => "noise",
             EffectStage::DualKawaseBlur(_) => "blur",
+            EffectStage::DirectionalBlur(_) => "directional-blur",
             EffectStage::Shader(_) => "shader",
             EffectStage::Save(_) => "save",
             EffectStage::Blend { .. } => "blend",
@@ -5272,6 +5309,15 @@ fn run_effect_pipeline_inner(
                     pyramid,
                 )?
             }
+            EffectStage::DirectionalBlur(blur) => apply_directional_blur_stage(
+                renderer,
+                current,
+                current_size,
+                ctx.content_rect,
+                ctx.frame,
+                *blur,
+                cache.as_deref_mut(),
+            )?,
             EffectStage::Shader(shader) => apply_texture_shader_stage(
                 renderer,
                 current,
@@ -5953,6 +5999,45 @@ fn apply_noise_stage(
             )
         }
     }
+}
+
+/// One pass: each pixel becomes the mean of the taps along the streak
+/// through it. The streak is in logical pixels; the frame's scale makes it
+/// texture pixels.
+fn apply_directional_blur_stage(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    size: (i32, i32),
+    content_rect: Rectangle<i32, Buffer>,
+    frame: ResolvedEffectFrame,
+    blur: crate::ssd::DirectionalBlur,
+    cache: Option<&mut EffectPipelineCache>,
+) -> Result<GlesTexture, ShaderEffectError> {
+    let (x, y) = (blur.x * frame.scale, blur.y * frame.scale);
+    let length = x.hypot(y);
+    if !length.is_finite() || length < 1e-3 {
+        return Ok(texture);
+    }
+    let taps = super::motion_blur::taps(length) as f32;
+    let program = compile_directional_blur_program(renderer)?;
+    let mut uniforms = effect_context_uniforms(size, content_rect, frame);
+    uniforms.push(Uniform::new(
+        "blur_step_uv",
+        [
+            x / taps / size.0.max(1) as f32,
+            y / taps / size.1.max(1) as f32,
+        ],
+    ));
+    uniforms.push(Uniform::new("blur_taps", taps));
+    apply_texture_program(
+        renderer,
+        texture,
+        size,
+        program,
+        uniforms,
+        cache,
+        "effect-directional-blur",
+    )
 }
 
 fn apply_blend_stage(

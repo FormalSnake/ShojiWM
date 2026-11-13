@@ -1138,11 +1138,28 @@ pub struct NoiseStage {
     pub amount: f32,
 }
 
+/// A box blur along one line: the streak a moving thing leaves while a
+/// shutter is open. `x` and `y` are the streak's whole length in logical
+/// pixels, centred on each pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectionalBlur {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl DirectionalBlur {
+    /// The streak's length in logical pixels.
+    pub fn length(self) -> f32 {
+        self.x.hypot(self.y)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectStage {
     Shader(ShaderStage),
     Noise(NoiseStage),
     DualKawaseBlur(BackdropBlur),
+    DirectionalBlur(DirectionalBlur),
     Save(String),
     Blend {
         input: EffectInput,

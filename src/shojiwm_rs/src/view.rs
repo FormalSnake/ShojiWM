@@ -676,6 +676,7 @@ pub struct ManagedWindow {
     z_index: Option<Prop<i32>>,
     opacity: Option<Prop<f64>>,
     transform: Option<Prop<ManagedTransform>>,
+    motion_blur: Option<Prop<[f64; 2]>>,
     children: Vec<Child>,
 }
 
@@ -717,6 +718,11 @@ managed_props! {
     z_index: i32,
     opacity: f64,
     transform: ManagedTransform,
+    /// The streak the window leaves this frame: its whole length along x
+    /// and y in logical pixels, which is the window's speed on screen times
+    /// the shutter the config wants. The pixels the window covers are
+    /// blurred along it in one pass; `[0.0, 0.0]` leaves them alone.
+    motion_blur: [f64; 2],
 }
 
 impl ManagedWindow {
@@ -772,6 +778,7 @@ impl ManagedWindow {
             confine_pointer: read(&self.confine_pointer).unwrap_or(false),
             above_fullscreen: read(&self.above_fullscreen).unwrap_or(false),
             z_index: read(&self.z_index),
+            motion_blur: read(&self.motion_blur).unwrap_or_default(),
             transform: WindowTransform {
                 origin: TransformOrigin {
                     x: transform.origin_x,
