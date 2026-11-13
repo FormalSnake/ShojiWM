@@ -15040,6 +15040,7 @@ fn tty_window_stack_elements(
     let mut max_window_id = stats.max_window_id.take();
     {
         timescope::scope!("tty window loop");
+        let mut streaks = crate::backend::motion_blur::Stack::default();
         for (_window_index, window) in windows_top_to_bottom.iter().enumerate() {
             timescope::scope!("tty window");
             // Fullscreen fast path: every other window is fully occluded;
@@ -17436,21 +17437,9 @@ fn tty_window_stack_elements(
                 ));
             }
             // Only the output's own frame: a render texture showing the window
-            // would share the streak's element state with it.
-            if primary
-                && let Some(element) = crate::backend::motion_blur::element_for_window(
-                    &mut *renderer,
-                    window_decorations,
-                    windows_top_to_bottom,
-                    window,
-                    &output.name(),
-                    output_geo,
-                    scale,
-                )
-            {
-                scene_elements.push(TtyRenderElements::Decoration(
-                    decoration::DecorationSceneElements::Streak(element),
-                ));
+            // would share the streak's element with it.
+            if primary {
+                streaks.reach(&mut *renderer, window, scene_elements.len());
             }
             if let Some(in_front_effects) = in_front_effects {
                 if window_effect_debug_enabled() {
@@ -17568,6 +17557,18 @@ fn tty_window_stack_elements(
                 max_window_elapsed_ms = window_elapsed_ms;
                 max_window_id = Some(window_id);
             }
+        }
+        for (at, element) in streaks.passes(
+            &mut *renderer,
+            window_decorations,
+            &output.name(),
+            output_geo,
+            scale,
+        ) {
+            scene_elements.insert(
+                at,
+                TtyRenderElements::Decoration(decoration::DecorationSceneElements::Streak(element)),
+            );
         }
     }
     stats.frame_had_transform_snapshot_damage = frame_had_transform_snapshot_damage;

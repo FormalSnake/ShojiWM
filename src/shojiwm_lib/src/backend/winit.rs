@@ -5158,6 +5158,7 @@ fn winit_window_stack_elements(
     let output: &Output = scene.output;
     let extra_damage: &mut Vec<crate::ssd::LogicalRect> = scene.extra_damage;
     {
+        let mut streaks = crate::backend::motion_blur::Stack::default();
         for (_window_index, window) in windows_top_to_bottom.iter().enumerate() {
             // Fullscreen fast path: everything but the
             // fullscreen window is occluded; render it as a
@@ -5851,20 +5852,8 @@ fn winit_window_stack_elements(
             }
             // Only the output's own frame: a render texture showing the window
             // would share the streak's element with it.
-            if primary
-                && let Some(element) = crate::backend::motion_blur::element_for_window(
-                    renderer,
-                    &mut state.window_decorations,
-                    windows_top_to_bottom,
-                    window,
-                    &output.name(),
-                    output_geo,
-                    scale,
-                )
-            {
-                scene_elements.push(WinitRenderElements::Decoration(
-                    decoration::DecorationSceneElements::Streak(element),
-                ));
+            if primary {
+                streaks.reach(renderer, window, scene_elements.len());
             }
             let popup_elements = transform_window_elements(
                 window_render::popup_elements(
@@ -6048,6 +6037,20 @@ fn winit_window_stack_elements(
             if let Some(snapshot_id) = snapshot_id.as_ref() {
                 state.snapshot_dirty_window_ids.remove(snapshot_id);
             }
+        }
+        for (at, element) in streaks.passes(
+            renderer,
+            &mut state.window_decorations,
+            &output.name(),
+            output_geo,
+            scale,
+        ) {
+            scene_elements.insert(
+                at,
+                WinitRenderElements::Decoration(decoration::DecorationSceneElements::Streak(
+                    element,
+                )),
+            );
         }
     }
 }

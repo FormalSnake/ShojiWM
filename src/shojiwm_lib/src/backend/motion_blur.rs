@@ -6,14 +6,15 @@
 //!
 //! The pass is a copy of the output's pixels under the windows into a
 //! texture, then one draw per window that reads the copy along the streak.
-//! The texture is as large as the output and goes back to a spare pile when
-//! the move ends, so no move makes one after the first.
+//! The texture is as large as the output and every pass on it shares the
+//! one: each copies just before it draws, and one that finds another's
+//! copy in it copies again.
 
 use std::{
-    cell::RefCell,
     collections::HashMap,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use smithay::{
@@ -52,13 +53,8 @@ pub const SHORTEST: f64 = 0.5;
 /// this bounds what a wrong value could ask for.
 pub const LONGEST: f64 = 96.0;
 
-/// The step the pass's margin round the window grows in, in logical
-/// pixels, so the pass covers the same pixels through a move while the
-/// streak changes length every frame of it.
-pub const REACH_STEP: i32 = 8;
-
-/// The spare textures kept: one for each output mode in use and one over.
-const SPARES: usize = 4;
+/// How long a copy of a size no output has drawn at is kept.
+const IDLE: Duration = Duration::from_secs(10);
 
 /// The taps for a streak `length` physical pixels long: a pixel apart at
 /// most while there are taps to spend, and never one alone, so the blur
@@ -89,8 +85,9 @@ pub fn plan(streak: [f64; 2]) -> Option<Plan> {
             x: x as f32,
             y: y as f32,
         },
-        // Half the streak lands on either side of an edge.
-        reach: ((length * keep / 2.0 / f64::from(REACH_STEP)).ceil() as i32) * REACH_STEP,
+        // Half the streak lands on either side of an edge, and nothing
+        // further out has a moving pixel in it.
+        reach: (length * keep / 2.0).ceil() as i32,
     })
 }
 
@@ -118,136 +115,156 @@ fn key(streak: [f64; 2]) -> [i64; 2] {
     streak.map(|part| (part * 16.0).round() as i64)
 }
 
-/// The windows a pass in front of `stack[index]` covers. `stack` is what
-/// an output draws, top to bottom: the key of each window's streak, `None`
-/// for one that is still. Windows next to each other in the stack with one
-/// streak share the pass in front of the topmost of them. A still window
-/// between two that move ends the run, or the pass of those above it would
-/// blur it where it lies over those below.
-fn run(stack: &[Option<[i64; 2]>], index: usize) -> Option<std::ops::Range<usize>> {
-    let streak = stack.get(index).copied().flatten()?;
-    if index > 0 && stack[index - 1] == Some(streak) {
-        return None;
-    }
-    let length = stack[index..]
-        .iter()
-        .take_while(|other| **other == Some(streak))
-        .count();
-    Some(index..index + length)
+/// A window an output draws: the key of its streak, `None` for one that is
+/// still, and the rect it is drawn in, with the pass's margin if it moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Lying {
+    key: Option<[i64; 2]>,
+    rect: LogicalRect,
 }
 
-/// Capture textures no pass holds, kept with the GL context.
+fn overlap(a: LogicalRect, b: LogicalRect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/// The passes for `stack`, which is what an output draws, top to bottom:
+/// for each the windows it covers, the one it is drawn in front of first.
+/// Windows with one streak share a pass. Another window between them in
+/// the stack ends the run only where it lies over one of those below it:
+/// the pass of those above would blur it there.
+fn runs(stack: &[Lying]) -> Vec<Vec<usize>> {
+    struct Run {
+        key: [i64; 2],
+        windows: Vec<usize>,
+        /// The others drawn under its topmost window so far.
+        between: Vec<LogicalRect>,
+    }
+    let mut open: Vec<Run> = Vec::new();
+    let mut runs = Vec::new();
+    for (index, lying) in stack.iter().enumerate() {
+        if let Some(key) = lying.key {
+            let run = open.iter().position(|run| run.key == key);
+            let covered = run.is_some_and(|run| {
+                open[run]
+                    .between
+                    .iter()
+                    .any(|other| overlap(*other, lying.rect))
+            });
+            match run {
+                Some(run) if !covered => open[run].windows.push(index),
+                _ => {
+                    runs.extend(run.map(|run| open.remove(run).windows));
+                    open.push(Run {
+                        key,
+                        windows: vec![index],
+                        between: Vec::new(),
+                    });
+                }
+            }
+        }
+        for run in &mut open {
+            if Some(run.key) != lying.key {
+                run.between.push(lying.rect);
+            }
+        }
+    }
+    runs.extend(open.into_iter().map(|run| run.windows));
+    runs.sort();
+    runs
+}
+
+/// A copy of an output's pixels, laid out as its framebuffer has them.
+#[derive(Debug)]
+struct Kept {
+    texture: GlesTexture,
+    /// The pass whose copy is in it.
+    of: Option<Id>,
+    used: Instant,
+}
+
+/// The copies, kept with the GL context: one for each size outputs draw at.
 #[derive(Debug, Default)]
-struct Spare {
-    textures: Vec<GlesTexture>,
+struct Copies {
+    held: Vec<Kept>,
     /// How many were ever made.
     made: usize,
 }
 
-type Spares = Arc<Mutex<Spare>>;
+type Shared = Arc<Mutex<Copies>>;
 
-fn spares(renderer: &mut GlesRenderer) -> Spares {
+fn copies(renderer: &mut GlesRenderer) -> Shared {
     let data = renderer.egl_context().user_data();
-    data.insert_if_missing(Spares::default);
-    data.get::<Spares>()
-        .expect("the spare textures were just put there")
+    data.insert_if_missing(Shared::default);
+    data.get::<Shared>()
+        .expect("the copies were just put there")
         .clone()
 }
 
-fn take(
-    renderer: &mut GlesRenderer,
-    spares: &Spares,
-    size: Size<i32, Buffer>,
-) -> Result<GlesTexture, GlesError> {
-    let mut spare = spares
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(at) = spare
-        .textures
-        .iter()
-        .position(|texture| texture.size() == size)
-    {
-        return Ok(spare.textures.swap_remove(at));
-    }
-    spare.made += 1;
-    let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
-    // A new texture repeats: a tap past the output's edge would read its
-    // far side.
-    let id = texture.tex_id();
-    renderer.with_context(|gl| unsafe {
-        gl.BindTexture(ffi::TEXTURE_2D, id);
-        for side in [ffi::TEXTURE_WRAP_S, ffi::TEXTURE_WRAP_T] {
-            gl.TexParameteri(ffi::TEXTURE_2D, side, ffi::CLAMP_TO_EDGE as i32);
-        }
-        gl.BindTexture(ffi::TEXTURE_2D, 0);
-    })?;
-    Ok(texture)
-}
-
-/// What a pass holds between its copy and its draw, and from one frame of
-/// a move to the next: in the damage tracker's cache for its element, so
-/// it goes when the element does.
-#[derive(Debug)]
-struct Held {
-    /// The output's pixels, laid out as its framebuffer has them.
-    texture: Option<GlesTexture>,
-    spares: Spares,
-}
-
-impl Held {
+impl Copies {
+    /// The copy for a framebuffer of `size`, made if there is none.
     fn fit(
         &mut self,
         renderer: &mut GlesRenderer,
         size: Size<i32, Buffer>,
-    ) -> Result<(), GlesError> {
-        if self
-            .texture
-            .as_ref()
-            .is_none_or(|texture| texture.size() != size)
+    ) -> Result<&mut Kept, GlesError> {
+        let now = Instant::now();
+        let at = match self
+            .held
+            .iter()
+            .position(|copy| copy.texture.size() == size)
         {
-            let old = self.texture.take();
-            give_back(&self.spares, old);
-            self.texture = Some(take(renderer, &self.spares, size)?);
-        }
-        Ok(())
+            Some(at) => at,
+            None => {
+                self.held
+                    .retain(|copy| now.duration_since(copy.used) < IDLE);
+                let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+                // A new texture repeats: a tap past the output's edge would
+                // read its far side.
+                let id = texture.tex_id();
+                renderer.with_context(|gl| unsafe {
+                    gl.BindTexture(ffi::TEXTURE_2D, id);
+                    for side in [ffi::TEXTURE_WRAP_S, ffi::TEXTURE_WRAP_T] {
+                        gl.TexParameteri(ffi::TEXTURE_2D, side, ffi::CLAMP_TO_EDGE as i32);
+                    }
+                    gl.BindTexture(ffi::TEXTURE_2D, 0);
+                })?;
+                self.made += 1;
+                self.held.push(Kept {
+                    texture,
+                    of: None,
+                    used: now,
+                });
+                self.held.len() - 1
+            }
+        };
+        self.held[at].used = now;
+        Ok(&mut self.held[at])
     }
 }
 
-fn give_back(spares: &Spares, texture: Option<GlesTexture>) {
-    let mut spare = spares
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    spare.textures.extend(texture);
-    let over = spare.textures.len().saturating_sub(SPARES);
-    spare.textures.drain(..over);
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        let old = self.texture.take();
-        give_back(&self.spares, old);
-    }
-}
-
+/// `None` where the shader does not compile, found out once.
 #[derive(Debug)]
-struct Program(GlesTexProgram);
+struct Program(Option<GlesTexProgram>);
 
-fn program(renderer: &mut GlesRenderer) -> Result<GlesTexProgram, GlesError> {
+fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
     if let Some(program) = renderer.egl_context().user_data().get::<Program>() {
-        return Ok(program.0.clone());
+        return program.0.clone();
     }
-    let compiled = renderer.compile_custom_texture_shader(
-        include_str!("motion_blur.frag"),
-        &[
-            UniformName::new("blur_step_uv", UniformType::_2f),
-            UniformName::new("blur_taps", UniformType::_1f),
-        ],
-    )?;
+    let compiled = renderer
+        .compile_custom_texture_shader(
+            include_str!("motion_blur.frag"),
+            &[
+                UniformName::new("blur_step_uv", UniformType::_2f),
+                UniformName::new("blur_taps", UniformType::_1f),
+            ],
+        )
+        .inspect_err(|error| tracing::warn!(?error, "the motion blur shader does not compile"))
+        .ok();
     renderer
         .egl_context()
         .user_data()
         .insert_if_missing(|| Program(compiled.clone()));
-    Ok(compiled)
+    compiled
 }
 
 /// The pass over a run of windows that move as one.
@@ -264,7 +281,7 @@ pub struct MotionBlurElement {
     /// How far past `geometry` the copy goes, in physical pixels.
     padding: i32,
     program: GlesTexProgram,
-    spares: Spares,
+    copies: Shared,
 }
 
 /// The element that draws `streak` over the windows drawn in `windows`, to
@@ -276,10 +293,9 @@ pub fn element(
     windows: &[LogicalRect],
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
-) -> Result<Option<MotionBlurElement>, GlesError> {
-    let Some(plan) = plan(streak) else {
-        return Ok(None);
-    };
+) -> Option<MotionBlurElement> {
+    let plan = plan(streak)?;
+    let program = program(renderer)?;
     let regions: Vec<_> = windows
         .iter()
         .filter(|window| window.width > 0 && window.height > 0)
@@ -296,9 +312,7 @@ pub fn element(
             )
         })
         .collect();
-    let Some(geometry) = regions.iter().copied().reduce(Rectangle::merge) else {
-        return Ok(None);
-    };
+    let geometry = regions.iter().copied().reduce(Rectangle::merge)?;
     let streak = [plan.blur.x * scale.x as f32, plan.blur.y * scale.y as f32];
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for region in &regions {
@@ -306,90 +320,118 @@ pub fn element(
     }
     streak.map(f32::to_bits).hash(&mut hasher);
     let signature = hasher.finish();
-    if state.signature != signature {
+    let copies = copies(renderer);
+    // Another pass has copied into the texture since this one did: it has
+    // to copy again, which a new commit makes the damage tracker ask for.
+    let kept = copies
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .held
+        .iter()
+        .any(|copy| copy.of.as_ref() == Some(&state.id));
+    if state.signature != signature || !kept {
         state.signature = signature;
         state.commit_counter.increment();
     }
-    Ok(Some(MotionBlurElement {
+    Some(MotionBlurElement {
         id: state.id.clone(),
         commit: state.commit_counter,
         geometry,
         regions,
         streak,
         padding: (f64::from(plan.padding()) * scale.x.max(scale.y)).ceil() as i32,
-        program: program(renderer)?,
-        spares: spares(renderer),
-    }))
+        program,
+        copies,
+    })
 }
 
-/// The streak element to draw in front of `window` as `output` draws it,
-/// if it is the topmost of a run of windows that move as one. They share
-/// the pass: each pass is a copy and a draw of its own, and what a pass
-/// costs is in their number, not their size.
-pub fn element_for_window(
-    renderer: &mut GlesRenderer,
-    decorations: &mut HashMap<Window, WindowDecorationState>,
-    windows_top_to_bottom: &[Window],
-    window: &Window,
-    output_name: &str,
-    output_geo: Rectangle<i32, Logical>,
-    scale: Scale<f64>,
-) -> Option<MotionBlurElement> {
-    // Compiled with the first window drawn: the first move would wait a
-    // frame or more on it.
-    let _ = program(renderer);
-    let decoration = decorations.get_mut(window)?;
-    let streak = decoration.managed_window.motion_blur;
-    if plan(streak).is_none() {
-        if !decoration.window_effect_cache.is_empty() {
-            decoration
-                .window_effect_cache
-                .remove(&format!("motion-blur@{output_name}"));
+/// The windows an output's frame draws, top to bottom, as it comes to
+/// them, and where in its elements each one's pass would go.
+#[derive(Debug, Default)]
+pub struct Stack {
+    windows: Vec<(Window, usize)>,
+}
+
+impl Stack {
+    /// `window` is drawn, and a pass in front of it goes at `at` in the
+    /// frame's elements.
+    pub fn reach(&mut self, renderer: &mut GlesRenderer, window: &Window, at: usize) {
+        // Compiled with the first window drawn: the first move would wait
+        // a frame or more on it.
+        if self.windows.is_empty() {
+            program(renderer);
         }
-        return None;
+        self.windows.push((window.clone(), at));
     }
-    let cache = format!("motion-blur@{output_name}");
-    let drawn: Vec<_> = windows_top_to_bottom
-        .iter()
-        .filter_map(|other| Some((other, decorations.get(other)?)))
-        .filter(|(_, decoration)| !decoration.managed_window_hidden_on_output(output_name))
-        .collect();
-    let stack: Vec<_> = drawn
-        .iter()
-        .map(|(_, decoration)| {
-            let streak = decoration.managed_window.motion_blur;
-            plan(streak).map(|_| key(streak))
-        })
-        .collect();
-    let run = drawn
-        .iter()
-        .position(|(other, _)| *other == window)
-        .and_then(|index| run(&stack, index));
-    let Some(run) = run else {
-        decorations
-            .get_mut(window)?
-            .window_effect_cache
-            .remove(&cache);
-        return None;
-    };
-    let rects: Vec<_> = drawn[run]
-        .iter()
-        .map(|(_, decoration)| {
-            crate::backend::visual::transformed_root_rect(
-                decoration.layout.root.rect,
-                decoration.visual_transform,
-            )
-        })
-        .collect();
-    let state = decorations
-        .get_mut(window)?
-        .window_effect_cache
-        .entry(cache)
-        .or_default();
-    element(renderer, state, streak, &rects, output_geo, scale)
-        .inspect_err(|error| tracing::warn!(?error, "failed to build a window's motion blur"))
-        .ok()
-        .flatten()
+
+    /// The passes of the frame and where each goes in its elements, the
+    /// last place first, so that putting one in moves none of the others.
+    /// Windows that move as one share a pass: each pass is a copy and a
+    /// draw of its own, and what a pass costs is in their number.
+    pub fn passes(
+        self,
+        renderer: &mut GlesRenderer,
+        decorations: &mut HashMap<Window, WindowDecorationState>,
+        output_name: &str,
+        output_geo: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+    ) -> Vec<(usize, MotionBlurElement)> {
+        let cache = format!("motion-blur@{output_name}");
+        let drawn: Vec<_> = self
+            .windows
+            .iter()
+            .filter_map(|(window, at)| {
+                let decoration = decorations.get(window)?;
+                let rect = crate::backend::visual::transformed_root_rect(
+                    decoration.layout.root.rect,
+                    decoration.visual_transform,
+                );
+                Some((window, *at, decoration.managed_window.motion_blur, rect))
+            })
+            .collect();
+        let stack: Vec<_> = drawn
+            .iter()
+            .map(|(_, _, streak, rect)| match plan(*streak) {
+                Some(plan) => Lying {
+                    key: Some(key(*streak)),
+                    rect: plan.rect(*rect),
+                },
+                None => Lying {
+                    key: None,
+                    rect: *rect,
+                },
+            })
+            .collect();
+        let runs = runs(&stack);
+        for (index, (window, ..)) in drawn.iter().enumerate() {
+            if runs.iter().any(|run| run[0] == index) {
+                continue;
+            }
+            if let Some(decoration) = decorations.get_mut(*window)
+                && !decoration.window_effect_cache.is_empty()
+            {
+                decoration.window_effect_cache.remove(&cache);
+            }
+        }
+        let mut passes: Vec<_> = runs
+            .iter()
+            .filter_map(|run| {
+                let (window, at, streak, _) = drawn[run[0]];
+                let rects: Vec<_> = run.iter().map(|index| drawn[*index].3).collect();
+                let state = decorations
+                    .get_mut(window)?
+                    .window_effect_cache
+                    .entry(cache.clone())
+                    .or_default();
+                Some((
+                    at,
+                    element(renderer, state, streak, &rects, output_geo, scale)?,
+                ))
+            })
+            .collect();
+        passes.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        passes
+    }
 }
 
 impl MotionBlurElement {
@@ -453,20 +495,26 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
+        _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let Some(held) = cache.and_then(|cache| cache.get::<RefCell<Held>>()) else {
-            return Ok(());
-        };
-        let held = held.borrow();
-        let Some(texture) = held.texture.as_ref() else {
-            return Ok(());
-        };
-        let size = texture.size();
-        let taps = taps(self.streak[0].hypot(self.streak[1])) as f32;
         // The copy lies as the framebuffer does, and the streak with it.
         let transform = frame.transformation();
         let output = frame.output_size();
+        let size = transform.transform_size(output);
+        let size = Size::<i32, Buffer>::from((size.w, size.h));
+        // Not this pass's copy: what it would draw is another's pixels.
+        let texture = self
+            .copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held
+            .iter()
+            .find(|copy| copy.texture.size() == size && copy.of.as_ref() == Some(&self.id))
+            .map(|copy| copy.texture.clone());
+        let Some(texture) = texture else {
+            return Ok(());
+        };
+        let taps = taps(self.streak[0].hypot(self.streak[1])) as f32;
         let area = Size::<f64, Physical>::from((f64::from(output.w), f64::from(output.h)));
         let turned = |x: f32, y: f32| {
             transform.transform_point_in(
@@ -501,7 +549,7 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
                 (f64::from(from.size.w), f64::from(from.size.h)).into(),
             );
             result = frame.render_texture_from_to(
-                texture,
+                &texture,
                 src,
                 Rectangle::new(dst.loc + within.loc, within.size),
                 &damage,
@@ -524,7 +572,7 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
         frame: &mut GlesFrame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-        cache: &UserDataMap,
+        _cache: &UserDataMap,
     ) -> Result<(), GlesError> {
         let output = Rectangle::from_size(frame.output_size());
         let Some(capture) = self.capture_region(dst).intersection(output) else {
@@ -536,19 +584,15 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
         let transform = frame.transformation();
         let blit = transform.transform_rect_in(capture, &output.size);
         let size = transform.transform_size(output.size);
-        let held = cache.get_or_insert::<RefCell<Held>, _>(|| {
-            RefCell::new(Held {
-                texture: None,
-                spares: self.spares.clone(),
-            })
-        });
-        let mut held = held.borrow_mut();
-        held.fit(frame.renderer().as_mut(), (size.w, size.h).into())?;
-        let target = held
-            .texture
-            .as_ref()
-            .expect("fit made the texture")
-            .tex_id();
+        let target = {
+            let mut copies = self
+                .copies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let copy = copies.fit(frame.renderer().as_mut(), (size.w, size.h).into())?;
+            copy.of = Some(self.id.clone());
+            copy.texture.tex_id()
+        };
         frame.with_context(|gl| unsafe {
             with_gpu_timing_gl_span(
                 gl,
@@ -611,56 +655,94 @@ mod tests {
     }
 
     #[test]
-    fn the_pass_reaches_past_the_window_by_a_margin_a_move_keeps() {
+    fn the_pass_reaches_no_further_than_the_streak_does() {
         let window = LogicalRect::new(100, 50, 800, 600);
-        let rect = plan([-9.0, 0.0]).unwrap().rect(window);
-        assert_eq!(rect, LogicalRect::new(92, 42, 816, 616));
-        // The same through a move: as the streak grows, shrinks and turns.
-        for streak in [[0.6, 0.0], [0.0, -12.0], [8.0, 8.0], [16.0, 0.0]] {
-            assert_eq!(plan(streak).unwrap().rect(window), rect, "{streak:?}");
+        // Half the streak either side, and a still pixel 7 away is left.
+        let twelve = plan([0.0, -12.0]).unwrap();
+        assert_eq!(twelve.rect(window), LogicalRect::new(94, 44, 812, 612));
+        assert_eq!(plan([0.6, 0.0]).unwrap().reach, 1);
+        assert_eq!(plan([-9.0, 0.0]).unwrap().reach, 5);
+        assert_eq!(plan([6.0, 8.0]).unwrap().reach, 5);
+        for streak in [[0.6, 0.0], [-9.0, 0.0], [6.0, 8.0], [300.0, 0.0]] {
+            let plan = plan(streak).unwrap();
+            let half = plan.blur.length() / 2.0;
+            assert!(plan.reach as f32 >= half && (plan.reach as f32) < half + 1.0);
+            // Its taps read no further than the copy goes.
+            assert!(plan.padding() as f32 >= half + 1.0);
         }
-        assert_eq!(plan([17.0, 0.0]).unwrap().reach, 16);
-        let plan = plan([-9.0, 0.0]).unwrap();
-        // Its taps read no further than the copy goes.
-        assert!(plan.padding() as f32 >= plan.blur.length() / 2.0);
     }
 
-    /// The windows the passes of `stack` cover, by the window each pass is
-    /// in front of.
-    fn passes(stack: &[Option<[i64; 2]>]) -> Vec<(usize, std::ops::Range<usize>)> {
-        (0..stack.len())
-            .filter_map(|index| Some((index, run(stack, index)?)))
-            .collect()
+    const TAPE: [f64; 2] = [9.0, 0.0];
+    const SWITCH: [f64; 2] = [0.0, -11.0];
+
+    /// A window `wide` by 300 at `x`, `y`, moving with `streak` if any.
+    fn lying(streak: Option<[f64; 2]>, x: i32, y: i32, wide: i32) -> Lying {
+        let rect = LogicalRect::new(x, y, wide, 300);
+        match streak {
+            Some(streak) => Lying {
+                key: Some(key(streak)),
+                rect: plan(streak).unwrap().rect(rect),
+            },
+            None => Lying { key: None, rect },
+        }
     }
 
     #[test]
     fn a_tape_is_one_pass_in_front_of_its_topmost_window() {
-        let tape = Some(key([9.0, 0.0]));
-        assert_eq!(passes(&[tape, tape, tape]), [(0, 0..3)]);
+        let tape = |x| lying(Some(TAPE), x, 0, 300);
+        assert_eq!(runs(&[tape(0), tape(320), tape(640)]), [[0, 1, 2]]);
         // Under a float that is still.
-        assert_eq!(passes(&[None, tape, tape]), [(1, 1..3)]);
-        assert_eq!(passes(&[None, None]), []);
+        let float = lying(None, 100, 100, 300);
+        assert_eq!(runs(&[float, tape(0), tape(320)]), [[1, 2]]);
+        assert!(runs(&[float, lying(None, 0, 0, 300)]).is_empty());
     }
 
     #[test]
-    fn a_still_window_in_the_stack_keeps_the_pass_above_it_off_the_windows_below() {
+    fn a_still_window_over_one_that_moves_keeps_the_pass_above_it_off_that_one() {
         // A fullscreen window leaving, a pinned window that stays, and the
         // tiles of the workspace coming in under it.
-        let switch = Some(key([0.0, -11.0]));
-        assert_eq!(
-            passes(&[switch, None, switch, switch]),
-            [(0, 0..1), (2, 2..4)]
+        let leaving = lying(Some(SWITCH), 0, -400, 1000);
+        let pinned = lying(None, 600, 500, 300);
+        let (under, beside) = (
+            lying(Some(SWITCH), 500, 400, 480),
+            lying(Some(SWITCH), 0, 400, 480),
         );
+        assert_eq!(
+            runs(&[leaving, pinned, under, beside]),
+            [vec![0], vec![2, 3]]
+        );
+        // Over none of them, it is in nobody's way.
+        let aside = lying(None, 1200, 500, 300);
+        assert_eq!(runs(&[leaving, aside, under, beside]), [[0, 2, 3]]);
     }
 
     #[test]
     fn windows_with_streaks_of_their_own_get_passes_of_their_own() {
-        let (tape, flick) = (Some(key([9.0, 0.0])), Some(key([3.0, 4.0])));
-        assert_eq!(passes(&[flick, tape, tape]), [(0, 0..1), (1, 1..3)]);
+        let tape = |x| lying(Some(TAPE), x, 0, 300);
+        let flick = |x| lying(Some([3.0, 4.0]), x, 100, 300);
+        assert_eq!(runs(&[flick(0), tape(0), tape(320)]), [vec![0], vec![1, 2]]);
+        // Between two of a tape and over the lower one.
         assert_eq!(
-            passes(&[tape, flick, tape]),
-            [(0, 0..1), (1, 1..2), (2, 2..3)]
+            runs(&[tape(0), flick(320), tape(320)]),
+            [vec![0], vec![1], vec![2]]
         );
+    }
+
+    #[test]
+    fn two_workspaces_on_their_own_tapes_are_two_passes_however_they_are_stacked() {
+        // A switch while the workspace leaving scrolls: its tiles and the
+        // tiles coming in take turns in the stack, a screen apart.
+        let leaving = |x| lying(Some([9.0, -11.0]), x, 0, 300);
+        let coming = |x| lying(Some(SWITCH), x, 800, 300);
+        let stack = [
+            leaving(640),
+            coming(640),
+            leaving(320),
+            coming(320),
+            leaving(0),
+            coming(0),
+        ];
+        assert_eq!(runs(&stack), [[0, 2, 4], [1, 3, 5]]);
     }
 
     #[test]
@@ -860,10 +942,10 @@ mod tests {
         let mut frames = vec![([0.0, 0.0], Vec::new())];
         frames.extend(moves());
         frames.push(([0.0, 0.0], Vec::new()));
-        let spares = spares(&mut renderer);
+        let copies = copies(&mut renderer);
         // As a monitor is, as the nested window is, and on its side.
         for transform in [Transform::Normal, Transform::Flipped180, Transform::_90] {
-            let made = spares.lock().unwrap().made;
+            let made = copies.lock().unwrap().made;
             let size = transform.transform_size(Size::<i32, Physical>::from(DESK));
             let mut target: GlesTexture = Offscreen::<GlesTexture>::create_buffer(
                 &mut renderer,
@@ -899,8 +981,7 @@ mod tests {
                     windows,
                     output_geo,
                     Scale::from(1.0),
-                )
-                .unwrap();
+                );
                 let elements: Vec<Drawn> = blur
                     .into_iter()
                     .map(Drawn::Blur)
@@ -969,8 +1050,164 @@ mod tests {
             // One texture at most for the whole of it: the scroll's group
             // shrinks as it leaves the output and every window changes
             // place every frame.
-            assert!(spares.lock().unwrap().made <= made + 1, "{transform:?}");
+            assert!(copies.lock().unwrap().made <= made + 1, "{transform:?}");
         }
-        assert_eq!(spares.lock().unwrap().made, 2);
+        assert_eq!(copies.lock().unwrap().made, 2);
+    }
+
+    /// A switch while the workspace leaving scrolls: two workspaces of
+    /// three tiles on streaks of their own, taking turns in the stack, and
+    /// something above them that moves between frames in which they do not.
+    #[test]
+    #[ignore = "requires surfaceless EGL; renders only offscreen buffers"]
+    fn two_workspaces_at_speeds_of_their_own_share_one_copy() {
+        use smithay::{
+            backend::{
+                allocator::Fourcc,
+                egl::{EGLContext, EGLDisplay, native::EGLSurfacelessDisplay},
+                renderer::{
+                    Bind, ExportMem, ImportMem, Offscreen, Renderer,
+                    damage::OutputDamageTracker,
+                    element::{Id, Kind, texture::TextureRenderElement},
+                    gles::GlesTexture,
+                },
+            },
+            utils::Transform,
+        };
+
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.unwrap();
+        let context = EGLContext::new(&display).unwrap();
+        let mut renderer = unsafe { GlesRenderer::new(context) }.unwrap();
+        let desk = desk();
+        let desk_texture = renderer
+            .import_memory(&desk, Fourcc::Abgr8888, DESK.into(), false)
+            .unwrap();
+        const MARK: i32 = 40;
+        let red = [200, 30, 30, 255].repeat((MARK * MARK) as usize);
+        let mark_texture = renderer
+            .import_memory(&red, Fourcc::Abgr8888, (MARK, MARK).into(), false)
+            .unwrap();
+        let (under_id, mark_id, context) = (Id::new(), Id::new(), renderer.context_id());
+        let shown = |id: &Id, texture: &GlesTexture, at: (f64, f64)| {
+            TextureRenderElement::from_static_texture(
+                id.clone(),
+                context.clone(),
+                at,
+                texture.clone(),
+                1,
+                Transform::Normal,
+                None,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+        };
+        let output_geo = Rectangle::from_size(DESK.into());
+        let mut target: GlesTexture =
+            Offscreen::<GlesTexture>::create_buffer(&mut renderer, Fourcc::Abgr8888, DESK.into())
+                .unwrap();
+        let mut tracker = OutputDamageTracker::new(DESK, 1.0, Transform::Normal);
+        let mut states: HashMap<usize, WindowEffectElementState> = HashMap::new();
+        let (leaving, coming) = ([9.0, -11.0], [0.0, -11.0]);
+        let mut first = true;
+        for step in 0..12 {
+            let rects = |streak: [f64; 2], y: i32| -> Vec<LogicalRect> {
+                (0..3)
+                    .map(|tile| {
+                        LogicalRect::new(
+                            20 + 170 * tile + (streak[0] * f64::from(step)) as i32,
+                            y - 6 * step,
+                            150,
+                            100,
+                        )
+                    })
+                    .collect()
+            };
+            let (left, came) = (rects(leaving, 90), rects(coming, 260));
+            let stack: Vec<Lying> = (0..3)
+                .flat_map(|tile| {
+                    [(leaving, left[tile]), (coming, came[tile])].map(|(streak, rect)| Lying {
+                        key: Some(key(streak)),
+                        rect: plan(streak).unwrap().rect(rect),
+                    })
+                })
+                .collect();
+            let runs = runs(&stack);
+            assert_eq!(runs, [[0, 2, 4], [1, 3, 5]]);
+            // The lower pass first: the upper one reads what it drew.
+            let (wanted, passed) = filtered(&desk, coming, &came);
+            let (wanted, over) = filtered(&wanted, leaving, &left);
+            // The mark moves on its own, over the tiles coming in.
+            for mark in [
+                (60 + 9 * step, 250 - 6 * step),
+                (64 + 9 * step, 244 - 6 * step),
+            ] {
+                let mut elements = vec![Drawn::Under(shown(
+                    &mark_id,
+                    &mark_texture,
+                    (f64::from(mark.0), f64::from(mark.1)),
+                ))];
+                for (run, streak, rects) in [(&runs[0], leaving, &left), (&runs[1], coming, &came)]
+                {
+                    let state = states.entry(run[0]).or_default();
+                    let blur = element(
+                        &mut renderer,
+                        state,
+                        streak,
+                        rects,
+                        output_geo,
+                        Scale::from(1.0),
+                    );
+                    elements.push(Drawn::Blur(blur.expect("the tiles are on the output")));
+                }
+                elements.push(Drawn::Under(shown(&under_id, &desk_texture, (0.0, 0.0))));
+                {
+                    let mut framebuffer = renderer.bind(&mut target).unwrap();
+                    tracker
+                        .render_output(
+                            &mut renderer,
+                            &mut framebuffer,
+                            usize::from(!first),
+                            &elements,
+                            [0.0; 4],
+                        )
+                        .unwrap();
+                }
+                first = false;
+                let mapping = renderer
+                    .copy_texture(&target, Rectangle::from_size(DESK.into()), Fourcc::Abgr8888)
+                    .unwrap();
+                let read = renderer.map_texture(&mapping).unwrap().to_vec();
+                let row = (DESK.0 * 4) as usize;
+                // Top row first or last, whichever the mark is found in.
+                let at = |x: i32, y: i32| ((y * DESK.0 + x) * 4) as usize;
+                let mut drawn = read.clone();
+                if drawn[at(mark.0, mark.1)..][..4] != red[..4] {
+                    drawn = read.chunks(row).rev().flatten().copied().collect();
+                }
+                for y in 0..DESK.1 {
+                    for x in 0..DESK.0 {
+                        let marked = (mark.0..mark.0 + MARK).contains(&x)
+                            && (mark.1..mark.1 + MARK).contains(&y);
+                        for channel in 0..4 {
+                            let at = at(x, y) + channel;
+                            let wanted = if marked { red[channel] } else { wanted[at] };
+                            let out = drawn[at].abs_diff(wanted);
+                            assert!(
+                                out <= 2,
+                                "step {step}, mark {mark:?}, {x} {y}: {out} levels out"
+                            );
+                            assert!(
+                                marked || passed[at] || over[at] || drawn[at] == desk[at],
+                                "step {step}, mark {mark:?}, {x} {y}: drew outside the windows"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Two passes a frame for the whole of it, and one texture.
+        assert_eq!(copies(&mut renderer).lock().unwrap().made, 1);
     }
 }
