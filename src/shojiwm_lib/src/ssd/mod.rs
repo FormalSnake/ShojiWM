@@ -51,7 +51,6 @@ pub use popup::{
 pub(crate) use popup_input::PopupInputState;
 pub use window_model::{
     GesturePinchEventSnapshot, GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
-    TouchEventSnapshot, TouchPhaseSnapshot,
     HdmiLinkSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
     ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
     ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
@@ -59,11 +58,11 @@ pub use window_model::{
     ManagedWindowScalarAnimationSnapshot, ManagedWindowState, OutputModeSnapshot,
     OutputPositionSnapshot, OutputSubpixelSnapshot, OutputTransformSnapshot,
     PointerHitTargetSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
-    PointerMovePointSnapshot, PopupParentKindSnapshot, TransformOrigin, WaylandLayerSnapshot,
-    WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
-    WindowActivateRequestEventSnapshot, WindowActivateRequestSourceSnapshot, WindowContentType,
-    X11WindowStateSnapshot,
-    WindowDecorationClientSnapshot, WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
+    PointerMovePointSnapshot, PopupParentKindSnapshot, TouchEventSnapshot, TouchPhaseSnapshot,
+    TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot,
+    WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
+    WindowActivateRequestSourceSnapshot, WindowContentType, WindowDecorationClientSnapshot,
+    WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
     WindowDecorationPolicyContextSnapshot, WindowDecorationPolicyReasonSnapshot,
     WindowDecorationProtocolSnapshot, WindowDecorationStateSnapshot,
     WindowFullscreenRequestEventSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,
@@ -71,7 +70,7 @@ pub use window_model::{
     WindowMoveSourceSnapshot, WindowPositionSnapshot, WindowResizeEdgesSnapshot,
     WindowResizeEventSnapshot, WindowResizePhaseSnapshot, WindowResizePointSnapshot,
     WindowResizeSourceSnapshot, WindowStateRequestSourceSnapshot, WindowTransform,
-    layer_runtime_id, popup_runtime_id,
+    X11WindowStateSnapshot, layer_runtime_id, popup_runtime_id,
 };
 
 /// Top-level decoration tree.
@@ -1312,6 +1311,21 @@ impl CompiledEffect {
                 | EffectInput::Shader(_)
                 | EffectInput::State(_)
         )
+    }
+
+    /// Whether each output pixel depends only on the backdrop around it, so
+    /// the effect can run once over a region and any rect inside it be
+    /// sampled from the result. Shader, noise and blend stages see the frame,
+    /// the content rect or other sources, which tie the output to where the
+    /// node is.
+    pub fn is_position_independent(&self) -> bool {
+        matches!(
+            self.input,
+            EffectInput::Backdrop | EffectInput::XrayBackdrop
+        ) && self
+            .pipeline
+            .iter()
+            .all(|stage| matches!(stage, EffectStage::DualKawaseBlur(_)))
     }
 
     pub fn uses_backdrop_input(&self) -> bool {

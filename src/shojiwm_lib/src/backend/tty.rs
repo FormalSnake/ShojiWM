@@ -813,12 +813,15 @@ fn backdrop_sample_state_map() -> &'static Mutex<HashMap<String, BackdropSampleF
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn previous_backdrop_sample_state(
-    key: &str,
-    current: BackdropSampleFrameState,
-) -> Option<BackdropSampleFrameState> {
-    let mut guard = backdrop_sample_state_map().lock().ok()?;
-    guard.insert(key.to_string(), current)
+fn record_backdrop_sample_rect(key: &str, rect: (f64, f64, f64, f64)) {
+    if let Ok(mut guard) = backdrop_sample_state_map().lock() {
+        guard.insert(
+            key.to_string(),
+            BackdropSampleFrameState {
+                sample_screen_rect: Some(rect),
+            },
+        );
+    }
 }
 
 fn latest_backdrop_sample_rect(key: &str) -> Option<(f64, f64, f64, f64)> {
@@ -4938,6 +4941,20 @@ fn capture_scene_texture_for_effect(
     scale: smithay::utils::Scale<f64>,
     scene: &[TtyRenderElements],
 ) -> Option<GlesTexture> {
+    capture_scene_for_effect(renderer, source, capture_geo, scale, scene, None)
+        .map(|snapshot| snapshot.texture)
+}
+
+/// Draws `scene` over `capture_geo` into `existing`'s texture when it has the
+/// capture's size, into a new one otherwise.
+fn capture_scene_for_effect(
+    renderer: &mut GlesRenderer,
+    source: &'static str,
+    capture_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    scene: &[TtyRenderElements],
+    existing: Option<crate::backend::snapshot::LiveWindowSnapshot>,
+) -> Option<crate::backend::snapshot::LiveWindowSnapshot> {
     if scene.is_empty() {
         return None;
     }
@@ -4960,7 +4977,7 @@ fn capture_scene_texture_for_effect(
             renderer.with_deferred_frame_flushes(|renderer| {
                 crate::backend::snapshot::capture_snapshot(
                     renderer,
-                    None,
+                    existing,
                     &mut tracker,
                     crate::ssd::LogicalRect::new(
                         capture_geo.loc.x,
@@ -4978,7 +4995,6 @@ fn capture_scene_texture_for_effect(
     )
     .ok()
     .flatten()
-    .map(|snapshot| snapshot.texture)
 }
 
 /// Outputs that render frames on the TTY backend, each ticking its own runtime clock
@@ -7861,11 +7877,9 @@ fn transform_snapshot_elements(
     Ok(elements
         .into_iter()
         .map(|element| {
-            TtyRenderElements::TransformedSnapshot(RelocateRenderElement::from_element(
-                RescaleRenderElement::from_element(element, visual.origin, visual.scale),
-                visual.translation,
-                Relocate::Relative,
-            ))
+            TtyRenderElements::TransformedSnapshot(
+                crate::backend::visual::transformed_snapshot_element(element, visual),
+            )
         })
         .collect())
 }
@@ -8086,35 +8100,6 @@ fn transform_backdrop_elements(
             transformed
         })
         .collect())
-}
-
-/// `(overall bounds, per-element bounds)` for a debug scene geometry dump.
-type DebugSceneGeometrySnapshot = (
-    Option<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
-    Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
-);
-
-fn debug_scene_geometry_snapshot(
-    elements: &[TtyRenderElements],
-    scale: Scale<f64>,
-) -> DebugSceneGeometrySnapshot {
-    let geometries = elements
-        .iter()
-        .map(|element| smithay::backend::renderer::element::Element::geometry(element, scale))
-        .collect::<Vec<_>>();
-
-    let union = geometries.iter().copied().reduce(|current, rect| {
-        let left = current.loc.x.min(rect.loc.x);
-        let top = current.loc.y.min(rect.loc.y);
-        let right = (current.loc.x + current.size.w).max(rect.loc.x + rect.size.w);
-        let bottom = (current.loc.y + current.size.h).max(rect.loc.y + rect.size.h);
-        smithay::utils::Rectangle::new(
-            smithay::utils::Point::from((left, top)),
-            ((right - left).max(0), (bottom - top).max(0)).into(),
-        )
-    });
-
-    (union, geometries.into_iter().take(8).collect())
 }
 
 fn log_gap_readback_probe(
@@ -9652,7 +9637,6 @@ fn backdrop_shader_elements_for_window(
         smithay::desktop::Window,
         crate::ssd::WindowDecorationState,
     >,
-    _window_commit_times: &std::collections::HashMap<smithay::desktop::Window, std::time::Duration>,
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
     upper_layer_source_damage: &[crate::state::OwnedDamageRect],
@@ -9666,9 +9650,11 @@ fn backdrop_shader_elements_for_window(
     force_visible: bool,
     window_index: usize,
     window: &smithay::desktop::Window,
+    // The transform the window is drawn with, which can differ from its
+    // decoration's (a hidden window shown by id is drawn untransformed).
+    visual_transform: crate::ssd::WindowTransform,
     alpha: f32,
     has_backdrop_source: bool,
-    apply_visual_transform: bool,
     prefer_framebuffer_backdrops: bool,
 ) -> Vec<(
     usize,
@@ -9709,723 +9695,342 @@ fn backdrop_shader_elements_for_window(
         .iter()
         .filter(|cached| {
             cached.shader.is_texture_backed()
-                && (!prefer_framebuffer_backdrops
-                    || !cached.shader.supports_framebuffer_backdrop())
+                && (!prefer_framebuffer_backdrops || !cached.shader.supports_framebuffer_backdrop())
         })
         .filter_map(|cached| {
-            let cache_key = format!(
-                "{}@{}@{}",
-                cached.stable_key,
-                output.name(),
-                if apply_visual_transform {
-                    "visual"
-                } else {
-                    "raw"
-                }
-            );
+            let cache_key = format!("{}@{}", cached.stable_key, output.name());
             let uses_backdrop = cached.shader.uses_backdrop_input();
             let uses_xray = cached.shader.uses_xray_backdrop_input();
             let render_as_backdrop = uses_backdrop || uses_xray;
             let root_rect = decoration.layout.root.rect;
+            let blur_padding = cached.shader.capture_padding.max(0);
+            let existing_cache = window_decorations
+                .get(window)
+                .and_then(|d| d.backdrop_cache.get(&cache_key))
+                .cloned();
+            let backdrop = crate::backend::visual::window_backdrop_geometry(
+                cached.rect,
+                cached.rect_precise,
+                root_rect,
+                decoration.root_subpixel_offset,
+                visual_transform,
+                blur_padding,
+                existing_cache
+                    .as_ref()
+                    .and_then(|existing| existing.region.as_ref())
+                    .map(|region| region.rect),
+                output_geo,
+                scale,
+            );
+            // A position independent effect runs over the whole capture and
+            // the element samples the node's rect from it, so the result
+            // holds while the node moves inside the capture. Any other effect
+            // is cropped to the node and reruns when the node moves.
+            let sample_by_uv = cached.shader.is_position_independent();
+            let capture_rect = crate::ssd::LogicalRect::new(
+                backdrop.capture.loc.x,
+                backdrop.capture.loc.y,
+                backdrop.capture.size.w,
+                backdrop.capture.size.h,
+            );
+            let watched_rect = if sample_by_uv {
+                capture_rect
+            } else {
+                backdrop.sampled
+            };
             let mut hasher = SignatureHasher::default();
             cached.stable_key.hash(&mut hasher);
-            let display_rect = if apply_visual_transform {
-                crate::backend::visual::transformed_rect(
-                    cached.rect,
-                    decoration.layout.root.rect,
-                    decoration.visual_transform,
-                )
-            } else {
-                cached.rect
-            };
-            let display_rect_precise = cached
-                .rect_precise
-                .map(|rect| {
-                    if apply_visual_transform {
-                        crate::backend::visual::transformed_precise_rect(
-                            rect,
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        )
-                    } else {
-                        rect
-                    }
-                })
-                .or_else(|| {
-                    Some(crate::backend::visual::precise_rect_from_logical(
-                        display_rect,
-                    ))
-                });
-            let (source_effect_rect, source_effect_rect_precise) =
-                crate::backend::visual::backdrop_sample_rects(
-                    cached.rect,
-                    cached.rect_precise,
-                    decoration.layout.root.rect,
-                    decoration.visual_transform,
-                );
             (
-                source_effect_rect.x,
-                source_effect_rect.y,
-                source_effect_rect.width,
-                source_effect_rect.height,
                 output_geo.loc.x,
                 output_geo.loc.y,
                 output_geo.size.w,
                 output_geo.size.h,
+                backdrop.capture.loc.x,
+                backdrop.capture.loc.y,
+                backdrop.capture.size.w,
+                backdrop.capture.size.h,
+                backdrop.capture_origin.x,
+                backdrop.capture_origin.y,
             )
                 .hash(&mut hasher);
-            let blur_padding = cached.shader.capture_padding.max(0);
+            if !sample_by_uv {
+                (
+                    backdrop.sampled.x,
+                    backdrop.sampled.y,
+                    backdrop.sampled.width,
+                    backdrop.sampled.height,
+                )
+                    .hash(&mut hasher);
+            }
             (blur_padding, cached.clip_radius).hash(&mut hasher);
             hash_debug(&mut hasher, &cached.shader);
-            let capture_geo = smithay::utils::Rectangle::new(
-                smithay::utils::Point::from((
-                    source_effect_rect.x - blur_padding,
-                    source_effect_rect.y - blur_padding,
-                )),
-                (
-                    source_effect_rect.width + blur_padding * 2,
-                    source_effect_rect.height + blur_padding * 2,
-                )
-                    .into(),
-            );
-            let actual_capture_geo = capture_geo.intersection(output_geo).unwrap_or(capture_geo);
-            let capture_origin_physical =
-                crate::backend::visual::logical_point_to_physical_point_global_edges(
-                    actual_capture_geo.loc,
-                    output_geo.loc,
-                    scale,
-                );
-            (
-                actual_capture_geo.loc.x,
-                actual_capture_geo.loc.y,
-                actual_capture_geo.size.w,
-                actual_capture_geo.size.h,
-                capture_origin_physical.x,
-                capture_origin_physical.y,
-            )
-                .hash(&mut hasher);
             if uses_backdrop || uses_xray {
                 hash_backdrop_items(
                     &mut hasher,
                     space,
                     window_decorations,
                     output,
-                    if uses_backdrop { &backdrop_items } else { xray_below },
-                    source_effect_rect,
+                    if uses_backdrop {
+                        &backdrop_items
+                    } else {
+                        xray_below
+                    },
+                    watched_rect,
                 );
             }
             let signature = hasher.finish();
-            let source_damage_entries = {
-                let mut entries = Vec::new();
-                if uses_backdrop || uses_xray {
-                    entries.extend(collect_backdrop_item_damage(
-                        window_decorations,
-                        if uses_backdrop { &backdrop_items } else { xray_below },
-                        window_source_damage,
-                        lower_layer_source_damage,
-                        upper_layer_source_damage,
-                    ));
-                }
-                entries
+            let source_damage_entries = if uses_backdrop || uses_xray {
+                collect_backdrop_item_damage(
+                    window_decorations,
+                    if uses_backdrop {
+                        &backdrop_items
+                    } else {
+                        xray_below
+                    },
+                    window_source_damage,
+                    lower_layer_source_damage,
+                    upper_layer_source_damage,
+                )
+            } else {
+                Vec::new()
             };
-            if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") && (uses_backdrop || uses_xray) && !source_damage_entries.is_empty() {
-                tracing::info!(
-                    stable_key = %cached.stable_key,
-                    source_effect_rect = ?source_effect_rect,
-                    uses_backdrop,
-                    uses_xray,
-                    source_damage_count = source_damage_entries.len(),
-                    owners = ?source_damage_entries.iter().map(|e| &e.owner).collect::<Vec<_>>(),
-                    rects = ?source_damage_entries.iter().map(|e| &e.rect).collect::<Vec<_>>(),
-                    "window-backdrop on-source-damage-box check [tty]"
-                );
-            }
             let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
                 &cached.shader,
                 smithay::utils::Rectangle::new(
-                    smithay::utils::Point::from((source_effect_rect.x, source_effect_rect.y)),
-                    (source_effect_rect.width, source_effect_rect.height).into(),
+                    smithay::utils::Point::from((watched_rect.x, watched_rect.y)),
+                    (watched_rect.width, watched_rect.height).into(),
                 ),
                 &source_damage_entries,
             );
-            if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") && (uses_backdrop || uses_xray) && !source_damage_entries.is_empty() {
+            if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") && !source_damage_entries.is_empty() {
                 tracing::info!(
                     stable_key = %cached.stable_key,
-                    source_damage_hit,
-                    "window-backdrop on-source-damage-box result [tty]"
-                );
-            }
-            let existing_cache = window_decorations
-                .get(window)
-                .and_then(|d| d.backdrop_cache.get(&cache_key))
-                .cloned();
-
-            if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
-                tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
-                    stable_key = %cached.stable_key,
-                    source_effect_rect = ?source_effect_rect,
-                    source_effect_rect_precise = ?source_effect_rect_precise,
-                    display_rect = ?display_rect,
-                    display_rect_precise = ?display_rect_precise,
-                    root_rect = ?root_rect,
-                    output_geo = ?output_geo,
-                    blur_padding,
-                    capture_geo = ?capture_geo,
-                    actual_capture_geo = ?actual_capture_geo,
-                    capture_origin_physical = ?capture_origin_physical,
-                    apply_visual_transform,
+                    watched_rect = ?watched_rect,
                     uses_backdrop,
                     uses_xray,
-                    has_existing_cache = existing_cache.is_some(),
-                    "backdrop debug: window shader rects"
+                    owners = ?source_damage_entries.iter().map(|e| &e.owner).collect::<Vec<_>>(),
+                    rects = ?source_damage_entries.iter().map(|e| &e.rect).collect::<Vec<_>>(),
+                    source_damage_hit,
+                    "window-backdrop on-source-damage-box check [tty]"
                 );
             }
-
-            if !matches!(
-                cached.shader.invalidate_policy(),
-                crate::ssd::EffectInvalidationPolicy::Always
-            ) && !source_damage_hit
-                && let Some(existing) = existing_cache
-                    .clone()
-                    .filter(|existing| existing.signature == signature)
-                {
-                    let local_rect = smithay::utils::Rectangle::new(
-                        smithay::utils::Point::from((
-                            display_rect.x - root_rect.x,
-                            display_rect.y - root_rect.y,
-                        )),
-                        (display_rect.width, display_rect.height).into(),
-                    );
-                    let clip_rect = {
-                        let precise_clip = display_rect_precise
-                            .zip(cached.clip_rect_precise.map(|clip| {
-                                if apply_visual_transform {
-                                    crate::backend::visual::transformed_precise_rect(
-                                        clip,
-                                        decoration.layout.root.rect,
-                                        decoration.visual_transform,
-                                    )
-                                } else {
-                                    clip
-                                }
-                            }))
-                            .map(|(rect, clip)| {
-                                crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
-                                    clip,
-                                    rect,
-                                    display_rect.width,
-                                    display_rect.height,
-                                    root_rect,
-                                    decoration.root_subpixel_offset,
-                                    output_geo,
-                                    scale,
-                                )
-                            });
-                        precise_clip.or_else(|| {
-                            cached.clip_rect.map(|clip_rect| {
-                                let clip = if apply_visual_transform {
-                                    crate::backend::visual::transformed_rect(
-                                        clip_rect,
-                                        decoration.layout.root.rect,
-                                        decoration.visual_transform,
-                                    )
-                                } else {
-                                    clip_rect
-                                };
-                                let rect = display_rect_precise.unwrap_or_else(|| {
-                                    crate::backend::visual::precise_rect_from_logical(display_rect)
-                                });
-                                crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
-                                    crate::backend::visual::precise_rect_from_logical(clip),
-                                    rect,
-                                    display_rect.width,
-                                    display_rect.height,
-                                    root_rect,
-                                    decoration.root_subpixel_offset,
-                                    output_geo,
-                                    scale,
-                                )
-                            })
-                        })
-                    };
-                    let local_sample_rect = smithay::utils::Rectangle::new(
-                        smithay::utils::Point::from((
-                            source_effect_rect.x - output_geo.loc.x,
-                            source_effect_rect.y - output_geo.loc.y,
-                        )),
-                        (source_effect_rect.width, source_effect_rect.height).into(),
-                    );
-                    let local_capture_rect = local_sample_rect;
-                    let sample_region =
-                        crate::backend::visual::precise_logical_rect_to_physical_buffer_rect(
-                            source_effect_rect_precise,
-                            actual_capture_geo.loc,
-                            scale,
-                        );
-                    let geometry = display_rect_precise
-                        .map(|rect| {
-                            crate::backend::visual::relative_physical_rect_from_root_precise(
-                                rect,
-                                root_rect,
-                                decoration.root_subpixel_offset,
-                                output_geo,
-                                scale,
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
-                                display_rect,
-                                root_rect,
-                                output_geo,
-                                scale,
-                            )
-                        });
-                    let element =
-                        crate::backend::shader_effect::backdrop_shader_element_with_geometry(
+            let reusable = existing_cache.filter(|existing| {
+                !matches!(
+                    cached.shader.invalidate_policy(),
+                    crate::ssd::EffectInvalidationPolicy::Always
+                ) && !source_damage_hit
+                    && existing.signature == signature
+            });
+            let from_cache = reusable.is_some();
+            let (texture, id, commit_counter) = match reusable {
+                Some(existing) => (existing.texture, existing.id, existing.commit_counter),
+                None => {
+                    let previous = window_decorations
+                        .get(window)
+                        .and_then(|d| d.backdrop_cache.get(&cache_key))
+                        .cloned();
+                    let previous_region = previous.as_ref().and_then(|p| p.region.clone());
+                    let backdrop_capture = if uses_backdrop {
+                        let scene = backdrop_items_capture_scene(
                             renderer,
-                            existing.id.clone(),
-                            existing.commit_counter,
-                            existing.texture,
-                            local_rect,
-                            geometry,
-                            local_sample_rect,
-                            local_capture_rect,
-                            &cached.shader,
-                            alpha,
-                            scale.x as f32,
-                            [0.0, 0.0],
-                            clip_rect,
-                            cached
-                                .clip_radius_precise
-                                .unwrap_or(cached.clip_radius as f32),
+                            space,
+                            window_decorations,
+                            output,
+                            backdrop.capture,
+                            backdrop.capture_origin,
+                            scale,
+                            &backdrop_items,
+                        );
+                        capture_scene_for_effect(
+                            renderer,
+                            "tty-window-backdrop",
+                            backdrop.capture,
+                            scale,
+                            &scene,
+                            previous_region.as_ref().and_then(|r| r.backdrop.clone()),
+                        )
+                    } else {
+                        None
+                    };
+                    let xray_capture = if uses_xray {
+                        let scene = backdrop_items_capture_scene(
+                            renderer,
+                            space,
+                            window_decorations,
+                            output,
+                            backdrop.capture,
+                            backdrop.capture_origin,
+                            scale,
+                            xray_below,
+                        );
+                        capture_scene_for_effect(
+                            renderer,
+                            "tty-window-xray",
+                            backdrop.capture,
+                            scale,
+                            &scene,
+                            previous_region.as_ref().and_then(|r| r.xray.clone()),
+                        )
+                    } else {
+                        None
+                    };
+                    let xray_texture = xray_capture.as_ref().map(|c| c.texture.clone());
+                    let input_texture = backdrop_capture
+                        .as_ref()
+                        .map(|c| c.texture.clone())
+                        .or_else(|| xray_texture.clone())
+                        .or_else(|| {
+                            crate::backend::shader_effect::solid_white_texture(renderer).ok()
+                        })?;
+                    let capture_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+                        backdrop.capture.size.w,
+                        backdrop.capture.size.h,
+                        scale,
+                    );
+                    if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
+                        crate::backend::shader_effect::log_gap_texture_region_readback(
+                            renderer,
+                            &input_texture,
+                            Some(backdrop.sample_region),
+                            (backdrop.geometry.size.w, backdrop.geometry.size.h),
+                            "shader-effect-input",
+                            &cached.stable_key,
+                            &output.name(),
+                            &cached.stable_key,
+                        );
+                    }
+                    let texture =
+                        crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+                            renderer,
                             format!(
-                                "window-backdrop:{}:{}",
-                                decoration.snapshot.id, cached.stable_key
+                                "tty:window-backdrop:{}:{}",
+                                decoration.snapshot.id, cache_key
                             ),
+                            input_texture,
+                            xray_texture,
+                            capture_size,
+                            (!sample_by_uv).then_some(backdrop.sample_region),
+                            (!sample_by_uv)
+                                .then_some((backdrop.geometry.size.w, backdrop.geometry.size.h)),
+                            &cached.shader,
+                            cached.node_shape.effect_frame(None, scale.x),
                         )
                         .ok()?;
-                    if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
-                        tracing::info!(
-                            window_id = %decoration.snapshot.id,
-                            title = %decoration.snapshot.title,
-                            app_id = ?decoration.snapshot.app_id,
-                            stable_key = %cached.stable_key,
-                            local_rect = ?local_rect,
-                            local_sample_rect = ?local_sample_rect,
-                            local_capture_rect = ?local_capture_rect,
-                            sample_region = ?sample_region,
-                            geometry = ?geometry,
-                            from_cache = true,
-                            "backdrop debug: window shader element"
+                    let (id, commit_counter) = match previous {
+                        Some(previous) => {
+                            let mut counter = previous.commit_counter;
+                            counter.increment();
+                            (previous.id, counter)
+                        }
+                        None => (
+                            smithay::backend::renderer::element::Id::new(),
+                            Default::default(),
+                        ),
+                    };
+                    if let Some(window_decoration) = window_decorations.get_mut(window) {
+                        window_decoration.backdrop_cache.insert(
+                            cache_key.clone(),
+                            crate::backend::shader_effect::CachedBackdropTexture {
+                                signature,
+                                texture: texture.clone(),
+                                id: id.clone(),
+                                commit_counter,
+                                sub_elements: std::collections::HashMap::new(),
+                                region: Some(
+                                    crate::backend::shader_effect::CapturedBackdropRegion {
+                                        rect: backdrop.capture,
+                                        backdrop: backdrop_capture,
+                                        xray: xray_capture,
+                                    },
+                                ),
+                            },
                         );
                     }
-                    if crate::env_flag!("SHOJI_GAP_DEBUG") {
-                        let geometry =
-                            smithay::backend::renderer::element::Element::geometry(&element, scale);
-                        let sample_region_screen = (
-                            capture_origin_physical.x as f64 + sample_region.loc.x,
-                            capture_origin_physical.y as f64 + sample_region.loc.y,
-                            sample_region.size.w,
-                            sample_region.size.h,
-                        );
-                        let backdrop_sample_key =
-                            format!("{}:{}:{}", output.name(), decoration.snapshot.id, cached.stable_key);
-                        let previous_backdrop_sample =
-                            previous_backdrop_sample_state(
-                                &backdrop_sample_key,
-                                BackdropSampleFrameState {
-                                    sample_screen_rect: Some(sample_region_screen),
-                                },
-                            );
-                        let sample_screen_delta = previous_backdrop_sample
-                            .and_then(|state| state.sample_screen_rect)
-                            .map(|previous| {
-                                (
-                                    sample_region_screen.0 - previous.0,
-                                    sample_region_screen.1 - previous.1,
-                                    sample_region_screen.2 - previous.2,
-                                    sample_region_screen.3 - previous.3,
-                                )
-                            });
-                        tracing::info!(
-                            stable_key = %cached.stable_key,
-                            rect = ?cached.rect,
-                            display_rect = ?display_rect,
-                            local_rect = ?local_rect,
-                            local_sample_rect = ?local_sample_rect,
-                            local_capture_rect = ?local_capture_rect,
-                            sample_region = ?sample_region,
-                            sample_region_screen = ?sample_region_screen,
-                            sample_screen_delta = ?sample_screen_delta,
-                            clip_rect = ?cached.clip_rect,
-                            geometry = ?geometry,
-                            "gap debug window backdrop element"
-                        );
-                    }
-                    return Some((cached.order, element, render_as_backdrop));
+                    (texture, id, commit_counter)
                 }
-            let mut backdrop_scene: Vec<TtyRenderElements> = Vec::new();
-            let backdrop_texture = if uses_backdrop {
-                backdrop_scene.extend(backdrop_items_capture_scene(
-                    renderer,
-                    space,
-                    window_decorations,
-                    output,
-                    actual_capture_geo,
-                    capture_origin_physical,
-                    scale,
-                    &backdrop_items,
-                ));
-                capture_scene_texture_for_effect(
-                    renderer,
-                    "tty-window-backdrop",
-                    actual_capture_geo,
-                    scale,
-                    &backdrop_scene,
-                )
-            } else {
-                None
             };
-            let mut xray_scene: Vec<TtyRenderElements> = Vec::new();
-            let xray_texture = if uses_xray {
-                xray_scene.extend(backdrop_items_capture_scene(
-                    renderer,
-                    space,
-                    window_decorations,
-                    output,
-                    actual_capture_geo,
-                    capture_origin_physical,
-                    scale,
-                    xray_below,
-                ));
-                capture_scene_texture_for_effect(
-                    renderer,
-                    "tty-window-xray",
-                    actual_capture_geo,
-                    scale,
-                    &xray_scene,
-                )
+            let src = if sample_by_uv {
+                backdrop.sample_region
             } else {
-                None
+                smithay::utils::Rectangle::from_size(texture.size().to_f64())
             };
-            let input_texture = backdrop_texture
-                .clone()
-                .or_else(|| xray_texture.clone())
-                .or_else(|| crate::backend::shader_effect::solid_white_texture(renderer).ok())?;
-            let geometry = display_rect_precise
-                .map(|rect| {
-                    crate::backend::visual::relative_physical_rect_from_root_precise(
-                        rect,
+            let local_rect = smithay::utils::Rectangle::new(
+                smithay::utils::Point::from((
+                    cached.rect.x - root_rect.x,
+                    cached.rect.y - root_rect.y,
+                )),
+                (cached.rect.width, cached.rect.height).into(),
+            );
+            let display_rect_precise = cached
+                .rect_precise
+                .unwrap_or_else(|| crate::backend::visual::precise_rect_from_logical(cached.rect));
+            let clip_rect = cached
+                .clip_rect_precise
+                .or_else(|| {
+                    cached
+                        .clip_rect
+                        .map(crate::backend::visual::precise_rect_from_logical)
+                })
+                .map(|clip| {
+                    crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
+                        clip,
+                        display_rect_precise,
+                        cached.rect.width,
+                        cached.rect.height,
                         root_rect,
                         decoration.root_subpixel_offset,
                         output_geo,
                         scale,
                     )
-                })
-                .unwrap_or_else(|| {
-                    crate::backend::visual::relative_physical_rect_from_root_global_origin_size(
-                        display_rect,
-                        root_rect,
-                        output_geo,
-                        scale,
-                    )
                 });
-            let root_origin_physical = crate::backend::visual::root_physical_origin_precise(
-                root_rect,
-                decoration.root_subpixel_offset,
-                output_geo,
-                scale,
+            let debug_label = format!(
+                "window-backdrop:{}:{}",
+                decoration.snapshot.id, cached.stable_key
             );
-            let final_backdrop_screen_rect = smithay::utils::Rectangle::new(
-                smithay::utils::Point::from((
-                    root_origin_physical.x + geometry.loc.x,
-                    root_origin_physical.y + geometry.loc.y,
-                )),
-                geometry.size,
-            );
-            // The pipeline samples where the window's visual transform draws
-            // the backdrop, which is where its capture was taken.
-            let sampled_screen_rect = if apply_visual_transform {
-                final_backdrop_screen_rect.to_f64()
-            } else {
-                crate::backend::visual::visually_transformed_physical_rect(
-                    final_backdrop_screen_rect,
-                    crate::backend::visual::window_visual_state(
-                        root_rect,
-                        decoration.visual_transform,
-                        output_geo,
-                        scale,
-                    ),
-                )
-            };
-            let sample_region = smithay::utils::Rectangle::new(
-                smithay::utils::Point::from((
-                    sampled_screen_rect.loc.x - capture_origin_physical.x as f64,
-                    sampled_screen_rect.loc.y - capture_origin_physical.y as f64,
-                )),
-                (sampled_screen_rect.size.w, sampled_screen_rect.size.h).into(),
-            );
-            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
-                crate::backend::shader_effect::log_gap_texture_region_readback(
-                    renderer,
-                    &input_texture,
-                    None,
-                    crate::backend::visual::logical_size_to_physical_buffer_size(
-                        actual_capture_geo.size.w,
-                        actual_capture_geo.size.h,
-                        scale,
-                    ),
-                    "shader-effect-capture-full",
-                    &cached.stable_key,
-                    &output.name(),
-                    &cached.stable_key,
-                );
-            }
-            if crate::env_flag!("SHOJI_GAP_DEBUG") {
-                let (backdrop_union, backdrop_first) =
-                    debug_scene_geometry_snapshot(&backdrop_scene, scale);
-                let (xray_union, xray_first) = debug_scene_geometry_snapshot(&xray_scene, scale);
-                tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    stable_key = %cached.stable_key,
-                    source_effect_rect = ?source_effect_rect,
-                    source_effect_rect_precise = ?source_effect_rect_precise,
-                    actual_capture_geo = ?actual_capture_geo,
-                    capture_origin_physical = ?capture_origin_physical,
-                    final_backdrop_screen_rect = ?final_backdrop_screen_rect,
-                    sample_region = ?sample_region,
-                    backdrop_union = ?backdrop_union,
-                    backdrop_first = ?backdrop_first,
-                    xray_union = ?xray_union,
-                    xray_first = ?xray_first,
-                    "gap debug tty backdrop capture scene"
-                );
-            }
-            let output_size = (
-                final_backdrop_screen_rect.size.w,
-                final_backdrop_screen_rect.size.h,
-            );
-            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
-                crate::backend::shader_effect::log_gap_texture_region_readback(
-                    renderer,
-                    &input_texture,
-                    Some(sample_region),
-                    output_size,
-                    "shader-effect-input",
-                    &cached.stable_key,
-                    &output.name(),
-                    &cached.stable_key,
-                );
-            }
-            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
+            let element = crate::backend::shader_effect::backdrop_shader_element_sampling(
                 renderer,
-                format!(
-                    "tty:window-backdrop:{}:{}",
-                    decoration.snapshot.id, cache_key
-                ),
-                input_texture,
-                xray_texture,
-                crate::backend::visual::logical_size_to_physical_buffer_size(
-                    actual_capture_geo.size.w,
-                    actual_capture_geo.size.h,
-                    scale,
-                ),
-                Some(sample_region),
-                Some(output_size),
-                &cached.shader,
-                cached.node_shape.effect_frame(None, scale.x),
-            )
-            .ok()?;
-            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
-                crate::backend::shader_effect::log_gap_texture_region_readback(
-                    renderer,
-                    &texture,
-                    None,
-                    output_size,
-                    "shader-effect-output",
-                    &cached.stable_key,
-                    &output.name(),
-                    &cached.stable_key,
-                );
-            }
-            let commit_counter = window_decorations
-                .get(window)
-                .and_then(|d| d.backdrop_cache.get(&cache_key))
-                .map(|existing| {
-                    let mut counter = existing.commit_counter;
-                    counter.increment();
-                    counter
-                })
-                .unwrap_or_default();
-            if let Some(window_decoration) = window_decorations.get_mut(window) {
-                window_decoration.backdrop_cache.insert(
-                    cache_key.clone(),
-                    crate::backend::shader_effect::CachedBackdropTexture {
-                        signature,
-                        texture: texture.clone(),
-                        id: smithay::backend::renderer::element::Id::new(),
-                        commit_counter,
-                        sub_elements: std::collections::HashMap::new(),
-                    },
-                );
-            }
-            let local_rect = smithay::utils::Rectangle::new(
-                smithay::utils::Point::from((
-                    display_rect.x - root_rect.x,
-                    display_rect.y - root_rect.y,
-                )),
-                (display_rect.width, display_rect.height).into(),
-            );
-            let clip_rect = {
-                let precise_clip = display_rect_precise
-                    .zip(cached.clip_rect_precise.map(|clip| {
-                        if apply_visual_transform {
-                            crate::backend::visual::transformed_precise_rect(
-                                clip,
-                                decoration.layout.root.rect,
-                                decoration.visual_transform,
-                            )
-                        } else {
-                            clip
-                        }
-                    }))
-                    .map(|(rect, clip)| {
-                        crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
-                            clip,
-                            rect,
-                            display_rect.width,
-                            display_rect.height,
-                            root_rect,
-                            decoration.root_subpixel_offset,
-                            output_geo,
-                            scale,
-                        )
-                    });
-                precise_clip.or_else(|| {
-                    cached.clip_rect.map(|clip_rect| {
-                        let clip = if apply_visual_transform {
-                            crate::backend::visual::transformed_rect(
-                                clip_rect,
-                                decoration.layout.root.rect,
-                                decoration.visual_transform,
-                            )
-                        } else {
-                            clip_rect
-                        };
-                        let rect = display_rect_precise.unwrap_or_else(|| {
-                            crate::backend::visual::precise_rect_from_logical(display_rect)
-                        });
-                        crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
-                            crate::backend::visual::precise_rect_from_logical(clip),
-                            rect,
-                            display_rect.width,
-                            display_rect.height,
-                            root_rect,
-                            decoration.root_subpixel_offset,
-                            output_geo,
-                            scale,
-                        )
-                    })
-                })
-            };
-            let local_sample_rect = smithay::utils::Rectangle::new(
-                smithay::utils::Point::from((
-                    source_effect_rect.x - output_geo.loc.x,
-                    source_effect_rect.y - output_geo.loc.y,
-                )),
-                (source_effect_rect.width, source_effect_rect.height).into(),
-            );
-            let local_capture_rect = local_sample_rect;
-            let element = crate::backend::shader_effect::backdrop_shader_element_with_geometry(
-                renderer,
-                window_decorations
-                    .get(window)
-                    .and_then(|d| d.backdrop_cache.get(&cache_key))
-                    .map(|cached| cached.id.clone())
-                    .unwrap_or_else(smithay::backend::renderer::element::Id::new),
-                window_decorations
-                    .get(window)
-                    .and_then(|d| d.backdrop_cache.get(&cache_key))
-                    .map(|cached| cached.commit_counter)
-                    .unwrap_or_default(),
+                id,
+                commit_counter,
                 texture,
                 local_rect,
-                geometry,
-                local_sample_rect,
-                local_capture_rect,
+                backdrop.geometry,
+                src,
+                [0.0, 0.0],
                 &cached.shader,
                 alpha,
                 scale.x as f32,
-                [0.0, 0.0],
                 clip_rect,
                 cached
                     .clip_radius_precise
                     .unwrap_or(cached.clip_radius as f32),
-                format!(
-                    "window-backdrop:{}:{}",
-                    decoration.snapshot.id, cached.stable_key
-                ),
+                debug_label.clone(),
             )
             .ok()?;
-            if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
-                tracing::info!(
-                    window_id = %decoration.snapshot.id,
-                    title = %decoration.snapshot.title,
-                    app_id = ?decoration.snapshot.app_id,
-                    stable_key = %cached.stable_key,
-                    local_rect = ?local_rect,
-                    local_sample_rect = ?local_sample_rect,
-                    local_capture_rect = ?local_capture_rect,
-                    sample_region = ?sample_region,
-                    final_backdrop_screen_rect = ?final_backdrop_screen_rect,
-                    geometry = ?geometry,
-                    from_cache = false,
-                    "backdrop debug: window shader element"
+            if crate::env_flag!("SHOJI_GAP_DEBUG") {
+                record_backdrop_sample_rect(
+                    &debug_label,
+                    (
+                        backdrop.capture_origin.x as f64 + backdrop.sample_region.loc.x,
+                        backdrop.capture_origin.y as f64 + backdrop.sample_region.loc.y,
+                        backdrop.sample_region.size.w,
+                        backdrop.sample_region.size.h,
+                    ),
                 );
             }
-            if crate::env_flag!("SHOJI_GAP_DEBUG") {
-                let geometry =
-                    smithay::backend::renderer::element::Element::geometry(&element, scale);
-                let sample_region_screen = (
-                    capture_origin_physical.x as f64 + sample_region.loc.x,
-                    capture_origin_physical.y as f64 + sample_region.loc.y,
-                    sample_region.size.w,
-                    sample_region.size.h,
-                );
-                let backdrop_sample_key =
-                    format!("{}:{}:{}", output.name(), decoration.snapshot.id, cached.stable_key);
-                let previous_backdrop_sample = previous_backdrop_sample_state(
-                    &backdrop_sample_key,
-                    BackdropSampleFrameState {
-                        sample_screen_rect: Some(sample_region_screen),
-                    },
-                );
-                let sample_screen_delta = previous_backdrop_sample
-                    .and_then(|state| state.sample_screen_rect)
-                    .map(|previous| {
-                        (
-                            sample_region_screen.0 - previous.0,
-                            sample_region_screen.1 - previous.1,
-                            sample_region_screen.2 - previous.2,
-                            sample_region_screen.3 - previous.3,
-                        )
-                    });
+            if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG")
+                || crate::env_flag!("SHOJI_GAP_DEBUG")
+            {
                 tracing::info!(
+                    window_id = %decoration.snapshot.id,
                     stable_key = %cached.stable_key,
                     rect = ?cached.rect,
-                    display_rect = ?display_rect,
+                    backdrop = ?backdrop,
+                    sample_by_uv,
+                    src = ?src,
                     local_rect = ?local_rect,
-                    local_sample_rect = ?local_sample_rect,
-                    local_capture_rect = ?local_capture_rect,
-                    sample_region = ?sample_region,
-                    sample_region_screen = ?sample_region_screen,
-                    sample_screen_delta = ?sample_screen_delta,
-                    clip_rect = ?cached.clip_rect,
-                    geometry = ?geometry,
-                    "gap debug window backdrop element"
+                    clip_rect = ?clip_rect,
+                    from_cache,
+                    "backdrop debug: window shader element"
                 );
             }
             Some((cached.order, element, render_as_backdrop))
@@ -11289,6 +10894,7 @@ fn configured_background_effect_elements_for_layer(
                 })
                 .unwrap_or_default(),
             sub_elements,
+            region: None,
         },
     );
     for rect in rects {
@@ -11753,6 +11359,7 @@ fn lower_layer_scene_elements(
                         })
                         .unwrap_or_default(),
                     sub_elements,
+                    region: None,
                 },
             );
             for rect in rects {
@@ -12501,6 +12108,7 @@ fn configured_background_effect_elements_for_window(
                         id: smithay::backend::renderer::element::Id::new(),
                         commit_counter,
                         sub_elements: std::collections::HashMap::new(),
+                        region: None,
                     },
                 );
             }
@@ -15546,9 +15154,15 @@ fn tty_window_stack_elements(
             // (a minimize animation's end pose); a plan that picks a hidden window by
             // id (another workspace, a minimized window) shows it as it would look
             // shown, untransformed at its rect.
-            let visual_state = match window_decorations.get(window).filter(|decoration| {
+            let shown_hidden = |decoration: &&crate::ssd::WindowDecorationState| {
                 force_visible && decoration.managed_window_hidden_on_output(output.name().as_str())
-            }) {
+            };
+            let drawn_transform = window_decorations
+                .get(window)
+                .filter(|decoration| !shown_hidden(decoration))
+                .map(|decoration| decoration.visual_transform)
+                .unwrap_or_default();
+            let visual_state = match window_decorations.get(window).filter(shown_hidden) {
                 Some(decoration) => window_visual_state(
                     decoration.layout.root.rect,
                     crate::ssd::WindowTransform::default(),
@@ -15770,7 +15384,6 @@ fn tty_window_stack_elements(
                     &mut *renderer,
                     space,
                     window_decorations,
-                    state.window_commit_times,
                     state.window_source_damage,
                     state.lower_layer_source_damage,
                     state.upper_layer_source_damage,
@@ -15782,13 +15395,13 @@ fn tty_window_stack_elements(
                     force_visible,
                     _window_index,
                     window,
+                    drawn_transform,
                     if use_full_window_snapshot {
                         1.0
                     } else {
                         visual_state.opacity
                     },
                     decoration_ready,
-                    false,
                     !use_full_window_snapshot,
                 );
                 if let Some(effect_config) = state.configured_background_effect.as_ref()
@@ -17188,7 +16801,6 @@ fn tty_window_stack_elements(
                     &mut *renderer,
                     space,
                     window_decorations,
-                    state.window_commit_times,
                     state.window_source_damage,
                     state.lower_layer_source_damage,
                     state.upper_layer_source_damage,
@@ -17200,9 +16812,9 @@ fn tty_window_stack_elements(
                     force_visible,
                     _window_index,
                     window,
+                    drawn_transform,
                     source_alpha,
                     decoration_ready,
-                    false,
                     false,
                 );
                 if let Some(effect_config) = state.configured_background_effect.as_ref() {
