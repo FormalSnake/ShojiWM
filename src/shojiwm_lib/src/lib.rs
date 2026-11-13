@@ -71,6 +71,7 @@ pub mod virtual_keyboard;
 pub mod window_decoration;
 pub mod wlr_foreign_toplevel;
 pub mod workspace_manager;
+pub mod xdg_dialog;
 pub mod xdg_toplevel_tag;
 pub mod xwayland_satellite;
 

@@ -1817,6 +1817,7 @@ impl ShojiWM {
         let plasma_virtual_desktop_state =
             crate::plasma_virtual_desktop::PlasmaVirtualDesktopState::new(&dh);
         crate::xdg_toplevel_tag::init_xdg_toplevel_tag(&dh);
+        crate::xdg_dialog::init_xdg_dialog(&dh);
         smithay::wayland::content_type::ContentTypeState::new::<Self>(&dh);
         let plasma_shell_state = crate::protocols::plasma_shell::PlasmaShellState::new(&dh);
         let ext_workspace_manager_state =
@@ -3438,6 +3439,7 @@ impl ShojiWM {
             size_constraints: Default::default(),
             is_resizable: true,
             is_transient: false,
+            suggests_float: false,
             parent_id: None,
             icon: None,
             interaction: DecorationInteractionSnapshot::default(),

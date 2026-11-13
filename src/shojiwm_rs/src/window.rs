@@ -34,6 +34,7 @@ pub(crate) struct WindowSignals {
     pub size_constraints: Signal<WindowSizeConstraintsSnapshot>,
     pub is_resizable: Signal<bool>,
     pub is_transient: Signal<bool>,
+    pub suggests_float: Signal<bool>,
     pub parent_id: Signal<Option<String>>,
     pub plasma: Signal<Option<PlasmaSurfaceSnapshot>>,
     pub minimized_geometry: Signal<Option<Rect>>,
@@ -61,6 +62,7 @@ impl WindowSignals {
             size_constraints: scope.signal(snapshot.size_constraints),
             is_resizable: scope.signal(snapshot.is_resizable),
             is_transient: scope.signal(snapshot.is_transient),
+            suggests_float: scope.signal(snapshot.suggests_float),
             parent_id: scope.signal(snapshot.parent_id.clone()),
             plasma: scope.signal(snapshot.plasma.clone()),
             minimized_geometry: scope.signal(snapshot.minimized_geometry.map(Into::into)),
@@ -88,6 +90,7 @@ impl WindowSignals {
         self.size_constraints.set(snapshot.size_constraints);
         self.is_resizable.set(snapshot.is_resizable);
         self.is_transient.set(snapshot.is_transient);
+        self.suggests_float.set(snapshot.suggests_float);
         self.parent_id.set(snapshot.parent_id.clone());
         self.plasma.set(snapshot.plasma.clone());
         self.minimized_geometry
@@ -146,6 +149,10 @@ window_signals! {
     size_constraints: WindowSizeConstraintsSnapshot,
     is_resizable: bool,
     is_transient: bool,
+    /// What the client says makes it a float under Hyprland's rules: a
+    /// parent, a fixed size, a modal hint, or an X11 dialog, utility, splash,
+    /// toolbar or menu type. Final from the first buffer commit on.
+    suggests_float: bool,
     parent_id: Option<String>,
     /// What plasmashell asked for this window (KDE `org_kde_plasma_surface`:
     /// role, position); `None` for every other window.
@@ -393,6 +400,7 @@ fn empty_snapshot() -> WaylandWindowSnapshot {
         size_constraints: Default::default(),
         is_resizable: false,
         is_transient: false,
+        suggests_float: false,
         parent_id: None,
         icon: None,
         interaction: Default::default(),
