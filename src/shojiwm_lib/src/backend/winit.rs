@@ -7,7 +7,7 @@ use smithay::{
     backend::{
         egl::EGLDevice,
         renderer::{
-            ImportDma, ImportMemWl, Texture,
+            Frame, ImportDma, ImportMemWl, Renderer, Texture,
             damage::OutputDamageTracker,
             element::Element,
             element::solid::SolidColorRenderElement,
@@ -1434,6 +1434,24 @@ pub fn init_winit(
                             state.pre_repaint(&output, frame_target);
 
                             let render_started_at = Instant::now();
+                            // On NVIDIA's EGL Wayland platform, draws issued after the
+                            // context switches from surfaceless (where the offscreen scene
+                            // work leaves it) to the window surface are often lost until
+                            // the next such switch. render_output's clear and wallpaper then
+                            // never land, framebuffer backdrops capture last frame's
+                            // composite and the blur converges on the window's own colour.
+                            // Switch once and release, so render_output's switch is the
+                            // second.
+                            if let Err(err) = renderer
+                                .with_deferred_frame_flushes(|renderer| {
+                                    renderer
+                                        .render(&mut framebuffer, size, Transform::Normal)?
+                                        .finish()
+                                })
+                                .and_then(|_| renderer.with_context(|_| ()))
+                            {
+                                warn!(?err, "failed to settle the window surface before rendering");
+                            }
                             let render_output_result = {
                                 timescope::scope!("winit render_output");
                                 damage_tracker.render_output(
