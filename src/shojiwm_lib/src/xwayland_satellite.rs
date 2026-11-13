@@ -1,8 +1,9 @@
 use smithay::reexports::calloop::channel::Sender;
 use smithay::reexports::rustix::{
     self,
-    fs::{OFlags, lstat, mkdir, open, unlink},
+    fs::{FileType, FlockOperation, Mode, OFlags, flock, fstat, lstat, mkdir, open, unlink},
     io::{Errno, FdFlags, fcntl_setfd},
+    net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType},
     process::{Pid, getpid, getuid, test_kill_process},
 };
 use std::{
@@ -427,12 +428,15 @@ type ReservedX11Display = (
 );
 
 fn reserve_x11_display(start: u32) -> Result<ReservedX11Display, Box<dyn std::error::Error>> {
+    // Held for the whole scan, so a stale lock is judged and replaced by one
+    // of this user's compositors at a time.
+    let reclaim_turn = take_reclaim_turn();
     for display_number in start..start + 50 {
         let lock_path = PathBuf::from(format!("/tmp/.X{display_number}-lock"));
         let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL;
         let lock_fd = match open(&lock_path, flags, 0o444.into()) {
             Ok(lock_fd) => lock_fd,
-            Err(_) if reclaim_stale_lock(&lock_path) => {
+            Err(_) if reclaim_turn.is_some() && reclaim_stale_lock(&lock_path) => {
                 let Ok(lock_fd) = open(&lock_path, flags, 0o444.into()) else {
                     continue;
                 };
@@ -470,14 +474,31 @@ fn reserve_x11_display(start: u32) -> Result<ReservedX11Display, Box<dyn std::er
     Err(io::Error::other("no free X11 display found").into())
 }
 
+/// This user's compositors take turns at stale locks: one that read a dead
+/// pid could otherwise unlink the lock another made a moment later, and the
+/// loser's guard could remove the winner's. Without the turn, because the
+/// path is not ours or flock fails, stale locks are left alone.
+fn take_reclaim_turn() -> Option<OwnedFd> {
+    let uid = getuid();
+    let path = format!("/tmp/.shojiwm-x11-reclaim-{}", uid.as_raw());
+    let flags =
+        OFlags::RDONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = open(&path, flags, Mode::RUSR | Mode::WUSR).ok()?;
+    let stat = fstat(&fd).ok()?;
+    if stat.st_uid != uid.as_raw() || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+    {
+        return None;
+    }
+    flock(&fd, FlockOperation::LockExclusive).ok()?;
+    Some(fd)
+}
+
 /// Removes a display lock left by a server that is gone: its pid, as the X
-/// lock format writes it, names no process. A lock that cannot be read, or
-/// another user's in sticky /tmp, stays. Xorg and wlroots do the same.
+/// lock format writes it, names no process. Only this user's regular files
+/// are read, another user's cannot be unlinked from sticky /tmp anyway.
+/// Xorg and wlroots do the same.
 fn reclaim_stale_lock(lock_path: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(lock_path) else {
-        return false;
-    };
-    let Some(pid) = contents.trim().parse().ok().and_then(Pid::from_raw) else {
+    let Some(pid) = lock_pid(lock_path) else {
         return false;
     };
     if test_kill_process(pid) != Err(Errno::SRCH) {
@@ -490,6 +511,23 @@ fn reclaim_stale_lock(lock_path: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The pid in a lock of this user's, opened without following a link or
+/// waiting on a FIFO, and read no further than the 11 bytes of `%10d\n`.
+fn lock_pid(lock_path: &Path) -> Option<Pid> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = open(lock_path, flags, Mode::empty()).ok()?;
+    let stat = fstat(&fd).ok()?;
+    if stat.st_uid != getuid().as_raw()
+        || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+    {
+        return None;
+    }
+    let mut record = [0; 11];
+    let read = rustix::io::read(&fd, &mut record).ok()?;
+    let text = std::str::from_utf8(&record[..read]).ok()?;
+    text.trim().parse().ok().and_then(Pid::from_raw)
 }
 
 fn x11_socket_is_in_use(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -530,19 +568,39 @@ fn bind_to_unix_socket(
     let addr = SocketAddr::from_pathname(&path)?;
     let listener = match UnixListener::bind_addr(&addr) {
         Ok(listener) => listener,
-        // A socket file nothing accepts on is a dead server's; one that
-        // answers belongs to a live one and stays.
-        Err(error)
-            if error.kind() == io::ErrorKind::AddrInUse
-                && UnixStream::connect(&path)
-                    .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionRefused) =>
-        {
-            unlink(&path)?;
+        // A socket file of ours nothing listens on is a dead server's and
+        // goes. Anything else there, or one that will not go, keeps the
+        // display taken and the caller moves on.
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            if !is_our_dead_socket(&path) || unlink(&path).is_err() {
+                return Err(error.into());
+            }
             bind_to_socket(&addr)?
         }
         Err(error) => return Err(error.into()),
     };
     Ok((listener, UnlinkGuard(path)))
+}
+
+/// A socket this user owns that refuses a connection. The probe never
+/// waits: a listener whose backlog is full answers EAGAIN and counts as
+/// alive, only a refusal says nobody listens.
+fn is_our_dead_socket(path: &Path) -> bool {
+    let Ok(stat) = lstat(path) else {
+        return false;
+    };
+    if stat.st_uid != getuid().as_raw() || FileType::from_raw_mode(stat.st_mode) != FileType::Socket
+    {
+        return false;
+    }
+    let flags = SocketFlags::NONBLOCK | SocketFlags::CLOEXEC;
+    let (Ok(probe), Ok(address)) = (
+        rustix::net::socket_with(AddressFamily::UNIX, SocketType::STREAM, flags, None),
+        SocketAddrUnix::new(path),
+    ) else {
+        return false;
+    };
+    rustix::net::connect(&probe, &address) == Err(Errno::CONNREFUSED)
 }
 
 fn open_display_sockets(
@@ -695,7 +753,7 @@ mod mode_tests {
 mod tests {
     use super::{
         X11_TMP_UNIX_DIR, bind_to_abstract_socket, bind_to_unix_socket, ensure_x11_unix_dir,
-        reserve_x11_display,
+        reserve_x11_display, rustix,
     };
     use std::{
         fs,
@@ -705,17 +763,36 @@ mod tests {
 
     static NEXT_TEST_DISPLAY: AtomicU32 = AtomicU32::new(0);
 
+    /// The display `reserve_x11_display(start)` gives within five seconds,
+    /// kept until the reservation is dropped by the caller's scope.
+    fn reserve_in_time(start: u32) -> Option<Result<super::ReservedX11Display, String>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(reserve_x11_display(start).map_err(|error| error.to_string()));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok()
+    }
+
+    fn dead_pid() -> u32 {
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = gone.id();
+        gone.wait().expect("reap");
+        pid
+    }
+
     struct TestDisplayPaths {
-        display_numbers: [u32; 2],
+        display_numbers: [u32; 4],
     }
 
     impl TestDisplayPaths {
         fn new() -> Self {
             let display_number = 100_000
                 + (std::process::id() % 10_000) * 100
-                + NEXT_TEST_DISPLAY.fetch_add(2, Ordering::Relaxed);
+                + NEXT_TEST_DISPLAY.fetch_add(4, Ordering::Relaxed);
             let paths = Self {
-                display_numbers: [display_number, display_number + 1],
+                display_numbers: std::array::from_fn(|n| display_number + n as u32),
             };
             paths.remove();
             paths
@@ -728,7 +805,9 @@ mod tests {
         fn remove(&self) {
             for display_number in self.display_numbers {
                 let _ = fs::remove_file(format!("/tmp/.X{display_number}-lock"));
-                let _ = fs::remove_file(format!("{X11_TMP_UNIX_DIR}/X{display_number}"));
+                let socket = format!("{X11_TMP_UNIX_DIR}/X{display_number}");
+                let _ = fs::remove_file(&socket);
+                let _ = fs::remove_dir(&socket);
             }
         }
     }
@@ -743,9 +822,7 @@ mod tests {
     fn reclaims_the_lock_and_socket_of_a_server_that_is_gone() {
         ensure_x11_unix_dir().expect("prepare X11 socket directory");
         let paths = TestDisplayPaths::new();
-        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
-        let pid = gone.id();
-        gone.wait().expect("reap");
+        let pid = dead_pid();
         let lock = format!("/tmp/.X{}-lock", paths.start());
         fs::write(&lock, format!("{pid:>10}\n")).expect("write a stale lock");
         // Its pathname socket outlives it too: bound, never unlinked.
@@ -772,6 +849,110 @@ mod tests {
 
         assert_eq!(reservation.0, paths.start() + 1);
         assert_eq!(fs::read_to_string(&lock).unwrap(), alive);
+        drop(reservation);
+    }
+
+    #[test]
+    fn contenders_for_one_stale_lock_leave_the_winner_its_lock() {
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        for _ in 0..50 {
+            let paths = TestDisplayPaths::new();
+            let lock = format!("/tmp/.X{}-lock", paths.start());
+            fs::write(&lock, format!("{:>10}\n", dead_pid())).expect("write a stale lock");
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let contenders: Vec<_> = (0..4)
+                .map(|_| {
+                    let gate = gate.clone();
+                    let start = paths.start();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        reserve_x11_display(start).map_err(|error| error.to_string())
+                    })
+                })
+                .collect();
+            let reservations: Vec<_> = contenders
+                .into_iter()
+                .map(|contender| contender.join().unwrap().expect("reserve display"))
+                .collect();
+            let winners = reservations.iter().filter(|r| r.0 == paths.start()).count();
+            assert_eq!(winners, 1);
+            let owner = fs::read_to_string(&lock).expect("the winner keeps its lock");
+            assert_eq!(owner.trim().parse::<u32>().unwrap(), std::process::id());
+            drop(reservations);
+        }
+    }
+
+    #[test]
+    fn a_lock_that_is_a_fifo_or_a_link_is_passed_over_without_waiting() {
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        let fifo = format!("/tmp/.X{}-lock", paths.start());
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("make a FIFO lock");
+        let link = format!("/tmp/.X{}-lock", paths.start() + 1);
+        std::os::unix::fs::symlink(&fifo, &link).expect("link a lock to it");
+
+        let reservation = reserve_in_time(paths.start()).expect("not held up by the FIFO");
+
+        let reservation = reservation.expect("reserve the display after them");
+        assert_eq!(reservation.0, paths.start() + 2);
+        assert!(fs::symlink_metadata(&fifo).is_ok() && fs::symlink_metadata(&link).is_ok());
+        drop(reservation);
+    }
+
+    #[test]
+    fn a_listener_with_a_full_backlog_keeps_its_display_without_holding_us_up() {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        let socket = PathBuf::from(format!("{X11_TMP_UNIX_DIR}/X{}", paths.start()));
+        let address = SocketAddrUnix::new(&socket).unwrap();
+        let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        rustix::net::bind(&listener, &address).expect("bind a pathname socket");
+        rustix::net::listen(&listener, 0).unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            let client = rustix::net::socket_with(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::NONBLOCK,
+                None,
+            )
+            .unwrap();
+            if rustix::net::connect(&client, &address).is_err() {
+                break;
+            }
+            queued.push(client);
+        }
+
+        let reservation = reserve_in_time(paths.start()).expect("not held up by the backlog");
+
+        let reservation = reservation.expect("reserve the next display");
+        assert_eq!(reservation.0, paths.start() + 1);
+        assert!(socket.exists());
+        drop(reservation);
+        drop(queued);
+    }
+
+    #[test]
+    fn a_socket_path_that_will_not_go_passes_over_its_display() {
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        // Refuses a connection and cannot be unlinked, as another user's
+        // stale socket in sticky /tmp/.X11-unix cannot.
+        let socket = PathBuf::from(format!("{X11_TMP_UNIX_DIR}/X{}", paths.start()));
+        fs::create_dir(&socket).expect("put something there that is not ours to remove");
+
+        let reservation = reserve_x11_display(paths.start()).expect("reserve the next display");
+
+        assert_eq!(reservation.0, paths.start() + 1);
+        assert!(socket.is_dir());
         drop(reservation);
     }
 
