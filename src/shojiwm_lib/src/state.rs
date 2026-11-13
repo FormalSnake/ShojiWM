@@ -122,7 +122,7 @@ use crate::ssd::{
     WindowPositionSnapshot,
 };
 use crate::xwayland_satellite::{
-    EmbeddedSatellite, SatelliteEvent, SatelliteInstance, SatelliteMode,
+    EmbeddedSatellite, FloatHints, SatelliteEvent, SatelliteInstance, SatelliteMode,
     reserve_embedded_satellite, satellite_mode, spawn_external_satellite,
 };
 use crate::{
@@ -1817,7 +1817,7 @@ impl ShojiWM {
         let plasma_virtual_desktop_state =
             crate::plasma_virtual_desktop::PlasmaVirtualDesktopState::new(&dh);
         crate::xdg_toplevel_tag::init_xdg_toplevel_tag(&dh);
-        crate::xdg_dialog::init_xdg_dialog(&dh);
+        crate::protocols::xdg_dialog::XdgDialogState::new::<Self>(&dh);
         smithay::wayland::content_type::ContentTypeState::new::<Self>(&dh);
         let plasma_shell_state = crate::protocols::plasma_shell::PlasmaShellState::new(&dh);
         let ext_workspace_manager_state =
@@ -2497,7 +2497,7 @@ impl ShojiWM {
             return;
         };
         match embedded.start() {
-            Ok(stream) => self.insert_embedded_satellite_client(stream),
+            Ok((stream, float_hints)) => self.insert_embedded_satellite_client(stream, float_hints),
             Err(error) => {
                 warn!(?error, "failed to start embedded xwayland-satellite thread");
                 self.schedule_satellite_restart();
@@ -2508,7 +2508,7 @@ impl ShojiWM {
     /// Insert the compositor's end of the embedded satellite's connection as a
     /// client. Peer credentials would name ShojiWM itself here, so the client
     /// is marked as the Xwayland bridge directly.
-    fn insert_embedded_satellite_client(&mut self, stream: UnixStream) {
+    fn insert_embedded_satellite_client(&mut self, stream: UnixStream, float_hints: FloatHints) {
         self.update_xwayland_refresh_override_from_pointer_or_first("xwayland-bridge-connect");
         let identity = WaylandClientIdentity::embedded_satellite(&stream);
         if let Err(error) = self.display_handle.insert_client(
@@ -2517,6 +2517,7 @@ impl ShojiWM {
                 compositor_state: CompositorClientState::default(),
                 xwayland_refresh_override: true,
                 identity,
+                float_hints: Some(float_hints),
             }),
         ) {
             warn!(
@@ -2757,6 +2758,7 @@ impl ShojiWM {
                         compositor_state: CompositorClientState::default(),
                         xwayland_refresh_override: client_is_xwayland_bridge,
                         identity: client_identity,
+                        float_hints: None,
                     }),
                 ) {
                     warn!(
@@ -6111,6 +6113,24 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
     pub xwayland_refresh_override: bool,
     identity: WaylandClientIdentity,
+    /// The embedded satellite's hints for the X11 windows it carries.
+    float_hints: Option<FloatHints>,
+}
+
+/// Whether the embedded satellite says the X11 window behind `toplevel`
+/// suggests floating.
+pub(crate) fn satellite_suggests_float(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+) -> bool {
+    use smithay::reexports::wayland_server::Resource;
+    toplevel
+        .xdg_toplevel()
+        .client()
+        .and_then(|client| {
+            let hints = client.get_data::<ClientState>()?.float_hints.as_ref()?;
+            Some(hints.suggests_float(toplevel.xdg_toplevel().id().protocol_id()))
+        })
+        .unwrap_or(false)
 }
 
 /// The pid of the process behind a Wayland client, from its socket

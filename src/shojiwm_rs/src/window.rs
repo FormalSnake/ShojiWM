@@ -150,8 +150,10 @@ window_signals! {
     is_resizable: bool,
     is_transient: bool,
     /// What the client says makes it a float under Hyprland's rules: a
-    /// parent, a fixed size, a modal hint, or an X11 dialog, utility, splash,
-    /// toolbar or menu type. Final from the first buffer commit on.
+    /// parent or a fixed size, and for an X11 window also a dialog, utility,
+    /// splash, toolbar or menu type, a modal state or a dialog role. It
+    /// follows the client's current hints; a config that decides once, at
+    /// the first buffer, reads it then.
     suggests_float: bool,
     parent_id: Option<String>,
     /// What plasmashell asked for this window (KDE `org_kde_plasma_surface`:

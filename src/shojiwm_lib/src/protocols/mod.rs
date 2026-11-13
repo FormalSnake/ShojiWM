@@ -18,6 +18,7 @@ pub mod tearing_control;
 pub mod text_input;
 pub mod virtual_keyboard;
 pub mod virtual_pointer;
+pub mod xdg_dialog;
 
 /// Hands a request an object data filter let through to smithay's object
 /// data, `inner`. Smithay reads its user data back from the backend while it

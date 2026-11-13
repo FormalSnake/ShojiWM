@@ -11,7 +11,7 @@ use smithay::{
             Anchor as WlrAnchor, ExclusiveZone as WlrExclusiveZone,
             KeyboardInteractivity as WlrKeyboardInteractivity, Layer as WlrLayer,
         },
-        shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData, dialog::ToplevelDialogHint},
+        shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData},
     },
     xwayland::xwm::WmWindowType,
 };
@@ -37,9 +37,10 @@ pub struct WaylandWindowSnapshot {
     pub size_constraints: WindowSizeConstraintsSnapshot,
     pub is_resizable: bool,
     pub is_transient: bool,
-    /// Hyprland's `suggestsFloat`: a parent, a fixed size, a modal hint
-    /// (xdg-dialog-v1, `_NET_WM_STATE_MODAL`) or an X11 window type that
-    /// floats (dialog, utility, splash, toolbar, menus, dock).
+    /// Hyprland's `suggestsFloat`: a parent or a fixed size, and for an X11
+    /// window also a float window type, `_NET_WM_STATE_MODAL`,
+    /// `WM_TRANSIENT_FOR` or a dialog `WM_WINDOW_ROLE`. See
+    /// `xdg_suggests_float` and `x11_suggests_float`.
     pub suggests_float: bool,
     pub parent_id: Option<String>,
     pub icon: Option<WindowIconSnapshot>,
@@ -928,14 +929,8 @@ impl ShojiWM {
             .as_ref()
             .and_then(|surface| self.runtime_id_for_toplevel_surface(surface));
         let is_transient = parent_surface.is_some();
-        let modal = with_states(toplevel.wl_surface(), |states| {
-            states
-                .data_map
-                .get::<XdgToplevelSurfaceData>()
-                .and_then(|role| role.lock().ok().map(|role| role.dialog_hint))
-                == Some(ToplevelDialogHint::Modal)
-        });
-        let suggests_float = is_transient || !is_resizable || modal;
+        let suggests_float = xdg_suggests_float(is_transient, min_size, max_size)
+            || crate::state::satellite_suggests_float(&toplevel);
 
         // Active window, not raw keyboard focus: a layer-shell panel that
         // borrowed the keyboard must not make every window report itself as
@@ -1357,8 +1352,29 @@ fn size_constraint_snapshot(
     })
 }
 
-/// Hyprland's X11 `suggestsFloat`: a float window type, a parent or modal
-/// hint (`transient`), or both axes fixed, where an xdg toplevel needs one.
+/// Hyprland's `suggestsFloat` for an xdg toplevel (`WaylandBackend.cpp`
+/// `traitsFrom`): a parent, or both minimums set and one axis fixed. The
+/// xdg-dialog-v1 modal hint is not part of it: the protocol gives it no
+/// effect without a parent, and a parent already floats the window. An X11
+/// window carried by the embedded xwayland-satellite arrives as an xdg
+/// toplevel; its X11 traits come from satellite (`FloatHints`).
+fn xdg_suggests_float(
+    has_parent: bool,
+    min_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> bool {
+    let fixed = min_size.w != 0
+        && min_size.h != 0
+        && (min_size.w == max_size.w || min_size.h == max_size.h);
+    has_parent || fixed
+}
+
+/// Hyprland's X11 `suggestsFloat` (`X11Backend.cpp` `traitsFrom`) for a
+/// window on ShojiWM's own X11 window manager: a float window type, a parent
+/// or modal hint (`transient`), or both axes fixed. smithay's `X11Surface`
+/// exposes neither `WM_WINDOW_ROLE` nor `_KDE_NET_WM_WINDOW_TYPE_OVERRIDE`,
+/// so those two of Hyprland's predicates are missing here; the default
+/// xwayland-satellite path has them.
 fn x11_suggests_float(
     window_type: Option<WmWindowType>,
     transient: bool,
@@ -1486,8 +1502,19 @@ fn anchor_to_edge_snapshot(anchor: WlrAnchor) -> Option<LayerEdgeSnapshot> {
 mod tests {
     use super::{
         PointerHitTargetSnapshot, WaylandWindowAction, WaylandWindowSnapshot, WmWindowType,
-        x11_suggests_float,
+        x11_suggests_float, xdg_suggests_float,
     };
+
+    #[test]
+    fn an_xdg_window_floats_by_hyprlands_traits() {
+        let size = |w, h| (w, h).into();
+        assert!(xdg_suggests_float(true, size(0, 0), size(0, 0)));
+        assert!(xdg_suggests_float(false, size(560, 249), size(560, 249)));
+        assert!(xdg_suggests_float(false, size(400, 300), size(400, 0)));
+        assert!(!xdg_suggests_float(false, size(400, 300), size(0, 0)));
+        // A fixed width with no minimum height is not a fixed size.
+        assert!(!xdg_suggests_float(false, size(400, 0), size(400, 0)));
+    }
 
     #[test]
     fn an_x11_window_floats_by_hyprlands_traits() {
