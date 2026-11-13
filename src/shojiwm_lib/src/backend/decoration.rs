@@ -26,6 +26,7 @@ smithay::render_elements! {
     Paint=crate::backend::paint::StablePaintElement,
     Shader=crate::backend::shader_effect::StableShaderEffectElement,
     Backdrop=crate::backend::shader_effect::StableBackdropFramebufferElement,
+    Streak=crate::backend::motion_blur::MotionBlurElement,
 }
 
 #[derive(Debug, thiserror::Error)]

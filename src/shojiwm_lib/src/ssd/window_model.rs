@@ -895,7 +895,8 @@ pub struct ManagedWindowState {
     pub z_index: Option<i32>,
     #[serde(default)]
     pub transform: WindowTransform,
-    /// `<ManagedWindow motionBlur>`: the streak the window leaves this frame,
+    /// `ManagedWindow::motion_blur` in shojiwm_rs, which the TS bridge does
+    /// not carry: the streak the window leaves this frame,
     /// as its whole length along x and y in logical pixels (its speed times
     /// the shutter the config picks). Zero draws the window as it is; any
     /// other value blurs the pixels it covers along that line once it is

@@ -17449,7 +17449,7 @@ fn tty_window_stack_elements(
                 )
             {
                 scene_elements.push(TtyRenderElements::Decoration(
-                    decoration::DecorationSceneElements::Backdrop(element),
+                    decoration::DecorationSceneElements::Streak(element),
                 ));
             }
             if let Some(in_front_effects) = in_front_effects {

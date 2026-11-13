@@ -5849,17 +5849,21 @@ fn winit_window_stack_elements(
                     PopupLayer::Window,
                 ));
             }
-            if let Some(element) = crate::backend::motion_blur::element_for_window(
-                renderer,
-                &mut state.window_decorations,
-                windows_top_to_bottom,
-                window,
-                &output.name(),
-                output_geo,
-                scale,
-            ) {
+            // Only the output's own frame: a render texture showing the window
+            // would share the streak's element with it.
+            if primary
+                && let Some(element) = crate::backend::motion_blur::element_for_window(
+                    renderer,
+                    &mut state.window_decorations,
+                    windows_top_to_bottom,
+                    window,
+                    &output.name(),
+                    output_geo,
+                    scale,
+                )
+            {
                 scene_elements.push(WinitRenderElements::Decoration(
-                    decoration::DecorationSceneElements::Backdrop(element),
+                    decoration::DecorationSceneElements::Streak(element),
                 ));
             }
             let popup_elements = transform_window_elements(

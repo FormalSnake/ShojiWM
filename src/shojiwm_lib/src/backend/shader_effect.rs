@@ -770,7 +770,7 @@ pub(crate) fn end_gpu_timing_frame_span(
     });
 }
 
-fn with_gpu_timing_gl_span<R>(
+pub(crate) fn with_gpu_timing_gl_span<R>(
     gl: &ffi::Gles2,
     label: &'static str,
     size: (i32, i32),
@@ -1014,7 +1014,7 @@ fn framebuffer_backdrop_element(
 /// The caller guarantees they hold a current GL context for the calling
 /// thread.
 #[inline]
-unsafe fn ensure_blur_scratch_fbo(gl: &smithay::backend::renderer::gles::ffi::Gles2) -> u32 {
+pub(crate) unsafe fn ensure_blur_scratch_fbo(gl: &smithay::backend::renderer::gles::ffi::Gles2) -> u32 {
     BLUR_SCRATCH_FBO.with(|cell| {
         let mut fbo = cell.get();
         if fbo == 0 {
@@ -2549,7 +2549,7 @@ fn scale_buffer_subrect(
     )
 }
 
-fn relative_intersections(
+pub(crate) fn relative_intersections(
     rects: &[Rectangle<i32, Physical>],
     region: Rectangle<i32, Physical>,
 ) -> Option<Vec<Rectangle<i32, Physical>>> {

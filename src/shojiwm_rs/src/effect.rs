@@ -406,6 +406,7 @@ pub fn dual_kawase_blur(radius: i32, passes: i32) -> Stage {
 
 /// A box blur along one line, `x` by `y` logical pixels long in all: what
 /// a shutter open that long leaves of something moving that way.
+/// A stage of Rust configs: the TS bridge has no wire form for it.
 pub fn directional_blur(x: f32, y: f32) -> Stage {
     Stage::Streak(DirectionalBlur { x, y })
 }
