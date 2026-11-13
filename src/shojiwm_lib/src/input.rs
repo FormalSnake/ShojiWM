@@ -2899,13 +2899,15 @@ impl ShojiWM {
                 // binding path as keyboard shortcuts. Touchpad/finger scrolling
                 // remains continuous and is always forwarded to the client.
                 // Every scroll takes its turn at the gate, a touchpad's too,
-                // as in Hyprland.
-                let offered = self.wheel_binding_gate.offer(std::time::Instant::now());
-                if offered
-                    && source == AxisSource::Wheel
-                    && (horizontal_amount != 0.0 || vertical_amount != 0.0)
-                {
+                // as in Hyprland. A turn of the wheel spoils a modifier tap
+                // whether or not the gate lets it through.
+                let turned = source == AxisSource::Wheel
+                    && (horizontal_amount != 0.0 || vertical_amount != 0.0);
+                if turned {
                     self.modifier_tap.interrupt();
+                }
+                let offered = self.wheel_binding_gate.offer(std::time::Instant::now());
+                if offered && turned {
                     use crate::runtime_key_binding::RuntimeWheelDirection;
                     let vertical_direction = if vertical_amount < 0.0 {
                         Some(RuntimeWheelDirection::Up)
