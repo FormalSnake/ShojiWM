@@ -132,9 +132,9 @@ impl ShojiWM {
     /// lock again.
     pub(crate) fn queue_grab_end_dispatch(&mut self, end: PendingGrabMotion) {
         self.loop_handle.insert_idle(move |state| {
-            // The button release that ended the grab is the user's doing, and so
-            // is a focus change the config makes in reply, as when `end` ran
-            // inside `process_input_event`.
+            // What ended the grab, a button let go or a lock or grab taking the
+            // pointer, follows the user's input, and so does a focus change the
+            // config makes in reply, as when `end` ran inside `process_input_event`.
             let previous_in_flight = std::mem::replace(&mut state.user_input_in_flight, true);
             let now_ms = Duration::from(state.clock.now()).as_millis() as u64;
             match end {

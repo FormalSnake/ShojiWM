@@ -63,6 +63,9 @@ pub struct ResizeSurfaceGrab {
     edges: ResizeEdge,
     source: WindowResizeSourceSnapshot,
     runtime_managed: bool,
+    /// The button that held the grab was let go, so `unset` ends it with
+    /// `End` rather than `Cancel`.
+    released: bool,
 
     initial_rect: Rectangle<i32, Logical>,
     initial_event_rect: Rectangle<i32, Logical>,
@@ -96,6 +99,7 @@ impl ResizeSurfaceGrab {
             edges,
             source,
             runtime_managed: false,
+            released: false,
             initial_rect,
             initial_event_rect,
             last_pointer,
@@ -302,37 +306,8 @@ impl PointerGrab<ShojiWM> for ResizeSurfaceGrab {
 
         if !handle.current_pressed().contains(&BTN_LEFT) {
             // No more buttons are pressed, release the grab.
+            self.released = true;
             handle.unset_grab(self, data, event.serial, event.time, true);
-
-            if self.runtime_managed {
-                let window_id = data.snapshot_window(&self.window).id;
-                let event =
-                    self.runtime_event(data, WindowResizePhaseSnapshot::End, self.last_pointer);
-                data.queue_grab_end_dispatch(PendingGrabMotion::WindowResize { window_id, event });
-                if let Some(xdg) = self.window.toplevel() {
-                    xdg.with_pending_state(|state| {
-                        state.states.unset(xdg_toplevel::State::Resizing);
-                    });
-                    xdg.send_pending_configure();
-                    ResizeSurfaceState::with(xdg.wl_surface(), |state| {
-                        *state = ResizeSurfaceState::Idle;
-                    });
-                }
-            } else if let Some(xdg) = self.window.toplevel() {
-                xdg.with_pending_state(|state| {
-                    state.states.unset(xdg_toplevel::State::Resizing);
-                    state.size = Some(self.last_window_size);
-                });
-
-                xdg.send_pending_configure();
-
-                ResizeSurfaceState::with(xdg.wl_surface(), |state| {
-                    *state = ResizeSurfaceState::WaitingForLastCommit {
-                        edges: self.edges,
-                        initial_rect: self.initial_rect,
-                    };
-                });
-            }
         }
     }
 
@@ -425,8 +400,45 @@ impl PointerGrab<ShojiWM> for ResizeSurfaceGrab {
         &self.start_data
     }
 
+    /// Every way the grab ends comes through here once: the button let go,
+    /// or the grab taken away, as a session lock or another grab does. The
+    /// config hears `End` or `Cancel` and the client leaves its resize either
+    /// way.
     fn unset(&mut self, data: &mut ShojiWM) {
         data.pointer_dispatch.discard_grab_motion();
+        let phase = if self.released {
+            WindowResizePhaseSnapshot::End
+        } else {
+            WindowResizePhaseSnapshot::Cancel
+        };
+        if self.runtime_managed {
+            let window_id = data.snapshot_window(&self.window).id;
+            let event = self.runtime_event(data, phase, self.last_pointer);
+            data.queue_grab_end_dispatch(PendingGrabMotion::WindowResize { window_id, event });
+            if let Some(xdg) = self.window.toplevel() {
+                xdg.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Resizing);
+                });
+                xdg.send_pending_configure();
+                ResizeSurfaceState::with(xdg.wl_surface(), |state| {
+                    *state = ResizeSurfaceState::Idle;
+                });
+            }
+        } else if let Some(xdg) = self.window.toplevel() {
+            xdg.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Resizing);
+                state.size = Some(self.last_window_size);
+            });
+
+            xdg.send_pending_configure();
+
+            ResizeSurfaceState::with(xdg.wl_surface(), |state| {
+                *state = ResizeSurfaceState::WaitingForLastCommit {
+                    edges: self.edges,
+                    initial_rect: self.initial_rect,
+                };
+            });
+        }
     }
 }
 
