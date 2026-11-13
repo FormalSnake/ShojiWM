@@ -120,6 +120,7 @@ fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std
 pub fn run_tty_udev(
     runtime: crate::runtime_api::RuntimeBoot,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::priority::raise_event_loop_thread();
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
     let mut state = ShojiWM::new(&mut event_loop, display, &runtime);

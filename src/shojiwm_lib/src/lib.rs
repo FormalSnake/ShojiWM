@@ -52,6 +52,7 @@ pub mod plasma_window_management;
 pub mod pointer_dispatch;
 pub mod presentation;
 pub mod presentation_test_client;
+pub mod priority;
 pub mod process_env;
 pub mod profiler;
 pub mod protocols;
