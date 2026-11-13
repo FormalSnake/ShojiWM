@@ -462,9 +462,21 @@ type ReservedX11Display = (
 );
 
 fn reserve_x11_display(start: u32) -> Result<ReservedX11Display, Box<dyn std::error::Error>> {
-    // Held for the whole scan, so a stale lock is judged and replaced by one
-    // of this user's compositors at a time.
-    let reclaim_turn = take_reclaim_turn();
+    let uid = getuid().as_raw();
+    let turn = take_reclaim_turn(
+        Path::new(&format!("/tmp/.shojiwm-x11-reclaim-{uid}")),
+        RECLAIM_TURN_WAIT,
+    );
+    reserve_x11_display_in_turn(start, turn)
+}
+
+/// Scans for a free display, reclaiming stale locks only with the turn,
+/// which is held for the whole scan so a stale lock is judged and replaced
+/// by one of this user's compositors at a time.
+fn reserve_x11_display_in_turn(
+    start: u32,
+    reclaim_turn: Option<OwnedFd>,
+) -> Result<ReservedX11Display, Box<dyn std::error::Error>> {
     for display_number in start..start + 50 {
         let lock_path = PathBuf::from(format!("/tmp/.X{display_number}-lock"));
         let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL;
@@ -508,23 +520,44 @@ fn reserve_x11_display(start: u32) -> Result<ReservedX11Display, Box<dyn std::er
     Err(io::Error::other("no free X11 display found").into())
 }
 
+/// How long a compositor waits for another one's turn at stale locks. A
+/// scan holds it for a few milliseconds; a holder that keeps it longer is
+/// stopped or stuck, and waiting on it would hold up this one's start.
+const RECLAIM_TURN_WAIT: Duration = Duration::from_millis(500);
+
 /// This user's compositors take turns at stale locks: one that read a dead
 /// pid could otherwise unlink the lock another made a moment later, and the
 /// loser's guard could remove the winner's. Without the turn, because the
-/// path is not ours or flock fails, stale locks are left alone.
-fn take_reclaim_turn() -> Option<OwnedFd> {
+/// path is not ours, flock fails, or another holds it past `wait`, stale
+/// locks are left alone and free displays are still taken.
+fn take_reclaim_turn(path: &Path, wait: Duration) -> Option<OwnedFd> {
     let uid = getuid();
-    let path = format!("/tmp/.shojiwm-x11-reclaim-{}", uid.as_raw());
     let flags =
         OFlags::RDONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let fd = open(&path, flags, Mode::RUSR | Mode::WUSR).ok()?;
+    let fd = open(path, flags, Mode::RUSR | Mode::WUSR).ok()?;
     let stat = fstat(&fd).ok()?;
     if stat.st_uid != uid.as_raw() || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
     {
         return None;
     }
-    flock(&fd, FlockOperation::LockExclusive).ok()?;
-    Some(fd)
+    let deadline = Instant::now() + wait;
+    loop {
+        match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Some(fd),
+            Err(Errno::WOULDBLOCK | Errno::INTR) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(Errno::WOULDBLOCK) => {
+                warn!(
+                    ?path,
+                    ?wait,
+                    "another compositor of this user holds the X11 reclaim turn; leaving stale locks alone"
+                );
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Removes a display lock left by a server that is gone: its pid, as the X
@@ -787,12 +820,13 @@ mod mode_tests {
 mod tests {
     use super::{
         X11_TMP_UNIX_DIR, bind_to_abstract_socket, bind_to_unix_socket, ensure_x11_unix_dir,
-        reserve_x11_display, rustix,
+        reserve_x11_display, reserve_x11_display_in_turn, rustix, take_reclaim_turn,
     };
     use std::{
         fs,
         path::PathBuf,
         sync::atomic::{AtomicU32, Ordering},
+        time::{Duration, Instant},
     };
 
     static NEXT_TEST_DISPLAY: AtomicU32 = AtomicU32::new(0);
@@ -1017,5 +1051,77 @@ mod tests {
         drop(reservation);
         drop(occupied);
         drop(occupied_guard);
+    }
+
+    /// A reclaim turn of its own, so the shared one the other tests take
+    /// stays free.
+    struct TestTurnPath(PathBuf);
+
+    impl TestTurnPath {
+        fn new(paths: &TestDisplayPaths) -> Self {
+            let path = PathBuf::from(format!(
+                "/tmp/.shojiwm-x11-reclaim-test-{}-{}",
+                std::process::id(),
+                paths.start()
+            ));
+            let _ = fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TestTurnPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_turn_held_past_the_wait_leaves_stale_locks_alone_and_scans_on() {
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        let turn = TestTurnPath::new(&paths);
+        // Another compositor of this user, stopped while it holds the turn.
+        let held = take_reclaim_turn(&turn.0, Duration::ZERO).expect("hold the turn");
+        let lock = format!("/tmp/.X{}-lock", paths.start());
+        let stale = format!("{:>10}\n", dead_pid());
+        fs::write(&lock, &stale).expect("write a stale lock");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = turn.0.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let taken = take_reclaim_turn(&path, Duration::from_millis(200));
+            let _ = sender.send((taken.is_some(), started.elapsed()));
+        });
+        let (taken, waited) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("not held up by the holder");
+        assert!(!taken, "the holder keeps the turn");
+        assert!(waited >= Duration::from_millis(200), "waited {waited:?}");
+
+        let reservation =
+            reserve_x11_display_in_turn(paths.start(), None).expect("reserve the next display");
+        assert_eq!(reservation.0, paths.start() + 1);
+        assert_eq!(fs::read_to_string(&lock).unwrap(), stale, "left alone");
+        drop(reservation);
+        drop(held);
+    }
+
+    #[test]
+    fn a_turn_let_go_within_the_wait_is_taken() {
+        let paths = TestDisplayPaths::new();
+        let turn = TestTurnPath::new(&paths);
+        let held = take_reclaim_turn(&turn.0, Duration::ZERO).expect("hold the turn");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let taken = take_reclaim_turn(&turn.0, Duration::from_secs(3));
+
+        assert!(taken.is_some(), "taken once let go");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        release.join().unwrap();
     }
 }
