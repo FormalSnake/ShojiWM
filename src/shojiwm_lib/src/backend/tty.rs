@@ -301,6 +301,67 @@ fn ratchet_frame_target(
     }
 }
 
+/// Driver-stamped flips `PeriodFit` takes before its period replaces the mode's.
+const PERIOD_FIT_MIN_FLIPS: u32 = 120;
+/// How far a fitted period may be from the mode's before it is thrown out. Panels run off their
+/// mode's nominal rate by a pixel clock's rounding (g815's eDP-1 flips at 239.731 Hz on a
+/// 240.000 Hz mode, 0.11%); a fit further off counted the vblanks between stamps wrong.
+const PERIOD_FIT_MAX_DEVIATION: f64 = 0.005;
+
+/// A least-squares fit of the real refresh period to driver flip timestamps, each placed at the
+/// number of vblanks since the first. A display often runs off its mode's nominal rate, and on
+/// the nominal period the grid drifted early across its history (0.15 ms over 32 flips on
+/// eDP-1), so a commit between the estimated vblank and the real one, which reaches the real
+/// one, was placed a period later.
+#[derive(Debug, Default)]
+struct PeriodFit {
+    /// The first stamp of this fit.
+    first: Duration,
+    /// The last stamp added and its vblank count from `first`.
+    last: Option<(Duration, u64)>,
+    flips: u32,
+    /// Running means and co-moments of vblank counts and stamps (milliseconds after `first`).
+    mean_vblanks: f64,
+    mean_ms: f64,
+    vblanks_moment: f64,
+    cross_moment: f64,
+}
+
+impl PeriodFit {
+    /// Adds a stamp, counting the vblanks since the last one with `period`. A gap that is not
+    /// within a quarter period of a whole number of them (a stamp the driver took late, or an
+    /// idle stretch long enough for `period`'s own error to add up) cannot be counted, and the
+    /// fit starts again from this stamp.
+    fn add(&mut self, stamp: Duration, period: Duration) {
+        let counted = self.last.and_then(|(last, vblanks)| {
+            let gap = stamp.checked_sub(last)?.as_secs_f64() / period.as_secs_f64();
+            let whole = gap.round();
+            (whole >= 1.0 && (gap - whole).abs() <= 0.25).then(|| vblanks + whole as u64)
+        });
+        let vblanks = counted.unwrap_or_else(|| {
+            *self = Self {
+                first: stamp,
+                ..Self::default()
+            };
+            0
+        });
+        self.last = Some((stamp, vblanks));
+        self.flips += 1;
+        let (x, y) = (vblanks as f64, (stamp - self.first).as_secs_f64() * 1_000.0);
+        let n = f64::from(self.flips);
+        let dx = x - self.mean_vblanks;
+        self.mean_vblanks += dx / n;
+        self.mean_ms += (y - self.mean_ms) / n;
+        self.vblanks_moment += dx * (x - self.mean_vblanks);
+        self.cross_moment += dx * (y - self.mean_ms);
+    }
+
+    fn period(&self) -> Option<Duration> {
+        (self.flips >= PERIOD_FIT_MIN_FLIPS && self.vblanks_moment > 0.0)
+            .then(|| Duration::from_secs_f64(self.cross_moment / self.vblanks_moment / 1_000.0))
+    }
+}
+
 /// An output's recent flips and the vblank grid they give.
 #[derive(Debug, Default)]
 struct FlipClock {
@@ -312,12 +373,19 @@ struct FlipClock {
     last_target: Option<Duration>,
     /// How many of the latest observations in a row are the driver's flip timestamps.
     kernel_timed: usize,
+    /// The mode period `period_fit` and `fitted_period` belong to.
+    mode_period: Duration,
+    period_fit: PeriodFit,
+    /// The last fit within `PERIOD_FIT_MAX_DEVIATION` of the mode.
+    fitted_period: Option<Duration>,
 }
 
 impl FlipClock {
     /// Records a flip observed at `observed`, the driver's timestamp when `kernel_timed` and
     /// otherwise the time its event was handled, and returns the vblank it completed at and the
-    /// next frame's presentation time.
+    /// next frame's presentation time, on the period fitted to the driver's timestamps once
+    /// there is one (see `period`). `fixed_rate` is false while flips are not locked to a
+    /// fixed vblank grid (VRR, tearing flips), and drops the fit; so does a new mode period.
     ///
     /// The time never goes back past `last_target`: after a bump, a phase re-estimate can put
     /// the next grid point short of the bumped one (120 Hz flips handled 2, 7, 4.3 and 0.1 ms
@@ -327,8 +395,26 @@ impl FlipClock {
         &mut self,
         observed: Duration,
         kernel_timed: bool,
-        period: Duration,
+        fixed_rate: bool,
+        mode: Duration,
     ) -> (Duration, Duration) {
+        if self.mode_period != mode || !fixed_rate {
+            self.mode_period = mode;
+            self.period_fit = PeriodFit::default();
+            self.fitted_period = None;
+        }
+        if kernel_timed && fixed_rate {
+            self.period_fit.add(observed, self.period(mode));
+            if let Some(fitted) = self.period_fit.period() {
+                let deviation = (fitted.as_secs_f64() / mode.as_secs_f64() - 1.0).abs();
+                if deviation <= PERIOD_FIT_MAX_DEVIATION {
+                    self.fitted_period = Some(fitted);
+                } else {
+                    self.period_fit = PeriodFit::default();
+                }
+            }
+        }
+        let period = self.period(mode);
         if self.observations.len() == VBLANK_GRID_HISTORY {
             self.observations.pop_front();
         }
@@ -355,6 +441,14 @@ impl FlipClock {
     /// fit with no spread to show for it: 32 flips handled 1.2 ms late at 60 Hz put the grid
     /// there, and a commit that missed the real vblank was placed on it, its successor sampled
     /// a period early. Until such an observation leaves the history, commits are left unknown.
+    /// The output's refresh period: the last accepted fit to its driver timestamps, or `mode`
+    /// until there is one. A rejected fit starts again and keeps the last accepted one.
+    fn period(&self, mode: Duration) -> Duration {
+        self.fitted_period
+            .filter(|_| self.mode_period == mode)
+            .unwrap_or(mode)
+    }
+
     fn placement_grid(&self) -> Option<Duration> {
         self.last_grid_next
             .filter(|_| self.kernel_timed >= self.observations.len())
@@ -1979,7 +2073,7 @@ fn upcoming_frame_target(surface: &SurfaceData) -> Option<Duration> {
     if surface.frame_pending && surface.redraw_state == TtyRedrawState::Queued {
         surface
             .in_flight_frame_target
-            .map(|target| target + surface.frame_duration)
+            .map(|target| target + surface.flip_clock.period(surface.frame_duration))
     } else {
         surface.next_frame_target
     }
@@ -2619,7 +2713,7 @@ mod vblank_grid_tests {
             .enumerate()
             .map(|(index, delay)| {
                 let observed = us(1_000_000.0 + index as f64 * PERIOD_US + delay);
-                let (_, target) = flips.observe(observed, true, period);
+                let (_, target) = flips.observe(observed, true, true, period);
                 target.as_secs_f64() * 1e6
             })
             .collect()
@@ -2636,7 +2730,7 @@ mod vblank_grid_tests {
         // 200 fps for a minute on a 120 Hz output.
         for index in 0..12_000u32 {
             let observed = us(1_000_000.0 + f64::from(index) * 5_000.0);
-            let (_, target) = flips.observe(observed, true, period);
+            let (_, target) = flips.observe(observed, true, true, period);
             assert!(
                 target <= observed + period * 2,
                 "flip {index}: target {target:?} ran ahead of observation {observed:?}"
@@ -2695,7 +2789,7 @@ mod vblank_grid_tests {
                 _ => [50.0, 150.0, 250.0, 350.0][index as usize % 4],
             };
             let vblank = 1_000_000.0 + f64::from(index) * period_us;
-            let (_, target) = flips.observe(us(vblank + delay), true, period);
+            let (_, target) = flips.observe(us(vblank + delay), true, true, period);
             let target = target.as_secs_f64() * 1e6;
             if index >= 4 {
                 let expected = vblank + period_us + 50.0;
@@ -2844,7 +2938,7 @@ mod vblank_grid_tests {
         let mut target = Duration::ZERO;
         for index in 0..32u32 {
             let observed = ms(690.0 + f64::from(index) * 10.0 + 0.05);
-            target = flips.observe(observed, true, period).1;
+            target = flips.observe(observed, true, true, period).1;
         }
         (flips.placement_grid(), target)
     }
@@ -2902,7 +2996,7 @@ mod vblank_grid_tests {
         let mut flips = FlipClock::default();
         for index in 0..32 {
             let observed = Duration::from_micros(1_000_000 + index * period_us + delay_us);
-            flips.observe(observed, kernel_timed, period);
+            flips.observe(observed, kernel_timed, true, period);
         }
         (flips, Duration::from_micros(1_000_000 + 32 * period_us))
     }
@@ -2981,12 +3075,116 @@ mod vblank_grid_tests {
         for index in 0..64 {
             vblank = Duration::from_micros(1_000_000 + index * period_us);
             let delay = if index % 4 == 3 { 3_916 } else { 50 };
-            flips.observe(vblank + Duration::from_micros(delay), false, period);
+            flips.observe(vblank + Duration::from_micros(delay), false, true, period);
         }
         let next = vblank + period;
         let from = next - Duration::from_micros(160);
         let to = next - Duration::from_micros(140);
         assert_eq!(queue_next(&flips, period, from, to), None);
+    }
+
+    /// g815's eDP-1: a 240.000 Hz mode on a panel that flips at 239.731 Hz.
+    const EDP_MODE: Duration = Duration::from_nanos(4_166_667);
+
+    /// The `index`th of eDP-1's real vblanks after 1 s.
+    fn edp_vblank(index: u64) -> Duration {
+        let period_ns = 1e9 / 239.731;
+        Duration::from_nanos(1_000_000_000 + (index as f64 * period_ns).round() as u64)
+    }
+
+    /// eDP-1 flips stamped 30 to 120 us after their vblanks, from `first` up to `end`.
+    fn edp_flips(flips: &mut FlipClock, first: u64, end: u64) {
+        for index in first..end {
+            let late = Duration::from_micros(30 + index * 37 % 91);
+            flips.observe(edp_vblank(index) + late, true, true, EDP_MODE);
+        }
+    }
+
+    /// On the mode's period the grid drifted 0.15 ms early across its 32 flips, and a commit
+    /// queued between the estimated vblank and the real one, which reaches the real one, was
+    /// placed a period later. The period fitted to the stamps puts the grid on the real vblanks.
+    #[test]
+    fn a_panel_slower_than_its_mode_is_placed_on_its_real_vblanks() {
+        let mut flips = FlipClock::default();
+        edp_flips(&mut flips, 0, 400);
+        let period = flips.period(EDP_MODE);
+        let real = edp_vblank(1) - edp_vblank(0);
+        assert!(
+            period.abs_diff(real) < Duration::from_nanos(100),
+            "fitted {period:?}"
+        );
+        let next = edp_vblank(400);
+        let grid = flips.placement_grid().unwrap();
+        assert!(
+            next <= grid && grid - next <= Duration::from_micros(130),
+            "grid {grid:?}, real vblank {next:?}"
+        );
+        // Between the estimate on the mode's period and the real vblank.
+        let from = next - Duration::from_micros(80);
+        let to = next - Duration::from_micros(60);
+        let placed = queue_next(&flips, period, from, to);
+        assert!(
+            placed.is_none_or(|vblank| vblank.abs_diff(next) < EDP_MODE / 2),
+            "placed on {placed:?}, flips at {next:?}"
+        );
+        // Clear of the guard: on the real vblank.
+        let from = next - Duration::from_micros(2_000);
+        let to = next - Duration::from_micros(1_950);
+        let placed = queue_next(&flips, period, from, to).unwrap();
+        assert!(
+            placed.abs_diff(next) <= Duration::from_micros(130),
+            "placed on {placed:?}"
+        );
+    }
+
+    /// Stamps 1% slower than a 60 Hz mode fit a period past `PERIOD_FIT_MAX_DEVIATION`: the
+    /// fit is thrown out and the mode's period stays. A stamp taken 3 ms late at 240 Hz cannot
+    /// be counted and starts the fit again, keeping the period already accepted.
+    #[test]
+    fn a_fit_far_from_the_mode_is_rejected() {
+        let mode = Duration::from_micros(16_667);
+        let mut flips = FlipClock::default();
+        for index in 0..400 {
+            let stamp = Duration::from_micros(1_000_000 + index * 16_834);
+            flips.observe(stamp, true, true, mode);
+        }
+        assert_eq!(flips.period(mode), mode);
+
+        let mut flips = FlipClock::default();
+        edp_flips(&mut flips, 0, 200);
+        let accepted = flips.period(EDP_MODE);
+        assert_ne!(accepted, EDP_MODE);
+        let late = edp_vblank(200) + Duration::from_micros(3_000);
+        flips.observe(late, true, true, EDP_MODE);
+        edp_flips(&mut flips, 201, 250);
+        assert_eq!(flips.period(EDP_MODE), accepted);
+    }
+
+    /// VRR, tearing flips and a new mode drop the fitted period.
+    #[test]
+    fn a_mode_change_or_vrr_drops_the_fitted_period() {
+        let mut flips = FlipClock::default();
+        edp_flips(&mut flips, 0, 200);
+        assert_ne!(flips.period(EDP_MODE), EDP_MODE);
+        flips.observe(edp_vblank(200), true, false, EDP_MODE);
+        assert_eq!(flips.period(EDP_MODE), EDP_MODE);
+
+        edp_flips(&mut flips, 201, 400);
+        assert_ne!(flips.period(EDP_MODE), EDP_MODE);
+        let sixty = Duration::from_micros(16_667);
+        flips.observe(edp_vblank(400), true, true, sixty);
+        assert_eq!(flips.period(sixty), sixty);
+        assert_eq!(flips.period(EDP_MODE), EDP_MODE);
+    }
+
+    /// Handled times never feed the fit.
+    #[test]
+    fn handled_times_do_not_fit_the_period() {
+        let mut flips = FlipClock::default();
+        for index in 0..400 {
+            flips.observe(edp_vblank(index), false, true, EDP_MODE);
+        }
+        assert_eq!(flips.period(EDP_MODE), EDP_MODE);
     }
 
     /// A rejected commit flips nothing and leaves the frame in flight as it was.
@@ -3460,9 +3658,16 @@ fn frame_finish(
     // late by however long the main thread was busy. Stepping a glide by the gaps between
     // flips (8, 12, 10.7, 10 ms while the display flipped every 8.33) was the judder in
     // kinetic scrolling.
+    let vrr = match &surface.target {
+        SurfaceTarget::Drm(drm_output) => {
+            drm_output.with_compositor(|compositor| compositor.vrr_enabled())
+        }
+        SurfaceTarget::Headless(_) => false,
+    };
     let (grid_vblank, next_frame_target) = surface.flip_clock.observe(
         presentation_clock,
         driver_time.is_some(),
+        !vrr && !surface.tearing_active,
         surface.frame_duration,
     );
     surface.next_frame_target = Some(next_frame_target);
@@ -3863,7 +4068,10 @@ fn submit_deferred_frame(
     let queue_started_at = Instant::now();
     let submit_error = {
         timescope::scope!("tty deferred queue_frame");
-        let (grid, period) = (surface.flip_clock.placement_grid(), surface.frame_duration);
+        let (grid, period) = (
+            surface.flip_clock.placement_grid(),
+            surface.flip_clock.period(surface.frame_duration),
+        );
         queue_in_flight(
             &mut surface.in_flight_frame_target,
             deferred.frame_target,
@@ -6886,8 +7094,10 @@ fn render_surface(
                 // otherwise. See `should_tear` / the tearing fast-path block above.
                 {
                     timescope::scope!("tty queue_frame");
-                    let (grid, period) =
-                        (surface.flip_clock.placement_grid(), surface.frame_duration);
+                    let (grid, period) = (
+                        surface.flip_clock.placement_grid(),
+                        surface.flip_clock.period(surface.frame_duration),
+                    );
                     let queued = queue_in_flight(
                         &mut surface.in_flight_frame_target,
                         frame_time,
