@@ -595,6 +595,29 @@ pub struct WindowVisualState {
     pub opacity: f32,
 }
 
+/// Where `rect`, in output physical pixels, lands once the window's visual
+/// transform is applied to it as `transform_snapshot_elements` applies it to
+/// the window's snapshot: scaled about `origin`, then moved by `translation`.
+pub fn visually_transformed_physical_rect(
+    rect: Rectangle<i32, Physical>,
+    visual: WindowVisualState,
+) -> Rectangle<f64, Physical> {
+    let map = |at: i32, origin: i32, scale: f64, translation: i32| {
+        origin as f64 + (at - origin) as f64 * scale + translation as f64
+    };
+    Rectangle::new(
+        Point::from((
+            map(rect.loc.x, visual.origin.x, visual.scale.x, visual.translation.x),
+            map(rect.loc.y, visual.origin.y, visual.scale.y, visual.translation.y),
+        )),
+        (
+            rect.size.w as f64 * visual.scale.x,
+            rect.size.h as f64 * visual.scale.y,
+        )
+            .into(),
+    )
+}
+
 pub fn requires_full_window_snapshot(visual: WindowVisualState) -> bool {
     // Translation and opacity can be applied directly to each render element. Scaling a complete
     // window element-by-element can expose subpixel rounding differences between its surfaces and
@@ -834,14 +857,87 @@ pub fn relative_physical_rect_from_root_global_edges_precise(
 #[cfg(test)]
 mod tests {
     use super::{
-        PreciseLogicalRect, WindowVisualState, is_identity_visual_geometry,
+        PreciseLogicalRect, WindowVisualState, backdrop_sample_rects, is_identity_visual_geometry,
+        visually_transformed_physical_rect,
         relative_physical_rect_from_root, relative_physical_rect_from_root_snapped_edges,
         requires_full_window_snapshot, snapped_precise_logical_rect_in_area_space,
         snapped_precise_logical_rect_in_element_space,
         snapped_precise_logical_rect_in_root_frame_area_space,
     };
-    use crate::ssd::LogicalRect;
+    use crate::ssd::{LogicalRect, WindowTransform};
     use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
+
+    /// formalwm lays a window out at the size it gave the client and scales
+    /// it to the box it animates through: a column going from a third of the
+    /// output to all of it starts out three times as wide as its rect.
+    #[test]
+    fn backdrop_is_sampled_where_a_scaled_window_is_drawn() {
+        let root = LogicalRect::new(10, 10, 336, 1260);
+        let node = LogicalRect::new(12, 12, 332, 1256);
+        let mut transform = WindowTransform::default();
+        transform.origin.x = 0.0;
+        transform.origin.y = 0.0;
+        transform.scale_x = 3.0;
+        let (sampled, precise) = backdrop_sample_rects(node, None, root, transform);
+        assert_eq!(
+            (sampled.x, sampled.y, sampled.width, sampled.height),
+            (16, 12, 996, 1256)
+        );
+        assert_eq!(
+            (precise.x, precise.y, precise.width, precise.height),
+            (16.0, 12.0, 996.0, 1256.0)
+        );
+
+        let precise_node = PreciseLogicalRect {
+            x: 12.5,
+            y: 12.0,
+            width: 331.5,
+            height: 1256.0,
+        };
+        let (_, precise) = backdrop_sample_rects(node, Some(precise_node), root, transform);
+        assert_eq!((precise.x, precise.width), (17.5, 994.5));
+    }
+
+    /// The physical rect of a backdrop under a window that scales about its
+    /// left edge to three times its width and slides 40 px right: the
+    /// pipeline samples where the snapshot puts it, not where it is laid out.
+    #[test]
+    fn a_backdrop_is_sampled_where_the_snapshot_draws_it() {
+        let visual = WindowVisualState {
+            origin: Point::<i32, Physical>::from((12, 12)),
+            scale: Scale::from((3.0, 1.0)),
+            translation: Point::<i32, Physical>::from((40, 0)),
+            opacity: 1.0,
+        };
+        let laid_out = Rectangle::<i32, Physical>::new((15, 15).into(), (415, 1570).into());
+        let drawn = visually_transformed_physical_rect(laid_out, visual);
+        assert_eq!(
+            (drawn.loc.x, drawn.loc.y, drawn.size.w, drawn.size.h),
+            (61.0, 15.0, 1245.0, 1570.0)
+        );
+
+        let rest = WindowVisualState {
+            scale: Scale::from((1.0, 1.0)),
+            translation: Point::<i32, Physical>::from((0, 0)),
+            ..visual
+        };
+        let drawn = visually_transformed_physical_rect(laid_out, rest);
+        assert_eq!(
+            (drawn.loc.x, drawn.loc.y, drawn.size.w, drawn.size.h),
+            (15.0, 15.0, 415.0, 1570.0)
+        );
+    }
+
+    #[test]
+    fn backdrop_of_a_window_at_rest_is_sampled_at_its_rect() {
+        let root = LogicalRect::new(10, 10, 1008, 1260);
+        let node = LogicalRect::new(12, 12, 1004, 1256);
+        let (sampled, _) = backdrop_sample_rects(node, None, root, WindowTransform::default());
+        assert_eq!(
+            (sampled.x, sampled.y, sampled.width, sampled.height),
+            (12, 12, 1004, 1256)
+        );
+    }
 
     #[test]
     fn opacity_only_visual_state_has_identity_geometry() {
@@ -1094,6 +1190,26 @@ pub fn transformed_rect(
     let height = (top.max(bottom) - top.min(bottom)).ceil() as i32;
 
     LogicalRect::new(x, y, width.max(0), height.max(0))
+}
+
+/// Where a node's backdrop is sampled: the node's rect under the window's
+/// visual transform, the screen behind the node as it is drawn. The node is
+/// laid out at its raw rect and moved by the transform afterwards (in a scale
+/// animation with the whole window, as one snapshot), so its backdrop is
+/// sampled there and drawn back into the raw rect. Sampled at the raw rect
+/// instead, a window scaled from the size it was given to the box it animates
+/// through shows the backdrop of that size stretched over the box.
+pub fn backdrop_sample_rects(
+    rect: LogicalRect,
+    rect_precise: Option<PreciseLogicalRect>,
+    reference_rect: LogicalRect,
+    transform: WindowTransform,
+) -> (LogicalRect, PreciseLogicalRect) {
+    let sampled = transformed_rect(rect, reference_rect, transform);
+    let precise = rect_precise
+        .map(|precise| transformed_precise_rect(precise, reference_rect, transform))
+        .unwrap_or_else(|| precise_rect_from_logical(sampled));
+    (sampled, precise)
 }
 
 pub fn transformed_precise_rect(

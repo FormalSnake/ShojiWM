@@ -2128,15 +2128,13 @@ fn backdrop_shader_elements_for_window(
                         display_rect,
                     ))
                 });
-            // Snapshot mode renders the whole window into a raw, untransformed offscreen texture
-            // and applies the visual transform exactly once to that final texture. If the shader
-            // effect capture/sample rect is still derived from the transformed display rect here,
-            // backdrop-based effects are sampled from a second, stale coordinate space and drift
-            // slightly during scale animations even though the final snapshot is otherwise correct.
-            let source_effect_rect = display_rect;
-            let _source_effect_rect_precise = display_rect_precise.unwrap_or_else(|| {
-                crate::backend::visual::precise_rect_from_logical(source_effect_rect)
-            });
+            let (source_effect_rect, _source_effect_rect_precise) =
+                crate::backend::visual::backdrop_sample_rects(
+                    cached.rect,
+                    cached.rect_precise,
+                    decoration.layout.root.rect,
+                    decoration.visual_transform,
+                );
             (
                 source_effect_rect.x,
                 source_effect_rect.y,
@@ -2449,16 +2447,27 @@ fn backdrop_shader_elements_for_window(
                 )),
                 geometry.size,
             );
+            // The pipeline samples where the window's visual transform draws
+            // the backdrop, which is where its capture was taken.
+            let sampled_screen_rect = if apply_visual_transform {
+                final_backdrop_screen_rect.to_f64()
+            } else {
+                crate::backend::visual::visually_transformed_physical_rect(
+                    final_backdrop_screen_rect,
+                    crate::backend::visual::window_visual_state(
+                        root_rect,
+                        decoration.visual_transform,
+                        output_geo,
+                        scale,
+                    ),
+                )
+            };
             let sample_region = Rectangle::new(
                 smithay::utils::Point::from((
-                    (final_backdrop_screen_rect.loc.x - capture_origin_physical.x) as f64,
-                    (final_backdrop_screen_rect.loc.y - capture_origin_physical.y) as f64,
+                    sampled_screen_rect.loc.x - capture_origin_physical.x as f64,
+                    sampled_screen_rect.loc.y - capture_origin_physical.y as f64,
                 )),
-                (
-                    final_backdrop_screen_rect.size.w as f64,
-                    final_backdrop_screen_rect.size.h as f64,
-                )
-                    .into(),
+                (sampled_screen_rect.size.w, sampled_screen_rect.size.h).into(),
             );
             let output_size = (
                 final_backdrop_screen_rect.size.w,
