@@ -127,8 +127,6 @@ pub fn run_tty_udev(
     let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
     crate::process_env::set_var("WAYLAND_DISPLAY", &state.socket_name);
     let _control_socket = crate::control_socket::start(&event_loop.handle(), &state.socket_name);
-    publish_activation_environment("tty-wayland-display");
-    state.start_xwayland(&event_loop);
 
     let (mut session, session_notifier) = LibSeatSession::new()?;
     let seat_name = session.seat();
@@ -383,6 +381,13 @@ pub fn run_tty_udev(
                 .into(),
         );
     }
+
+    // Published once the cards are ours (Xwayland's start publishes too): the session manager
+    // starts the session's clients when WAYLAND_DISPLAY appears, and the kernel makes whoever
+    // opens a card with no master its master, so a client opening the card first
+    // (nvidia-settings' autostart) left us EBUSY.
+    publish_activation_environment("tty-wayland-display");
+    state.start_xwayland(&event_loop);
 
     info!(socket = ?state.socket_name, "set wayland display for tty backend");
     state.enable_initial_decoration_runtime();
