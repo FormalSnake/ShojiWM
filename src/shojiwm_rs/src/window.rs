@@ -9,7 +9,7 @@ use shojiwm_lib::ssd::{
     ManagedWindowPointAnimationSnapshot, ManagedWindowPointSnapshot,
     ManagedWindowRectAnimationSnapshot, ManagedWindowScalarAnimationSnapshot, RuntimeWindowAction,
     WaylandWindowAction, WaylandWindowSnapshot, WindowContentType, WindowDecorationStateSnapshot,
-    WindowIconSnapshot, window_model::WindowSizeConstraintsSnapshot,
+    WindowIconSnapshot, X11WindowStateSnapshot, window_model::WindowSizeConstraintsSnapshot,
 };
 
 use crate::{
@@ -41,6 +41,7 @@ pub(crate) struct WindowSignals {
     pub foreign_toplevel_id: Signal<Option<String>>,
     pub tag: Signal<Option<String>>,
     pub content_type: Signal<Option<WindowContentType>>,
+    pub x11: Signal<Option<X11WindowStateSnapshot>>,
     pub icon: Signal<Option<WindowIconSnapshot>>,
     pub interaction: Signal<DecorationInteractionSnapshot>,
     pub decoration: Signal<WindowDecorationStateSnapshot>,
@@ -69,6 +70,7 @@ impl WindowSignals {
             foreign_toplevel_id: scope.signal(snapshot.foreign_toplevel_id.clone()),
             tag: scope.signal(snapshot.tag.clone()),
             content_type: scope.signal(snapshot.content_type),
+            x11: scope.signal(snapshot.x11),
             icon: scope.signal(snapshot.icon.clone()),
             interaction: scope.signal(snapshot.interaction.clone()),
             decoration: scope.signal(snapshot.decoration),
@@ -99,6 +101,7 @@ impl WindowSignals {
             .set(snapshot.foreign_toplevel_id.clone());
         self.tag.set(snapshot.tag.clone());
         self.content_type.set(snapshot.content_type);
+        self.x11.set(snapshot.x11);
         self.icon.set(snapshot.icon.clone());
         self.interaction.set(snapshot.interaction.clone());
         self.decoration.set(snapshot.decoration);
@@ -172,6 +175,10 @@ window_signals! {
     /// What the client says it shows (`wp-content-type-v1`): photo, video or
     /// game; `None` when it said nothing.
     content_type: Option<WindowContentType>,
+    /// What an X11 window's state and size hints say of how it wants to be
+    /// kept (above the others, on every desktop, at one aspect ratio);
+    /// `None` for a Wayland window.
+    x11: Option<X11WindowStateSnapshot>,
     icon: Option<WindowIconSnapshot>,
     interaction: DecorationInteractionSnapshot,
     decoration: WindowDecorationStateSnapshot,
@@ -388,6 +395,7 @@ fn empty_snapshot() -> WaylandWindowSnapshot {
         foreign_toplevel_id: None,
         tag: None,
         content_type: None,
+        x11: None,
         id: String::new(),
         title: String::new(),
         app_id: None,

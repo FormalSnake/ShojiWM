@@ -4448,6 +4448,7 @@ mod tests {
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
+            x11: None,
             id: "1".into(),
             title: "Kitty".into(),
             app_id: Some("kitty".into()),

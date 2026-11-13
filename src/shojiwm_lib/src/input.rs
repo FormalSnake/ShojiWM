@@ -1720,7 +1720,7 @@ impl ShojiWM {
         }
     }
 
-    fn dispatch_gesture_pinch(
+    pub(crate) fn dispatch_gesture_pinch(
         &mut self,
         phase: GestureSwipePhaseSnapshot,
         timestamp: u64,
@@ -3691,7 +3691,7 @@ impl ShojiWM {
             .cloned()
     }
 
-    fn window_for_pointer_surface(
+    pub(crate) fn window_for_pointer_surface(
         &self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) -> Option<smithay::desktop::Window> {

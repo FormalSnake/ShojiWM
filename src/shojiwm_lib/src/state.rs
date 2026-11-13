@@ -3437,6 +3437,7 @@ impl ShojiWM {
             is_focused: false,
             is_floating: true,
             is_maximized: false,
+            x11: None,
             is_fullscreen: false,
             is_xwayland: false,
             decoration: Default::default(),
@@ -4790,7 +4791,13 @@ impl ShojiWM {
     /// committed its fullscreen buffer, matching what is on screen.
     pub(crate) fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
         self.windows_for_output_top_to_bottom(output)
-            .first()
+            .into_iter()
+            .find(|window| {
+                !self
+                    .window_decorations
+                    .get(*window)
+                    .is_some_and(|decoration| decoration.managed_window.above_fullscreen)
+            })
             .and_then(|window| window.toplevel())
             .is_some_and(|toplevel| {
                 toplevel.with_committed_state(|state| {
@@ -4798,6 +4805,8 @@ impl ShojiWM {
                         state.states.contains(
                             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
                         )
+        // A window that floats over a fullscreen one (`aboveFullscreen`, a
+        // picture in picture) does not count: the first one under those does.
                     })
                 })
             })

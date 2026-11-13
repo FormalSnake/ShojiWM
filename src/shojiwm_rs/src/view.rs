@@ -672,6 +672,7 @@ pub struct ManagedWindow {
     tiled: Option<Prop<bool>>,
     allow_tearing: Option<Prop<bool>>,
     confine_pointer: Option<Prop<bool>>,
+    above_fullscreen: Option<Prop<bool>>,
     z_index: Option<Prop<i32>>,
     opacity: Option<Prop<f64>>,
     transform: Option<Prop<ManagedTransform>>,
@@ -710,6 +711,9 @@ managed_props! {
     /// Keep the pointer inside the window while it has keyboard focus, as if
     /// the client had confined it (an X11 game that grabs and warps).
     confine_pointer: bool,
+    /// The window floats over a fullscreen one (a picture in picture): the
+    /// fullscreen window under it still keeps the Top layer behind it.
+    above_fullscreen: bool,
     z_index: i32,
     opacity: f64,
     transform: ManagedTransform,
@@ -766,6 +770,7 @@ impl ManagedWindow {
             tiled: read(&self.tiled).unwrap_or(false),
             allow_tearing: read(&self.allow_tearing),
             confine_pointer: read(&self.confine_pointer).unwrap_or(false),
+            above_fullscreen: read(&self.above_fullscreen).unwrap_or(false),
             z_index: read(&self.z_index),
             transform: WindowTransform {
                 origin: TransformOrigin {

@@ -143,6 +143,7 @@ pub mod prelude {
         AlignItems, BlendMode, BoxShadow, Color, EffectRegion, ImageFit, JustifyContent, Overflow,
         PointerEvents, PopupAlign, PopupCollision, PopupDismissReason, PopupLayer, PopupMode,
         PopupPlacement, StylePosition, TextShadow, WindowAction, WindowContentType,
+        X11WindowStateSnapshot,
     };
 }
 

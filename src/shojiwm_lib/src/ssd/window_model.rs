@@ -71,10 +71,28 @@ pub struct WaylandWindowSnapshot {
     /// said nothing or `none`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<WindowContentType>,
+    /// What an X11 window's state and size hints say of how it wants to be
+    /// kept; `None` for a Wayland window, which has no way to say it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x11: Option<X11WindowStateSnapshot>,
     /// The process behind the window's client, from its socket credentials
     /// (`_NET_WM_PID` for an X11 window on Xwayland); `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
+}
+
+/// `_NET_WM_STATE` and `WM_NORMAL_HINTS` of an X11 window, as far as they say
+/// where it wants to be: a player kept over the other windows, on every
+/// desktop, at one aspect ratio.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X11WindowStateSnapshot {
+    /// `_NET_WM_STATE_ABOVE`.
+    pub above: bool,
+    /// `_NET_WM_STATE_STICKY`.
+    pub sticky: bool,
+    /// The size hints give one aspect ratio as both the least and the most.
+    pub fixed_aspect: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -858,6 +876,12 @@ impl Default for ManagedWindowState {
             force_rect_size: false,
             tiled: false,
             allow_tearing: None,
+    /// `<ManagedWindow aboveFullscreen>`: the window floats over a fullscreen
+    /// one without ending its hold on the output. The Top layer stays behind
+    /// the fullscreen window, for the pointer as for the eye, as long as the
+    /// first window under the ones so marked is fullscreen.
+    #[serde(default)]
+    pub above_fullscreen: bool,
             confine_pointer: false,
             z_index: None,
             transform: WindowTransform::default(),
@@ -884,6 +908,7 @@ pub enum WaylandWindowAction {
     /// Focus the window because it was asked for by name. Unlike `Focus`,
     /// it is not refused in favour of a window that opened later.
     FocusOnRequest,
+            above_fullscreen: false,
     /// Take the keyboard from the window if it has it. No window has it
     /// then, until one is focused.
     Unfocus,
@@ -1030,6 +1055,7 @@ impl ShojiWM {
                 decoration: WindowDecorationStateSnapshot::default(),
                 size_constraints: WindowSizeConstraintsSnapshot::default(),
                 is_resizable: true,
+            x11: None,
                 is_transient: false,
                 suggests_float: false,
                 parent_id: None,
@@ -1087,6 +1113,7 @@ impl ShojiWM {
             .element_location(window)
             .map(|loc| {
                 let geometry = window.geometry();
+                x11: None,
                 WindowPositionSnapshot {
                     x: (loc.x + geometry.loc.x) as f64,
                     y: (loc.y + geometry.loc.y) as f64,
@@ -1168,6 +1195,19 @@ impl ShojiWM {
 
     pub fn snapshot_layer_surface(
         &self,
+            x11: Some(X11WindowStateSnapshot {
+                above: x11.is_above(),
+                sticky: x11.is_sticky(),
+                fixed_aspect: x11
+                    .size_hints()
+                    .and_then(|hints| hints.aspect)
+                    .is_some_and(|(least, most)| {
+                        least.numerator > 0
+                            && least.denominator > 0
+                            && i64::from(least.numerator) * i64::from(most.denominator)
+                                == i64::from(most.numerator) * i64::from(least.denominator)
+                    }),
+            }),
         output_name: &str,
         layer: &LayerSurface,
         geometry: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
@@ -1623,6 +1663,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PointerHitTargetSnapshot::Layer {
                 layer_id: "layer-1".into(),
+            x11: None,
             })
             .expect("serialize layer"),
             serde_json::json!({ "kind": "layer", "layerId": "layer-1" }),

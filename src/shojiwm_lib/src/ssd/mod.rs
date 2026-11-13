@@ -62,6 +62,7 @@ pub use window_model::{
     WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
     WindowActivateRequestEventSnapshot, WindowActivateRequestSourceSnapshot, WindowContentType,
     WindowDecorationClientSnapshot, WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
+    X11WindowStateSnapshot,
     WindowDecorationPolicyContextSnapshot, WindowDecorationPolicyReasonSnapshot,
     WindowDecorationProtocolSnapshot, WindowDecorationStateSnapshot,
     WindowFullscreenRequestEventSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,
