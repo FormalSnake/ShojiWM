@@ -328,6 +328,38 @@ fn predict_next_frame(
     (vblank, target)
 }
 
+/// The first vblank after `time` on the grid through `grid_point`.
+fn vblank_after(grid_point: Duration, period: Duration, time: Duration) -> Duration {
+    let period_ns = period.as_nanos();
+    if period_ns == 0 {
+        return grid_point;
+    }
+    let point = grid_point.as_nanos();
+    let time = time.as_nanos();
+    let next = if point > time {
+        point - (point - time - 1) / period_ns * period_ns
+    } else {
+        point + ((time - point) / period_ns + 1) * period_ns
+    };
+    Duration::from_nanos(next as u64)
+}
+
+/// The vblank a frame rendered for `target` flips at when committed at `committed_at`: the
+/// first one after the commit, if that is later. A commit after its vblank (its flip event was
+/// handled late, or the render ran past it) shows the frame a period later, and the frame
+/// rendered ahead of it targets the vblank after that one; chained from `target`, every frame
+/// rendered ahead stayed a period short of the vblank it was shown at until the chain broke.
+fn in_flight_vblank(
+    target: Duration,
+    last_grid_next: Option<Duration>,
+    period: Duration,
+    committed_at: Duration,
+) -> Duration {
+    last_grid_next.map_or(target, |grid| {
+        target.max(vblank_after(grid, period, committed_at))
+    })
+}
+
 /// The time a frame is sampled at, and whether `next_frame_target` was thrown out for it.
 /// `last_frame_time` is the time the output's previous frame was sampled at; the result is never
 /// earlier, whether it comes from the prediction, the render-ahead chain or the clock, so
@@ -1254,8 +1286,8 @@ struct SurfaceData {
     /// An ahead render already ran for the flip in flight (it may have had no damage);
     /// another one waits for the flip, so a burst of redraw requests does not re-render.
     ahead_attempted: bool,
-    /// The vblank the newest submitted (or held) frame was rendered for; an ahead frame
-    /// targets the vblank after it. `None` while what is in flight is not a rendered
+    /// The vblank the newest submitted (or held) frame flips at (see `in_flight_vblank`); an
+    /// ahead frame targets the vblank after it. `None` while what is in flight is not a rendered
     /// frame (a cursor-only commit) or nothing is.
     in_flight_frame_target: Option<Duration>,
     /// Whether the last render used the fullscreen fast path (a fullscreen window scanned
@@ -2451,7 +2483,10 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 
 #[cfg(test)]
 mod vblank_grid_tests {
-    use super::{VBLANK_GRID_HISTORY, predict_next_frame, sanitize_next_frame_target, vblank_grid};
+    use super::{
+        VBLANK_GRID_HISTORY, in_flight_vblank, predict_next_frame, sanitize_next_frame_target,
+        vblank_grid,
+    };
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -2623,6 +2658,38 @@ mod vblank_grid_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_frame_committed_after_its_vblank_flips_at_the_next_one() {
+        let period = us(PERIOD_US);
+        let grid = us(1_000_000.0);
+        // Committed in time: the vblank it was rendered for.
+        assert_eq!(
+            in_flight_vblank(grid, Some(grid), period, grid - us(500.0)),
+            grid
+        );
+        // Committed 300 us after that vblank: the next one, and the frame rendered ahead of it
+        // the one after.
+        assert_eq!(
+            in_flight_vblank(grid, Some(grid), period, grid + us(300.0)),
+            grid + period
+        );
+        assert_eq!(
+            in_flight_vblank(
+                grid,
+                Some(grid - period * 3),
+                period,
+                grid + period + us(10.0)
+            ),
+            grid + period * 2
+        );
+        // Rendered for a later vblank than the commit reaches: that one.
+        assert_eq!(
+            in_flight_vblank(grid + period, Some(grid), period, grid - us(500.0)),
+            grid + period
+        );
+        assert_eq!(in_flight_vblank(grid, None, period, grid + us(300.0)), grid);
     }
 
     #[test]
@@ -3592,7 +3659,12 @@ fn submit_ahead_frame(
         return;
     };
     surface.frame_pending = true;
-    surface.in_flight_frame_target = Some(ahead.frame_target);
+    surface.in_flight_frame_target = Some(in_flight_vblank(
+        ahead.frame_target,
+        surface.last_grid_next,
+        surface.frame_duration,
+        now,
+    ));
     surface.redraw_state = TtyRedrawState::WaitingForVBlank { redraw_needed };
     surface.deferred_submit = Some(ahead);
     let generation = surface.deferred_submit_generation.wrapping_add(1);
@@ -6572,7 +6644,17 @@ fn render_surface(
                 surface.queued_cpu_duration = total_cpu_elapsed;
             }
             surface.frame_pending = true;
-            surface.in_flight_frame_target = Some(frame_time);
+            // An ahead frame is only staged here; `submit_ahead_frame` places it when it commits.
+            surface.in_flight_frame_target = Some(if rendering_ahead {
+                frame_time
+            } else {
+                in_flight_vblank(
+                    frame_time,
+                    surface.last_grid_next,
+                    surface.frame_duration,
+                    Duration::from(state.clock.now()),
+                )
+            });
             surface.skipped_while_pending_count = 0;
             surface.frame_callback_timer_armed = false;
             surface.frame_callback_timer_generation =
