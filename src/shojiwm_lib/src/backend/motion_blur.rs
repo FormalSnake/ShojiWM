@@ -53,7 +53,7 @@ pub const SHORTEST: f64 = 0.5;
 /// this bounds what a wrong value could ask for.
 pub const LONGEST: f64 = 96.0;
 
-/// How long a copy of a size no output has drawn at is kept.
+/// How long a copy of a size nothing has drawn at is kept.
 const IDLE: Duration = Duration::from_secs(10);
 
 /// The taps for a streak `length` physical pixels long: a pixel apart at
@@ -177,12 +177,14 @@ fn runs(stack: &[Lying]) -> Vec<Vec<usize>> {
 #[derive(Debug)]
 struct Kept {
     texture: GlesTexture,
-    /// The pass whose copy is in it.
-    of: Option<Id>,
+    /// The pass whose copy is in it, and where in the target it was
+    /// drawing its box: a copy of part of the output lies elsewhere.
+    of: Option<(Id, Point<i32, Physical>)>,
     used: Instant,
 }
 
-/// The copies, kept with the GL context: one for each size outputs draw at.
+/// The copies, kept with the GL context: one for each size drawn at, an
+/// output's or a copy of part of one.
 #[derive(Debug, Default)]
 struct Copies {
     held: Vec<Kept>,
@@ -208,6 +210,9 @@ impl Copies {
         size: Size<i32, Buffer>,
     ) -> Result<&mut Kept, GlesError> {
         let now = Instant::now();
+        // An output that changed mode or went, a region no longer copied.
+        self.held
+            .retain(|copy| copy.texture.size() == size || now.duration_since(copy.used) < IDLE);
         let at = match self
             .held
             .iter()
@@ -215,8 +220,6 @@ impl Copies {
         {
             Some(at) => at,
             None => {
-                self.held
-                    .retain(|copy| now.duration_since(copy.used) < IDLE);
                 let texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
                 // A new texture repeats: a tap past the output's edge would
                 // read its far side.
@@ -293,6 +296,7 @@ pub fn element(
     windows: &[LogicalRect],
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
+    alone: bool,
 ) -> Option<MotionBlurElement> {
     let plan = plan(streak)?;
     let program = program(renderer)?;
@@ -321,14 +325,16 @@ pub fn element(
     streak.map(f32::to_bits).hash(&mut hasher);
     let signature = hasher.finish();
     let copies = copies(renderer);
-    // Another pass has copied into the texture since this one did: it has
-    // to copy again, which a new commit makes the damage tracker ask for.
-    let kept = copies
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .held
-        .iter()
-        .any(|copy| copy.of.as_ref() == Some(&state.id));
+    // Another pass has copied into the texture since this one did, or will
+    // before this one draws: it has to copy again, which a new commit makes
+    // the damage tracker ask for.
+    let kept = alone
+        && copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held
+            .iter()
+            .any(|copy| copy.of.as_ref() == Some(&(state.id.clone(), geometry.loc)));
     if state.signature != signature || !kept {
         state.signature = signature;
         state.commit_counter.increment();
@@ -423,9 +429,10 @@ impl Stack {
                     .window_effect_cache
                     .entry(cache.clone())
                     .or_default();
+                let alone = runs.len() == 1;
                 Some((
                     at,
-                    element(renderer, state, streak, &rects, output_geo, scale)?,
+                    element(renderer, state, streak, &rects, output_geo, scale, alone)?,
                 ))
             })
             .collect();
@@ -509,7 +516,9 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .held
             .iter()
-            .find(|copy| copy.texture.size() == size && copy.of.as_ref() == Some(&self.id))
+            .find(|copy| {
+                copy.texture.size() == size && copy.of.as_ref() == Some(&(self.id.clone(), dst.loc))
+            })
             .map(|copy| copy.texture.clone());
         let Some(texture) = texture else {
             return Ok(());
@@ -542,8 +551,11 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
             let Some(damage) = relative_intersections(damage, within) else {
                 continue;
             };
-            // The texture is the output, so a region reads from where it is.
-            let from = transform.transform_rect_in(*region, &output);
+            // The texture is the target, so a region reads from where it
+            // is drawn in it, which in a copy of part of the output is not
+            // where it is on the output.
+            let drawn = Rectangle::new(dst.loc + within.loc, within.size);
+            let from = transform.transform_rect_in(drawn, &output);
             let src = Rectangle::new(
                 Point::from((f64::from(from.loc.x), f64::from(from.loc.y))),
                 (f64::from(from.size.w), f64::from(from.size.h)).into(),
@@ -551,7 +563,7 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
             result = frame.render_texture_from_to(
                 &texture,
                 src,
-                Rectangle::new(dst.loc + within.loc, within.size),
+                drawn,
                 &damage,
                 &[],
                 transform.invert(),
@@ -590,7 +602,7 @@ impl RenderElement<GlesRenderer> for MotionBlurElement {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let copy = copies.fit(frame.renderer().as_mut(), (size.w, size.h).into())?;
-            copy.of = Some(self.id.clone());
+            copy.of = Some((self.id.clone(), dst.loc));
             copy.texture.tex_id()
         };
         frame.with_context(|gl| unsafe {
@@ -981,6 +993,7 @@ mod tests {
                     windows,
                     output_geo,
                     Scale::from(1.0),
+                    true,
                 );
                 let elements: Vec<Drawn> = blur
                     .into_iter()
@@ -1138,11 +1151,12 @@ mod tests {
             // The lower pass first: the upper one reads what it drew.
             let (wanted, passed) = filtered(&desk, coming, &came);
             let (wanted, over) = filtered(&wanted, leaving, &left);
-            // The mark moves on its own, over the tiles coming in.
-            for mark in [
-                (60 + 9 * step, 250 - 6 * step),
-                (64 + 9 * step, 244 - 6 * step),
-            ] {
+            // The mark moves on its own while the tiles do not: twice over
+            // those coming in, then twice over those leaving, whose pass is
+            // the upper one and has nothing under it changing.
+            for mark in [(60, 250), (64, 244), (230, 80), (234, 86)]
+                .map(|(x, y)| (x + 9 * step, y - 6 * step))
+            {
                 let mut elements = vec![Drawn::Under(shown(
                     &mark_id,
                     &mark_texture,
@@ -1158,6 +1172,7 @@ mod tests {
                         rects,
                         output_geo,
                         Scale::from(1.0),
+                        false,
                     );
                     elements.push(Drawn::Blur(blur.expect("the tiles are on the output")));
                 }
@@ -1209,5 +1224,150 @@ mod tests {
         }
         // Two passes a frame for the whole of it, and one texture.
         assert_eq!(copies(&mut renderer).lock().unwrap().made, 1);
+    }
+
+    /// A copy of part of the output, as a region screenshot takes it while
+    /// the windows move: every element moved by the region's corner, drawn
+    /// into a buffer the region's size on a tracker of its own.
+    #[test]
+    #[ignore = "requires surfaceless EGL; renders only offscreen buffers"]
+    fn a_copy_of_part_of_the_output_shows_the_pass_as_the_output_does() {
+        use smithay::{
+            backend::{
+                allocator::Fourcc,
+                egl::{EGLContext, EGLDisplay, native::EGLSurfacelessDisplay},
+                renderer::{
+                    Bind, ExportMem, ImportMem, Offscreen, Renderer,
+                    damage::OutputDamageTracker,
+                    element::{
+                        Id, Kind,
+                        texture::TextureRenderElement,
+                        utils::{Relocate, RelocateRenderElement},
+                    },
+                    gles::GlesTexture,
+                },
+            },
+            utils::Transform,
+        };
+
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.unwrap();
+        let context = EGLContext::new(&display).unwrap();
+        let mut renderer = unsafe { GlesRenderer::new(context) }.unwrap();
+        let desk = desk();
+        let desk_texture = renderer
+            .import_memory(&desk, Fourcc::Abgr8888, DESK.into(), false)
+            .unwrap();
+        let (under_id, context) = (Id::new(), renderer.context_id());
+        let output_geo = Rectangle::from_size(DESK.into());
+        const PART: (i32, i32, i32, i32) = (100, 60, 320, 220);
+        let mut whole: GlesTexture =
+            Offscreen::<GlesTexture>::create_buffer(&mut renderer, Fourcc::Abgr8888, DESK.into())
+                .unwrap();
+        let mut part: GlesTexture = Offscreen::<GlesTexture>::create_buffer(
+            &mut renderer,
+            Fourcc::Abgr8888,
+            (PART.2, PART.3).into(),
+        )
+        .unwrap();
+        let mut on_output = OutputDamageTracker::new(DESK, 1.0, Transform::Normal);
+        let mut on_part = OutputDamageTracker::new((PART.2, PART.3), 1.0, Transform::Normal);
+        let mut state = WindowEffectElementState::default();
+        let mut upside_down = false;
+        let mut frames = vec![([0.0, 0.0], Vec::new())];
+        frames.extend(moves());
+        for (index, (streak, windows)) in frames.iter().enumerate() {
+            let blur = element(
+                &mut renderer,
+                &mut state,
+                *streak,
+                windows,
+                output_geo,
+                Scale::from(1.0),
+                true,
+            );
+            let elements: Vec<Drawn> = blur
+                .into_iter()
+                .map(Drawn::Blur)
+                .chain([Drawn::Under(TextureRenderElement::from_static_texture(
+                    under_id.clone(),
+                    context.clone(),
+                    (0.0, 0.0),
+                    desk_texture.clone(),
+                    1,
+                    Transform::Normal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ))])
+                .collect();
+            let age = usize::from(index > 0);
+            {
+                let mut framebuffer = renderer.bind(&mut whole).unwrap();
+                on_output
+                    .render_output(&mut renderer, &mut framebuffer, age, &elements, [0.0; 4])
+                    .unwrap();
+            }
+            let moved: Vec<_> = elements
+                .iter()
+                .map(|element| {
+                    RelocateRenderElement::from_element(
+                        element,
+                        Point::<i32, Physical>::from((-PART.0, -PART.1)),
+                        Relocate::Relative,
+                    )
+                })
+                .collect();
+            {
+                let mut framebuffer = renderer.bind(&mut part).unwrap();
+                on_part
+                    .render_output(&mut renderer, &mut framebuffer, age, &moved, [0.0; 4])
+                    .unwrap();
+            }
+            let mapping = renderer
+                .copy_texture(
+                    &part,
+                    Rectangle::from_size((PART.2, PART.3).into()),
+                    Fourcc::Abgr8888,
+                )
+                .unwrap();
+            let read = renderer.map_texture(&mapping).unwrap().to_vec();
+            let (wanted, _) = filtered(&desk, *streak, windows);
+            let cut = |from: &[u8]| -> Vec<u8> {
+                (PART.1..PART.1 + PART.3)
+                    .flat_map(|y| {
+                        let start = ((y * DESK.0 + PART.0) * 4) as usize;
+                        from[start..start + (PART.2 * 4) as usize].iter().copied()
+                    })
+                    .collect()
+            };
+            let row = (PART.2 * 4) as usize;
+            if index == 0 {
+                upside_down = read != cut(&desk);
+            }
+            let drawn: Vec<u8> = if upside_down {
+                read.chunks(row).rev().flatten().copied().collect()
+            } else {
+                read
+            };
+            // A tap past the part's edge has no pixel to read there, so
+            // the streak's reach in from the edge is left out.
+            let rim = plan(*streak).map_or(0, |plan| plan.padding());
+            let wanted = cut(&wanted);
+            let mut worst = 0;
+            for y in rim..PART.3 - rim {
+                for x in rim..PART.2 - rim {
+                    let at = ((y * PART.2 + x) * 4) as usize;
+                    for channel in 0..4 {
+                        worst = worst.max(drawn[at + channel].abs_diff(wanted[at + channel]));
+                    }
+                }
+            }
+            assert!(
+                worst <= 2,
+                "frame {index}, streak {streak:?}: {worst} levels out"
+            );
+        }
     }
 }
