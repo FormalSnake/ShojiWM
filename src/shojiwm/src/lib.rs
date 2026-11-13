@@ -799,6 +799,7 @@ COMPOSITOR.window.composition = (window) => <Label text={window.title} />;
             x: 12.0,
             y: 34.0,
             output_name: Some("eDP-1".into()),
+            window_id: None,
         });
         assert!(
             runtime

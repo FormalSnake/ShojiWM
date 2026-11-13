@@ -104,6 +104,7 @@ export const CURSOR_CONTROLLER: CursorController = {
       x: position.x,
       y: position.y,
       ...(position.outputName ? { outputName: position.outputName } : {}),
+      ...(position.windowId ? { windowId: position.windowId } : {}),
     };
   },
   setAppLockIgnored(ignored) {

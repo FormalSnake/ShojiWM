@@ -145,13 +145,16 @@ fn center_anchor() -> crate::runtime_pointer_region::PointerRegionAnchor {
     crate::runtime_pointer_region::PointerRegionAnchor::Center
 }
 
-/// `COMPOSITOR.cursor.getPosition`: the cursor as of the last pointer motion.
+/// `COMPOSITOR.cursor.getPosition`: the cursor as of the last pointer motion
+/// or button press. `window_id` is the window whose surface the pointer is
+/// over, none over a layer surface, a decoration or the bare desk.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorPositionSnapshot {
     pub x: f64,
     pub y: f64,
     pub output_name: Option<String>,
+    pub window_id: Option<String>,
 }
 
 impl Cursor {

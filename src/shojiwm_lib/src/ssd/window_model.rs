@@ -308,6 +308,9 @@ pub struct GesturePinchEventSnapshot {
     pub delta_y: f64,
     pub position: Option<PointerMovePointSnapshot>,
     pub output_name: Option<String>,
+    /// The window whose surface the pointer is over, none over a layer
+    /// surface, a decoration or the bare desk.
+    pub window_id: Option<String>,
     pub timestamp: u64,
 }
 
@@ -322,6 +325,9 @@ pub struct TouchEventSnapshot {
     pub id: i32,
     pub position: Option<PointerMovePointSnapshot>,
     pub output_name: Option<String>,
+    /// The window whose surface the finger is over, none over a layer
+    /// surface, a decoration or the bare desk, and none once it has lifted.
+    pub window_id: Option<String>,
     pub fingers: u32,
     pub taken: bool,
     pub timestamp: u64,

@@ -107,6 +107,7 @@ impl ShojiWM {
                 y: position.y,
             }),
             output_name,
+            window_id: position.and_then(|position| self.window_id_under(position)),
             fingers: self.touch.points.len() as u32,
             taken: self.touch.taken,
             timestamp: u64::from(time_msec),
@@ -248,7 +249,10 @@ impl ShojiWM {
         if !self.touch.taken {
             touch.cancel(self);
         }
-        let slots: Vec<TouchSlot> = self.touch.points.keys().copied().collect();
+        // In the order of their ids, so a config hears the same touch end the
+        // same way every time.
+        let mut slots: Vec<TouchSlot> = self.touch.points.keys().copied().collect();
+        slots.sort_by_key(|slot| i32::from(*slot));
         self.touch.points.clear();
         for slot in slots {
             self.report_touch(TouchPhaseSnapshot::Cancel, slot, None, time_msec);

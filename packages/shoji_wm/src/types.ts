@@ -2763,6 +2763,11 @@ export interface CursorPosition {
   y: number;
   /** The output under the cursor. */
   outputName?: string;
+  /**
+   * The window whose surface the cursor is over. Absent over a layer
+   * surface, a decoration or the bare desk.
+   */
+  windowId?: string;
 }
 
 export interface BorderValue {

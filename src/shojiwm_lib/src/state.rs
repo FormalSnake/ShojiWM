@@ -4799,8 +4799,17 @@ impl ShojiWM {
     /// (client-acked) means this flips on only once the client has actually
     /// committed its fullscreen buffer, matching what is on screen.
     pub fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
-        // A window that floats over a fullscreen one (`aboveFullscreen`, a
-        // picture in picture) does not count: the first one under those does.
+        self.windows_for_output_top_to_bottom(output)
+            .first()
+            .is_some_and(|window| committed_fullscreen(window))
+    }
+
+    /// True when a fullscreen window is the topmost on `output` once the
+    /// windows that float over a fullscreen one (`aboveFullscreen`, a picture
+    /// in picture) are left out. This is for what fullscreen means to the
+    /// output (the pointer regions it turns off), not for stacking: with such
+    /// a window over it the Top layer is drawn, and hit, over both.
+    pub fn output_has_fullscreen_window_under_pictures(&self, output: &Output) -> bool {
         self.windows_for_output_top_to_bottom(output)
             .into_iter()
             .find(|window| {
@@ -4809,16 +4818,7 @@ impl ShojiWM {
                     .get(*window)
                     .is_some_and(|decoration| decoration.managed_window.above_fullscreen)
             })
-            .and_then(|window| window.toplevel())
-            .is_some_and(|toplevel| {
-                toplevel.with_committed_state(|state| {
-                    state.is_some_and(|state| {
-                        state.states.contains(
-                            smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
-                        )
-                    })
-                })
-            })
+            .is_some_and(committed_fullscreen)
     }
 
     pub fn surface_under(
@@ -6406,4 +6406,17 @@ mod subpixel_latch_tests {
         output.set_subpixel(resolve_output_subpixel(None, detected_subpixel(&output)));
         assert_eq!(output.physical_properties().subpixel, Subpixel::Unknown);
     }
+}
+
+/// Whether the client has committed the xdg Fullscreen state.
+fn committed_fullscreen(window: &Window) -> bool {
+    window.toplevel().is_some_and(|toplevel| {
+        toplevel.with_committed_state(|state| {
+            state.is_some_and(|state| {
+                state.states.contains(
+                    smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
+                )
+            })
+        })
+    })
 }

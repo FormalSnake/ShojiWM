@@ -1176,13 +1176,7 @@ impl ShojiWM {
             PointerRegionEventSnapshot, PointerRegionMotion, PointerRegionOutput,
         };
 
-        self.config_runtime
-            .host()
-            .set_cursor_position(crate::cursor::CursorPositionSnapshot {
-                x: pos.x,
-                y: pos.y,
-                output_name: self.output_at_point(pos).map(|output| output.name()),
-            });
+        self.publish_cursor_position(pos);
         if self.pointer_regions.is_empty() {
             return;
         }
@@ -1193,7 +1187,7 @@ impl ShojiWM {
                 Some(PointerRegionOutput {
                     name: output.name(),
                     geometry: self.space.output_geometry(output)?,
-                    fullscreen: self.output_has_topmost_fullscreen_window(output),
+                    fullscreen: self.output_has_fullscreen_window_under_pictures(output),
                 })
             })
             .collect();
@@ -1751,6 +1745,7 @@ impl ShojiWM {
                 y: position.y,
             }),
             output_name,
+            window_id: pointer_position.and_then(|position| self.window_id_under(position)),
             timestamp,
         };
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
@@ -2177,6 +2172,11 @@ impl ShojiWM {
                 // A pointer button press cancels a pending modifier tap (e.g. Super+drag).
                 if matches!(button_state, ButtonState::Pressed) {
                     self.modifier_tap.interrupt();
+                    // What is under the pointer may have changed since it last
+                    // moved; a config's press binding reads it as it is now.
+                    if let Some(pointer) = self.seat.get_pointer() {
+                        self.publish_cursor_position(pointer.current_location());
+                    }
                 }
 
                 if pointer_button_debug_enabled() {
@@ -3730,6 +3730,27 @@ impl ShojiWM {
                         == Some(&root)
             })
             .cloned()
+    }
+
+    /// The id of the window whose surface is the hit target at `pos`: none
+    /// where a layer surface, a decoration or nothing would take a press.
+    pub fn window_id_under(&self, pos: Point<f64, Logical>) -> Option<String> {
+        let (surface, _) = self.surface_under(pos)?;
+        let window = self.window_for_pointer_surface(&surface)?;
+        self.window_decorations
+            .get(&window)
+            .map(|decoration| decoration.snapshot.id.clone())
+    }
+
+    fn publish_cursor_position(&self, pos: Point<f64, Logical>) {
+        self.config_runtime
+            .host()
+            .set_cursor_position(crate::cursor::CursorPositionSnapshot {
+                x: pos.x,
+                y: pos.y,
+                output_name: self.output_at_point(pos).map(|output| output.name()),
+                window_id: self.window_id_under(pos),
+            });
     }
 
     pub(crate) fn window_for_pointer_surface(
