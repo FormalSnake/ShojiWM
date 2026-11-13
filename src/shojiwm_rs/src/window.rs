@@ -336,6 +336,13 @@ impl Window {
         self.act(WaylandWindowAction::FocusOnRequest);
     }
 
+    /// Hand the window to the button the pointer holds down: it is dragged
+    /// until the button is let go (`on_window_move` reports it), and its
+    /// client hears no more of the press. Nothing with no button down.
+    pub fn begin_move(&self) {
+        self.act(WaylandWindowAction::Move);
+    }
+
     /// Take the keyboard from the window if it has it; no window has it
     /// then. A layer surface holding the keyboard keeps it.
     pub fn unfocus(&self) {

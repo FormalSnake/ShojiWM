@@ -298,6 +298,29 @@ impl XwmHandler for ShojiWM {
 
     fn fullscreen_request(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
+    // Above and sticky are a window's wish and the config's to grant: the
+    // state is recorded so the config reads it off the window, and the
+    // client sees it took.
+    fn above_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let _ = window.set_above(true);
+        self.schedule_redraw();
+    }
+
+    fn unabove_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let _ = window.set_above(false);
+        self.schedule_redraw();
+    }
+
+    fn stick_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let _ = window.set_sticky(true);
+        self.schedule_redraw();
+    }
+
+    fn unstick_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let _ = window.set_sticky(false);
+        self.schedule_redraw();
+    }
+
     fn unfullscreen_request(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn resize_request(

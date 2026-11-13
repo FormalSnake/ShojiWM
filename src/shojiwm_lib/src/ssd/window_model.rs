@@ -84,15 +84,16 @@ pub struct WaylandWindowSnapshot {
 /// `_NET_WM_STATE` and `WM_NORMAL_HINTS` of an X11 window, as far as they say
 /// where it wants to be: a player kept over the other windows, on every
 /// desktop, at one aspect ratio.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct X11WindowStateSnapshot {
     /// `_NET_WM_STATE_ABOVE`.
     pub above: bool,
     /// `_NET_WM_STATE_STICKY`.
     pub sticky: bool,
-    /// The size hints give one aspect ratio as both the least and the most.
-    pub fixed_aspect: bool,
+    /// Width over height, where the size hints give one aspect ratio as both
+    /// the least and the most.
+    pub aspect: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -393,6 +394,8 @@ pub enum WindowMoveSourceSnapshot {
     Modifier,
     ClientCsd,
     Xwayland,
+    /// The config started it (`window.beginMove()`).
+    Config,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -937,6 +940,10 @@ pub enum WaylandWindowAction {
     /// Take the keyboard from the window if it has it. No window has it
     /// then, until one is focused.
     Unfocus,
+    /// Hand the window to the button the pointer holds down: it is dragged
+    /// until the button is let go, as if its client had asked for the move.
+    /// Nothing with no button down.
+    Move,
     ScheduleAnimation,
     CancelAnimation,
 }
@@ -1198,15 +1205,16 @@ impl ShojiWM {
             x11: Some(X11WindowStateSnapshot {
                 above: x11.is_above(),
                 sticky: x11.is_sticky(),
-                fixed_aspect: x11
+                aspect: x11
                     .size_hints()
                     .and_then(|hints| hints.aspect)
-                    .is_some_and(|(least, most)| {
+                    .filter(|(least, most)| {
                         least.numerator > 0
                             && least.denominator > 0
                             && i64::from(least.numerator) * i64::from(most.denominator)
                                 == i64::from(most.numerator) * i64::from(least.denominator)
-                    }),
+                    })
+                    .map(|(least, _)| f64::from(least.numerator) / f64::from(least.denominator)),
             }),
             pid: x11.pid().and_then(|pid| i32::try_from(pid).ok()),
         }

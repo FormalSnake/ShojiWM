@@ -3179,6 +3179,41 @@ impl ShojiWM {
         }
     }
 
+    /// `window.beginMove()`: the press the pointer holds becomes a move of
+    /// `window`, and its client hears no more of the press.
+    fn begin_window_move(&mut self, window: &Window) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        // Only a held button ends the grab again.
+        if !pointer.is_grabbed() || self.runtime_input_grab.is_some() || self.session_lock_active {
+            return;
+        }
+        let Some(location) = self.space.element_location(window) else {
+            return;
+        };
+        let rect = smithay::utils::Rectangle::new(location, window.geometry().size);
+        let event_rect = self.managed_resize_initial_rect(window, rect);
+        let start_data = compositor_pointer_grab_start_data(None, 0x110, pointer.current_location());
+        let mut grab = MoveSurfaceGrab::start(
+            start_data,
+            window.clone(),
+            location,
+            event_rect,
+            WindowMoveSourceSnapshot::Config,
+        );
+        grab.notify_start(self);
+        pointer.set_grab(
+            self,
+            grab,
+            SERIAL_COUNTER.next_serial(),
+            smithay::input::pointer::Focus::Clear,
+        );
+        pointer.frame(self);
+        let _ = self.display_handle.flush_clients();
+        self.schedule_redraw();
+    }
+
     pub(crate) fn apply_runtime_window_actions(&mut self, actions: Vec<RuntimeWindowAction>) {
         for runtime_action in actions {
             if matches!(
@@ -3292,6 +3327,7 @@ impl ShojiWM {
                         self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
                     }
                 }
+                crate::ssd::WaylandWindowAction::Move => self.begin_window_move(&window),
                 crate::ssd::WaylandWindowAction::FinalizeClose => {}
                 crate::ssd::WaylandWindowAction::ScheduleAnimation
                 | crate::ssd::WaylandWindowAction::CancelAnimation => {}
