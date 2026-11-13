@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use smithay::input::keyboard::{KeysymHandle, ModifiersState};
 use xkbcommon::xkb;
@@ -144,6 +145,32 @@ pub enum RuntimeWheelDirection {
     Down,
     Left,
     Right,
+}
+
+/// Hyprland's `binds:scroll_event_delay` at its default: once a scroll has
+/// been offered to the wheel bindings, the scrolls of the next 300 ms go to
+/// the client. A notch can come as several events (a high-resolution wheel
+/// sends fractions of one) and a flick of several notches is one binding.
+#[derive(Debug, Default)]
+pub struct WheelBindingGate {
+    offered: Option<Instant>,
+}
+
+impl WheelBindingGate {
+    pub const DELAY: Duration = Duration::from_millis(300);
+
+    /// Whether a scroll at `now` is offered to the bindings. Only one that
+    /// is starts the delay again, as Hyprland resets its timer only then.
+    pub fn offer(&mut self, now: Instant) -> bool {
+        if self
+            .offered
+            .is_some_and(|offered| now.saturating_duration_since(offered) < Self::DELAY)
+        {
+            return false;
+        }
+        self.offered = Some(now);
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -830,6 +857,21 @@ mod tests {
             entry("Super+A", RuntimeKeyBindingPhase::Press)
                 .compile()
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_wheel_bindings_take_one_scroll_per_delay() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut gate = WheelBindingGate::default();
+        let offered: Vec<bool> = [0, 1, 16, 299, 300, 450, 599, 600, 1200]
+            .into_iter()
+            .map(|ms| gate.offer(at(ms)))
+            .collect();
+        assert_eq!(
+            offered,
+            [true, false, false, false, true, false, false, true, true]
         );
     }
 }

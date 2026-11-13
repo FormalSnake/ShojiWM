@@ -587,6 +587,7 @@ pub struct ShojiWM {
     /// lets go.
     pub keyboard_devices: HashMap<String, crate::input::KeyboardDevice>,
     pub modifier_tap: crate::modifier_tap::ModifierTapTracker,
+    pub wheel_binding_gate: crate::runtime_key_binding::WheelBindingGate,
     pub pending_tap_binding_ids: Vec<String>,
     /// A binding whose key the keyboard filter left to the client, run right
     /// after.
@@ -2143,6 +2144,7 @@ impl ShojiWM {
             consumed_keys: HashSet::new(),
             keyboard_devices: HashMap::new(),
             modifier_tap: Default::default(),
+            wheel_binding_gate: Default::default(),
             pending_tap_binding_ids: Vec::new(),
             non_consuming_key_binding_id: None,
             pointer_focus_refresh_queued: false,

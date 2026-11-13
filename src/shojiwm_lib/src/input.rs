@@ -2898,7 +2898,11 @@ impl ShojiWM {
                 // Mouse-wheel shortcuts use the same configurable runtime
                 // binding path as keyboard shortcuts. Touchpad/finger scrolling
                 // remains continuous and is always forwarded to the client.
-                if source == AxisSource::Wheel
+                // Every scroll takes its turn at the gate, a touchpad's too,
+                // as in Hyprland.
+                let offered = self.wheel_binding_gate.offer(std::time::Instant::now());
+                if offered
+                    && source == AxisSource::Wheel
                     && (horizontal_amount != 0.0 || vertical_amount != 0.0)
                 {
                     self.modifier_tap.interrupt();
