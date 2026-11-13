@@ -278,24 +278,42 @@ fn vblank_grid(
 
 /// Each flip is a frame of its own, so it cannot share a presentation time with the previous
 /// one; that happens when a phase re-estimate or an event handled after the following vblank
-/// lands both on the same grid point. The bump is only one period past the grid: flips that
-/// come faster than the refresh period (tearing flips from a fullscreen game) would otherwise
-/// push the target a period further every flip, running seconds ahead of the clock over a long
-/// session, and every window animation sampled at that time finished instantly.
+/// lands both on the same grid point. `last_grid_next` is the previous flip's `grid_next`
+/// before this bump, never the bumped target: compared with a bumped target, the next flip's
+/// correct grid point reads as a duplicate whenever the bump was more than half a period off
+/// the grid (a late first event, a stall), and every later flip got bumped again, holding the
+/// target up to a period past the real vblank for as long as frames kept flipping. The bump is
+/// only one period past the grid: flips that come faster than the refresh period (tearing
+/// flips from a fullscreen game) would otherwise push the target a period further every flip.
 fn ratchet_frame_target(
-    last: Option<Duration>,
+    last_grid_next: Option<Duration>,
     grid_next: Duration,
     frame_duration: Duration,
 ) -> Duration {
-    match last {
-        Some(last)
-            if grid_next < last + frame_duration / 2
-                && last + frame_duration <= grid_next + frame_duration =>
-        {
-            last + frame_duration
+    match last_grid_next {
+        Some(last) if last <= grid_next && grid_next < last + frame_duration / 2 => {
+            grid_next + frame_duration
         }
         _ => grid_next,
     }
+}
+
+/// Records a flip observed at `observed` and returns the vblank it completed at and the next
+/// frame's presentation time, keeping `observations` and `last_grid_next` for the next flip.
+fn predict_next_frame(
+    observations: &mut std::collections::VecDeque<Duration>,
+    last_grid_next: &mut Option<Duration>,
+    observed: Duration,
+    period: Duration,
+) -> (Duration, Duration) {
+    if observations.len() == VBLANK_GRID_HISTORY {
+        observations.pop_front();
+    }
+    observations.push_back(observed);
+    let (vblank, grid_next) = vblank_grid(observations, observed, period);
+    let target = ratchet_frame_target(*last_grid_next, grid_next, period);
+    *last_grid_next = Some(grid_next);
+    (vblank, target)
 }
 
 fn sanitize_next_frame_target(
@@ -1140,8 +1158,8 @@ struct SurfaceData {
     next_frame_target: Option<Duration>,
     /// Recent flip-completion observations; see `vblank_grid`.
     vblank_observations: std::collections::VecDeque<Duration>,
-    /// The last `next_frame_target` derived from the vblank grid.
-    last_grid_frame_target: Option<Duration>,
+    /// The vblank after the last flip, on the grid and before `ratchet_frame_target`.
+    last_grid_next: Option<Duration>,
     estimated_render_duration: Duration,
     last_presented_at: Option<Duration>,
     last_frame_callback_at: Option<Duration>,
@@ -1531,7 +1549,7 @@ impl SurfaceData {
             frame_duration,
             next_frame_target: None,
             vblank_observations: std::collections::VecDeque::with_capacity(VBLANK_GRID_HISTORY),
-            last_grid_frame_target: None,
+            last_grid_next: None,
             estimated_render_duration: Duration::from_millis(4),
             last_presented_at: None,
             last_frame_callback_at: None,
@@ -2410,9 +2428,7 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 
 #[cfg(test)]
 mod vblank_grid_tests {
-    use super::{
-        VBLANK_GRID_HISTORY, ratchet_frame_target, sanitize_next_frame_target, vblank_grid,
-    };
+    use super::{VBLANK_GRID_HISTORY, predict_next_frame, sanitize_next_frame_target, vblank_grid};
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -2481,17 +2497,35 @@ mod vblank_grid_tests {
         // 200 fps for a minute on a 120 Hz output.
         for index in 0..12_000u32 {
             let observed = us(1_000_000.0 + f64::from(index) * 5_000.0);
-            if history.len() == VBLANK_GRID_HISTORY {
-                history.pop_front();
-            }
-            history.push_back(observed);
-            let grid_next = vblank_grid(&history, observed, period).1;
-            let target = ratchet_frame_target(last, grid_next, period);
-            last = Some(target);
+            let target = predict_next_frame(&mut history, &mut last, observed, period).1;
             assert!(
                 target <= observed + period * 2,
                 "flip {index}: target {target:?} ran ahead of observation {observed:?}"
             );
+        }
+    }
+
+    /// A first event handled 4.3 ms late, then prompt ones: the first target is that far off
+    /// the grid, and comparing the next grid point with it (rather than with the previous grid
+    /// point) bumped every later frame too, holding each target 4.3 ms past the real vblank.
+    #[test]
+    fn one_late_event_does_not_hold_later_targets_off_the_grid() {
+        let period = us(PERIOD_US);
+        let mut history = VecDeque::new();
+        let mut last = None;
+        for index in 0..200u32 {
+            let delay = if index == 0 { 4_300.0 } else { 100.0 };
+            let vblank = 1_000_000.0 + f64::from(index) * PERIOD_US;
+            let observed = us(vblank + delay);
+            let target = predict_next_frame(&mut history, &mut last, observed, period).1;
+            let target = target.as_secs_f64() * 1e6;
+            if index >= 2 {
+                let expected = vblank + PERIOD_US + 100.0;
+                assert!(
+                    (target - expected).abs() < 1.0,
+                    "flip {index}: target {target} us, the next vblank is {expected} us"
+                );
+            }
         }
     }
 
@@ -2930,21 +2964,12 @@ fn frame_finish(
     // leaves the time this event was dispatched — late by however long the main thread
     // was busy. Stepping a glide by those gaps (8, 12, 10.7, 10 ms while the display
     // flipped every 8.33) was the judder in kinetic scrolling.
-    if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
-        surface.vblank_observations.pop_front();
-    }
-    surface.vblank_observations.push_back(presentation_clock);
-    let (grid_vblank, mut next_frame_target) = vblank_grid(
-        &surface.vblank_observations,
+    let (grid_vblank, next_frame_target) = predict_next_frame(
+        &mut surface.vblank_observations,
+        &mut surface.last_grid_next,
         presentation_clock,
         surface.frame_duration,
     );
-    next_frame_target = ratchet_frame_target(
-        surface.last_grid_frame_target,
-        next_frame_target,
-        surface.frame_duration,
-    );
-    surface.last_grid_frame_target = Some(next_frame_target);
     surface.next_frame_target = Some(next_frame_target);
     if ShojiWM::motion_trace_enabled() {
         info!(
