@@ -7347,21 +7347,26 @@ mod kawase_plan_tests {
     fn taps_reach_as_far_as_hyprlands() {
         let radius = 8.0;
         for source in [(2560, 1440), (2560, 1600), (1601, 999)] {
-            let (sizes, plan) = kawase_plan(source, 3);
-            for pass in plan {
-                let read = sizes[pass.from];
-                let reach = [
-                    pass.half_pixel[0] * radius * read.0 as f32,
-                    pass.half_pixel[1] * radius * read.1 as f32,
-                ];
-                let expected = if pass.up { radius / 4.0 } else { radius };
-                // An odd level halves to a little under half, so its taps
-                // land a little short of or past the even case.
-                let slack = expected * 0.01;
-                assert!(
-                    reach.iter().all(|r| (r - expected).abs() <= slack),
-                    "{source:?} {pass:?}: taps reach {reach:?} texels, Hyprland's {expected}"
-                );
+            for passes in 1..=8 {
+                let (sizes, plan) = kawase_plan(source, passes);
+                for pass in plan {
+                    let read = sizes[pass.from];
+                    let reach = [
+                        pass.half_pixel[0] * radius * read.0 as f32,
+                        pass.half_pixel[1] * radius * read.1 as f32,
+                    ];
+                    let expected = if pass.up { radius / 4.0 } else { radius };
+                    // An odd level halves to a little under half, so its taps
+                    // land short of or past the even case by up to one texel
+                    // of the smaller of the two levels.
+                    let target = sizes[pass.to];
+                    let smaller = read.0.min(read.1).min(target.0).min(target.1);
+                    let slack = expected * 0.01f32.max(1.0 / smaller as f32);
+                    assert!(
+                        reach.iter().all(|r| (r - expected).abs() <= slack),
+                        "{source:?} {passes} passes, {pass:?}: taps reach {reach:?} texels, Hyprland's {expected}"
+                    );
+                }
             }
         }
     }
