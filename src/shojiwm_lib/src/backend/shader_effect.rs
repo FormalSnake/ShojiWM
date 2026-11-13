@@ -6308,40 +6308,67 @@ pub fn preblur_backdrop_texture(
 
     // Uncached fallback for callers that do not own persistent pipeline
     // state. Live framebuffer backdrops use the cached pyramid path above.
-    let mut levels = Vec::with_capacity(passes + 1);
-    let mut current = texture;
-    let mut current_size = size;
-    levels.push((current.clone(), current_size));
-
-    for _ in 0..passes {
-        let next_size = (max(1, current_size.0 / 2), max(1, current_size.1 / 2));
-        current = blur_texture_pass(
+    let (sizes, plan) = kawase_plan(size, passes);
+    let mut levels: Vec<Option<GlesTexture>> = vec![None; sizes.len()];
+    levels[0] = Some(texture);
+    for pass in plan {
+        let source = levels[pass.from]
+            .clone()
+            .expect("a kawase pass reads a level an earlier pass wrote");
+        let program = if pass.up { &programs.up } else { &programs.down };
+        levels[pass.to] = Some(blur_texture_pass(
             renderer,
-            current,
-            next_size,
-            &programs.down,
-            [0.5f32 / next_size.0 as f32, 0.5f32 / next_size.1 as f32],
+            source,
+            sizes[pass.to],
+            program,
+            pass.half_pixel,
             offset,
-        )?;
-        current_size = next_size;
-        levels.push((current.clone(), current_size));
+        )?);
     }
 
-    for idx in (1..levels.len()).rev() {
-        let (src_texture, src_size) = levels[idx].clone();
-        let dst_size = levels[idx - 1].1;
-        current = blur_texture_pass(
-            renderer,
-            src_texture,
-            dst_size,
-            &programs.up,
-            [0.5f32 / src_size.0 as f32, 0.5f32 / src_size.1 as f32],
-            offset,
-        )?;
-        levels[idx - 1].0 = current.clone();
-    }
+    Ok(levels[0].take().expect("the last upsample writes level 0"))
+}
 
-    Ok(current)
+/// One pass of the dual-Kawase chain: it reads pyramid level `from` and
+/// writes level `to`, one level smaller going down and one larger going up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KawasePass {
+    up: bool,
+    from: usize,
+    to: usize,
+    half_pixel: [f32; 2],
+}
+
+/// The level sizes (level 0 is the source) and the passes of a blur with
+/// `passes` halvings. `half_pixel` is half a texel of the pass's target in
+/// both directions, as KWin and Hyprland (`src/render/gl/blur/Kawase.cpp`)
+/// have it: the upsample reads a level half its target's size, and half a
+/// texel of that puts its eight taps twice as far apart, far enough that the
+/// gaps between them show the source through as a grid.
+fn kawase_plan(source_size: (i32, i32), passes: usize) -> (Vec<(i32, i32)>, Vec<KawasePass>) {
+    let mut sizes = vec![(source_size.0.max(1), source_size.1.max(1))];
+    for i in 1..=passes {
+        let (w, h) = sizes[i - 1];
+        sizes.push((max(1, w / 2), max(1, h / 2)));
+    }
+    let half_pixel = |level: usize| {
+        let (w, h) = sizes[level];
+        [0.5 / w as f32, 0.5 / h as f32]
+    };
+    let down = (1..=passes).map(|to| KawasePass {
+        up: false,
+        from: to - 1,
+        to,
+        half_pixel: half_pixel(to),
+    });
+    let up = (0..passes).rev().map(|to| KawasePass {
+        up: true,
+        from: to + 1,
+        to,
+        half_pixel: half_pixel(to),
+    });
+    let plan = down.chain(up).collect();
+    (sizes, plan)
 }
 
 /// Reuses textures held in `pyramid` across frames; only allocates on first
@@ -6369,50 +6396,27 @@ fn preblur_using_pyramid(
         TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(600)
     };
 
-    // Down-sample chain
-    let mut current_tex = source;
-    let mut current_size = source_size;
-    // Indexed on purpose: state carries across iterations, both forward and reversed.
-    #[allow(clippy::needless_range_loop)]
-    for i in 1..=passes {
-        let dst_size = (max(1, current_size.0 / 2), max(1, current_size.1 / 2));
-        let dst_tex = pyramid[i].clone();
+    let (sizes, plan) = kawase_plan(source_size, passes);
+    for pass in plan {
+        let source_tex = if pass.from == 0 { &source } else { &pyramid[pass.from] };
+        let (label, program) = if pass.up {
+            ("blur-upsample-pass", &programs.up)
+        } else {
+            ("blur-downsample-pass", &programs.down)
+        };
         blur_texture_pass_into(
             renderer,
-            &current_tex,
-            &dst_tex,
-            dst_size,
-            "blur-downsample-pass",
-            &programs.down,
-            [0.5f32 / dst_size.0 as f32, 0.5f32 / dst_size.1 as f32],
-            offset,
-        )?;
-        current_tex = dst_tex;
-        current_size = dst_size;
-        if stage_readback {
-            gap_stage_readback(renderer, &format!("blur-down-{i}"), &current_tex);
-        }
-    }
-
-    // Up-sample chain, writing back into the larger pyramid level each step.
-    // The final result lands in `pyramid[0]`.
-    for i in (0..passes).rev() {
-        let src_tex = pyramid[i + 1].clone();
-        let src_size = (src_tex.size().w, src_tex.size().h);
-        let dst_tex = pyramid[i].clone();
-        let dst_size = (dst_tex.size().w, dst_tex.size().h);
-        blur_texture_pass_into(
-            renderer,
-            &src_tex,
-            &dst_tex,
-            dst_size,
-            "blur-upsample-pass",
-            &programs.up,
-            [0.5f32 / src_size.0 as f32, 0.5f32 / src_size.1 as f32],
+            source_tex,
+            &pyramid[pass.to],
+            sizes[pass.to],
+            label,
+            program,
+            pass.half_pixel,
             offset,
         )?;
         if stage_readback {
-            gap_stage_readback(renderer, &format!("blur-up-{i}"), &dst_tex);
+            let direction = if pass.up { "up" } else { "down" };
+            gap_stage_readback(renderer, &format!("blur-{direction}-{}", pass.to), &pyramid[pass.to]);
         }
     }
 
@@ -7261,5 +7265,48 @@ mod frame_rect_tests {
         assert_eq!(pixel(22, 20).1, 0, "left of the clip (x < 25)");
         assert_eq!(pixel(50, 20).1, 255, "inside the clip");
         assert_eq!(pixel(10, 20), (0, 0), "outside the frame");
+    }
+}
+
+#[cfg(test)]
+mod kawase_plan_tests {
+    use super::*;
+
+    #[test]
+    fn passes_walk_the_pyramid_down_then_back_up() {
+        let (sizes, plan) = kawase_plan((2560, 1440), 2);
+        assert_eq!(sizes, vec![(2560, 1440), (1280, 720), (640, 360)]);
+        let steps: Vec<_> = plan.iter().map(|pass| (pass.up, pass.from, pass.to)).collect();
+        assert_eq!(
+            steps,
+            vec![(false, 0, 1), (false, 1, 2), (true, 2, 1), (true, 1, 0)]
+        );
+    }
+
+    /// Hyprland's blur at `size` 8 against its full-size framebuffer
+    /// (Kawase.cpp's halfpixel of 0.5 / (w / 2) down and 0.5 / (w * 2) up):
+    /// a downsample's taps sit 8 texels out in the level it reads, an
+    /// upsample's diagonal taps 2.
+    #[test]
+    fn taps_reach_as_far_as_hyprlands() {
+        let radius = 8.0;
+        for source in [(2560, 1440), (2560, 1600), (1601, 999)] {
+            let (sizes, plan) = kawase_plan(source, 3);
+            for pass in plan {
+                let read = sizes[pass.from];
+                let reach = [
+                    pass.half_pixel[0] * radius * read.0 as f32,
+                    pass.half_pixel[1] * radius * read.1 as f32,
+                ];
+                let expected = if pass.up { radius / 4.0 } else { radius };
+                // An odd level halves to a little under half, so its taps
+                // land a little short of or past the even case.
+                let slack = expected * 0.01;
+                assert!(
+                    reach.iter().all(|r| (r - expected).abs() <= slack),
+                    "{source:?} {pass:?}: taps reach {reach:?} texels, Hyprland's {expected}"
+                );
+            }
+        }
     }
 }
