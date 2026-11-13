@@ -10,7 +10,9 @@
 //! destruction clears smithay's, and the next one takes its place). So the
 //! filter holds the requests that set state back and decides at `commit`,
 //! against the input method that would hear them: they go to smithay before
-//! the `commit`, or are dropped. What is held back across a lock or an unlock
+//! the `commit`, or are dropped. Smithay keeps one pending value per field,
+//! `enable` and `disable` sharing one, so the filter keeps the last request
+//! of each kind: a client that never commits holds five at most. What is held back across a lock or an unlock
 //! is dropped too. `commit` itself always goes through: smithay counts commits
 //! for the serial of its `done` events.
 
@@ -104,11 +106,25 @@ struct TextInputFilter {
     held: Mutex<Held>,
 }
 
-/// The requests since the last `commit`, and the lock state they came in.
+/// The last request of each kind since the last `commit`, and the lock
+/// state they came in.
 #[derive(Default)]
 struct Held {
     epoch: u64,
-    requests: Vec<Message<ObjectId, OwnedFd>>,
+    requests: [Option<Message<ObjectId, OwnedFd>>; 5],
+}
+
+/// Where a request that sets state is held, by the pending field smithay
+/// sets with it.
+fn held_slot(opcode: u16) -> Option<usize> {
+    match opcode {
+        zwp_text_input_v3::REQ_ENABLE_OPCODE | zwp_text_input_v3::REQ_DISABLE_OPCODE => Some(0),
+        zwp_text_input_v3::REQ_SET_SURROUNDING_TEXT_OPCODE => Some(1),
+        zwp_text_input_v3::REQ_SET_TEXT_CHANGE_CAUSE_OPCODE => Some(2),
+        zwp_text_input_v3::REQ_SET_CONTENT_TYPE_OPCODE => Some(3),
+        zwp_text_input_v3::REQ_SET_CURSOR_RECTANGLE_OPCODE => Some(4),
+        _ => None,
+    }
 }
 
 impl ObjectData<ShojiWM> for TextInputFilter {
@@ -119,27 +135,24 @@ impl ObjectData<ShojiWM> for TextInputFilter {
         client_id: ClientId,
         msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData<ShojiWM>>> {
-        match msg.opcode {
-            zwp_text_input_v3::REQ_ENABLE_OPCODE
-            | zwp_text_input_v3::REQ_DISABLE_OPCODE
-            | zwp_text_input_v3::REQ_SET_SURROUNDING_TEXT_OPCODE
-            | zwp_text_input_v3::REQ_SET_TEXT_CHANGE_CAUSE_OPCODE
-            | zwp_text_input_v3::REQ_SET_CONTENT_TYPE_OPCODE
-            | zwp_text_input_v3::REQ_SET_CURSOR_RECTANGLE_OPCODE => {
-                let mut held = self.held.lock().unwrap();
-                if held.epoch != state.text_input_epoch {
-                    held.requests.clear();
-                    held.epoch = state.text_input_epoch;
-                }
-                held.requests.push(msg);
-                None
+        if let Some(slot) = held_slot(msg.opcode) {
+            let mut held = self.held.lock().unwrap();
+            if held.epoch != state.text_input_epoch {
+                *held = Held {
+                    epoch: state.text_input_epoch,
+                    ..Held::default()
+                };
             }
+            held.requests[slot] = Some(msg);
+            return None;
+        }
+        match msg.opcode {
             zwp_text_input_v3::REQ_COMMIT_OPCODE => {
                 let held = std::mem::take(&mut *self.held.lock().unwrap());
                 if held.epoch == state.text_input_epoch
                     && (!state.session_lock_active || state.input_method_is_lockers())
                 {
-                    for request in held.requests {
+                    for request in held.requests.into_iter().flatten() {
                         forward_request(
                             self.clone(),
                             self.inner.clone(),

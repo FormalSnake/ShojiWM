@@ -139,10 +139,12 @@ impl ObjectData<ShojiWM> for InputMethodShim {
                 _ => {}
             }
         }
+        let inner = self.inner.clone();
         if msg.opcode == zwp_input_method_v2::REQ_GRAB_KEYBOARD_OPCODE {
             state.input_method_grab = new_object_id(&msg);
+            return forward_request(self, inner, handle, state, client_id, msg)
+                .map(|inner| Arc::new(GrabShim { inner }) as Arc<dyn ObjectData<ShojiWM>>);
         }
-        let inner = self.inner.clone();
         forward_request(self, inner, handle, state, client_id, msg)
     }
 
@@ -158,6 +160,49 @@ impl ObjectData<ShojiWM> for InputMethodShim {
         self.inner
             .clone()
             .destroyed(handle, state, client_id, object_id);
+    }
+}
+
+/// A `zwp_input_method_keyboard_grab_v2` smithay made, in front of its
+/// object data. Every grab object of the seat shares smithay's one grab, and
+/// smithay's destructor clears it and unsets the seat's keyboard grab
+/// whichever object goes. Only the destruction of the grab the keys go to
+/// reaches it, and only while that grab holds the keyboard: an older grab's
+/// `release` would end the live one.
+struct GrabShim {
+    inner: Arc<dyn ObjectData<ShojiWM>>,
+}
+
+impl ObjectData<ShojiWM> for GrabShim {
+    fn request(
+        self: Arc<Self>,
+        handle: &Handle,
+        state: &mut ShojiWM,
+        client_id: ClientId,
+        msg: Message<ObjectId, OwnedFd>,
+    ) -> Option<Arc<dyn ObjectData<ShojiWM>>> {
+        let inner = self.inner.clone();
+        forward_request(self, inner, handle, state, client_id, msg)
+    }
+
+    fn destroyed(
+        self: Arc<Self>,
+        handle: &Handle,
+        state: &mut ShojiWM,
+        client_id: ClientId,
+        object_id: ObjectId,
+    ) {
+        if state.input_method_grab.as_ref() != Some(&object_id) {
+            return;
+        }
+        state.input_method_grab = None;
+        // The lock may have taken the keyboard from this grab, and the seat
+        // may hold another grab by now.
+        if state.input_method_holds_keyboard() {
+            self.inner
+                .clone()
+                .destroyed(handle, state, client_id, object_id);
+        }
     }
 }
 

@@ -147,7 +147,8 @@ keyboard's even when a binding took the modifier key, and a keyboard unplugged
 or a switch to another VT lets go of the keys it held in the client. While
 the session is locked, no input method or menu keyboard grab but the locker's
 own hears a key, and an input method has to grab the keyboard again after the unlock (fcitx5 and
-ibus do when they are next activated). A key held across the unlock goes no
+ibus do when they are next activated). An older grab released under the lock
+leaves the locker's own in place. A key held across the unlock goes no
 further than the locker. Under the lock the virtual keyboard of a client that
 has been an input method cannot type, even after it gave the input method up;
 any other, such as an on-screen keyboard, types into the locker. ShojiWM knows
@@ -165,7 +166,7 @@ hears a text input's state under the lock (activation, content type,
 surrounding text, cursor rectangle), so a password field reaches none of
 them. That is decided at each commit, against the input method the state
 would go to, and state left uncommitted when the session locks or unlocks is
-dropped. After the unlock the input method starts again from a deactivate; and a panel mapped on demand behind
+dropped. Until a commit only the last value of each kind is kept. After the unlock the input method starts again from a deactivate; and a panel mapped on demand behind
 the lock screen does not take the keyboard at the unlock. A button held on the
 lock screen at the unlock comes up there, and its own release goes nowhere.
 `nonConsuming: true` runs the handler and still delivers the key or the button

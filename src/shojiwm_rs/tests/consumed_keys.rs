@@ -1222,6 +1222,50 @@ fn the_lockers_input_method_keeps_its_keyboard_grab_under_the_lock() {
     unlock(&mut session, locked);
 }
 
+/// Another client's input method held a keyboard grab from before the lock
+/// and releases it while the locker's own input method holds the keyboard,
+/// with a key down through the locker's grab.
+#[test]
+fn a_grab_from_before_the_lock_released_leaves_the_lockers_grab() {
+    let mut session = focused_session();
+    let im = session.connect("input-method");
+    let peer = &session.peers[im];
+    let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let input_method = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    let stale = input_method.grab_keyboard(&peer.queue.handle(), ());
+    session.roundtrip();
+    assert_eq!(take(&IM_SEEN), vec![Seen::Mods(0)]);
+    let locked = lock(&mut session);
+
+    let locker_im = locker_input_method(&mut session);
+    let grab = locker_im.grab_keyboard(&session.peers[locker(&session)].queue.handle(), ());
+    session.roundtrip();
+    assert_eq!(take(&LOCKER_IM_SEEN), vec![Seen::Mods(0)]);
+    press(&mut session, K);
+    stale.release();
+    session.roundtrip();
+    release(&mut session, K);
+    assert_eq!(take(&LOCKER_IM_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+    press(&mut session, K);
+    release(&mut session, K);
+    assert_eq!(take(&LOCKER_IM_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+    assert!(session.state.seat.get_keyboard().unwrap().is_grabbed());
+    assert_eq!(take(&LOCKER_SEEN), vec![]);
+    assert_eq!(take(&IM_SEEN), vec![]);
+
+    // The locker's own release still ends its grab.
+    grab.release();
+    session.roundtrip();
+    assert!(!session.state.seat.get_keyboard().unwrap().is_grabbed());
+    press(&mut session, K);
+    release(&mut session, K);
+    assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+    assert_eq!(take(&LOCKER_IM_SEEN), vec![]);
+    unlock(&mut session, locked);
+}
+
 /// An input method refused a grab under the lock while the locker's own
 /// input method holds the keyboard, and an on-screen keyboard presses Shift.
 #[test]
