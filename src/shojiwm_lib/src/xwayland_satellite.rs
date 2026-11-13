@@ -3,7 +3,7 @@ use smithay::reexports::rustix::{
     self,
     fs::{OFlags, lstat, mkdir, open, unlink},
     io::{Errno, FdFlags, fcntl_setfd},
-    process::{getpid, getuid},
+    process::{Pid, getpid, getuid, test_kill_process},
 };
 use std::{
     ffi::OsString,
@@ -430,8 +430,15 @@ fn reserve_x11_display(start: u32) -> Result<ReservedX11Display, Box<dyn std::er
     for display_number in start..start + 50 {
         let lock_path = PathBuf::from(format!("/tmp/.X{display_number}-lock"));
         let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL;
-        let Ok(lock_fd) = open(&lock_path, flags, 0o444.into()) else {
-            continue;
+        let lock_fd = match open(&lock_path, flags, 0o444.into()) {
+            Ok(lock_fd) => lock_fd,
+            Err(_) if reclaim_stale_lock(&lock_path) => {
+                let Ok(lock_fd) = open(&lock_path, flags, 0o444.into()) else {
+                    continue;
+                };
+                lock_fd
+            }
+            Err(_) => continue,
         };
         let lock_guard = UnlinkGuard(lock_path);
 
@@ -461,6 +468,28 @@ fn reserve_x11_display(start: u32) -> Result<ReservedX11Display, Box<dyn std::er
     }
 
     Err(io::Error::other("no free X11 display found").into())
+}
+
+/// Removes a display lock left by a server that is gone: its pid, as the X
+/// lock format writes it, names no process. A lock that cannot be read, or
+/// another user's in sticky /tmp, stays. Xorg and wlroots do the same.
+fn reclaim_stale_lock(lock_path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(lock_path) else {
+        return false;
+    };
+    let Some(pid) = contents.trim().parse().ok().and_then(Pid::from_raw) else {
+        return false;
+    };
+    if test_kill_process(pid) != Err(Errno::SRCH) {
+        return false;
+    }
+    match unlink(lock_path) {
+        Ok(()) => {
+            info!(lock = ?lock_path, pid = pid.as_raw_nonzero(), "reclaimed the X11 lock of a server that is gone");
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn x11_socket_is_in_use(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -499,7 +528,20 @@ fn bind_to_unix_socket(
 ) -> Result<(UnixListener, UnlinkGuard), Box<dyn std::error::Error>> {
     let path = PathBuf::from(format!("/tmp/.X11-unix/X{display_number}"));
     let addr = SocketAddr::from_pathname(&path)?;
-    let listener = bind_to_socket(&addr)?;
+    let listener = match UnixListener::bind_addr(&addr) {
+        Ok(listener) => listener,
+        // A socket file nothing accepts on is a dead server's; one that
+        // answers belongs to a live one and stays.
+        Err(error)
+            if error.kind() == io::ErrorKind::AddrInUse
+                && UnixStream::connect(&path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionRefused) =>
+        {
+            unlink(&path)?;
+            bind_to_socket(&addr)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     Ok((listener, UnlinkGuard(path)))
 }
 
@@ -695,6 +737,42 @@ mod tests {
         fn drop(&mut self) {
             self.remove();
         }
+    }
+
+    #[test]
+    fn reclaims_the_lock_and_socket_of_a_server_that_is_gone() {
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = gone.id();
+        gone.wait().expect("reap");
+        let lock = format!("/tmp/.X{}-lock", paths.start());
+        fs::write(&lock, format!("{pid:>10}\n")).expect("write a stale lock");
+        // Its pathname socket outlives it too: bound, never unlinked.
+        let socket = PathBuf::from(format!("{X11_TMP_UNIX_DIR}/X{}", paths.start()));
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("leave a socket file"));
+
+        let reservation = reserve_x11_display(paths.start()).expect("reserve display");
+
+        assert_eq!(reservation.0, paths.start());
+        let owner: u32 = fs::read_to_string(&lock).unwrap().trim().parse().unwrap();
+        assert_eq!(owner, std::process::id());
+        drop(reservation);
+    }
+
+    #[test]
+    fn keeps_the_lock_of_a_server_that_lives() {
+        ensure_x11_unix_dir().expect("prepare X11 socket directory");
+        let paths = TestDisplayPaths::new();
+        let lock = format!("/tmp/.X{}-lock", paths.start());
+        let alive = format!("{:>10}\n", std::process::id());
+        fs::write(&lock, &alive).expect("write a live lock");
+
+        let reservation = reserve_x11_display(paths.start()).expect("reserve next display");
+
+        assert_eq!(reservation.0, paths.start() + 1);
+        assert_eq!(fs::read_to_string(&lock).unwrap(), alive);
+        drop(reservation);
     }
 
     #[test]
