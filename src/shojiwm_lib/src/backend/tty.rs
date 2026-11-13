@@ -432,6 +432,14 @@ impl FlipClock {
         (vblank, target)
     }
 
+    /// The output's refresh period: the last accepted fit to its driver timestamps, or `mode`
+    /// until there is one. A rejected fit starts again and keeps the last accepted one.
+    fn period(&self, mode: Duration) -> Duration {
+        self.fitted_period
+            .filter(|_| self.mode_period == mode)
+            .unwrap_or(mode)
+    }
+
     /// The grid `queue_in_flight` may place a commit on: the vblank after the last flip, while
     /// every observation it was fitted to is a driver timestamp. Those are taken in the kernel
     /// as the flip is reported (NVIDIA's are `ktime_get()` in its nvidia-modeset thread, since
@@ -441,14 +449,6 @@ impl FlipClock {
     /// fit with no spread to show for it: 32 flips handled 1.2 ms late at 60 Hz put the grid
     /// there, and a commit that missed the real vblank was placed on it, its successor sampled
     /// a period early. Until such an observation leaves the history, commits are left unknown.
-    /// The output's refresh period: the last accepted fit to its driver timestamps, or `mode`
-    /// until there is one. A rejected fit starts again and keeps the last accepted one.
-    fn period(&self, mode: Duration) -> Duration {
-        self.fitted_period
-            .filter(|_| self.mode_period == mode)
-            .unwrap_or(mode)
-    }
-
     fn placement_grid(&self) -> Option<Duration> {
         self.last_grid_next
             .filter(|_| self.kernel_timed >= self.observations.len())
