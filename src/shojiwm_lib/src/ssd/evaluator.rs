@@ -363,6 +363,9 @@ pub struct RuntimeEventConfigUpdate {
     /// Touchpad pinches (`RuntimeEvent::GesturePinch`).
     #[serde(default)]
     pub gesture_pinch_async: bool,
+    /// Touchscreen touches (`RuntimeEvent::Touch`).
+    #[serde(default)]
+    pub touch_async: bool,
     /// Drag and drop events (`InputRequest::Dnd`).
     #[serde(default)]
     pub dnd: bool,

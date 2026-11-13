@@ -212,6 +212,8 @@ pub enum RuntimeEvent {
     GestureSwipe(GestureSwipeEventSnapshot),
     /// Touchpad pinches, delivered without waiting for a result.
     GesturePinch(crate::ssd::GesturePinchEventSnapshot),
+    /// Touchscreen touches, delivered without waiting for a result.
+    Touch(crate::ssd::TouchEventSnapshot),
 }
 
 /// One change to a decoration tree the compositor already holds, returned by

@@ -11,6 +11,11 @@
 //!
 //! ```text
 //! client -> server   "quit\n" | "reload\n" | "key <chord> [<hold-ms>]\n"
+//!                    | "pointer <x> <y>\n" | "button press|release\n"
+//!                    | "touch down|move <id> <x> <y>\n" | "touch up <id>\n"
+//!                    | "touch cancel\n" | "pinch begin <fingers>\n"
+//!                    | "pinch update <scale> [<dx> <dy>]\n"
+//!                    | "pinch end|cancel\n"
 //! server -> client   "ok\n" | "error: <message>\n"
 //! ```
 //!
@@ -19,6 +24,12 @@
 //! key binds (see [`crate::virtual_input`]). `key XF86AudioRaiseVolume 800`
 //! holds it for 800 ms before the release, long enough for key repeat. The
 //! answer comes once the event loop has pressed the chord.
+//!
+//! The rest drive a session no hand is on, a test rig's: `pointer` moves the
+//! cursor to a global logical position and `button` presses or releases the
+//! left button there, `touch` is one finger of a touchscreen, and `pinch` a
+//! touchpad pinch as libinput reports one (`scale` is the spread since the
+//! start, `dx` and `dy` the movement since the last update).
 
 use std::{
     ffi::OsStr,
@@ -35,7 +46,10 @@ use smithay::reexports::calloop::{
 use std::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::state::ShojiWM;
+use crate::{
+    state::ShojiWM,
+    virtual_input::{VirtualPinch, VirtualTouch},
+};
 
 pub const SOCKET_ENV: &str = "SHOJIWM_SOCKET";
 
@@ -43,7 +57,7 @@ pub const SOCKET_ENV: &str = "SHOJIWM_SOCKET";
 /// that connects and then says nothing ever waits this long.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Quit,
     Reload,
@@ -53,6 +67,15 @@ pub enum Command {
         chord: String,
         hold_ms: u32,
     },
+    Pointer {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        pressed: bool,
+    },
+    Touch(VirtualTouch),
+    Pinch(VirtualPinch),
 }
 
 impl Command {
@@ -62,7 +85,63 @@ impl Command {
             Self::Reload => "reload".into(),
             Self::Key { chord, hold_ms: 0 } => format!("key {chord}"),
             Self::Key { chord, hold_ms } => format!("key {chord} {hold_ms}"),
+            Self::Pointer { x, y } => format!("pointer {x} {y}"),
+            Self::Button { pressed: true } => "button press".into(),
+            Self::Button { pressed: false } => "button release".into(),
+            Self::Touch(VirtualTouch::Down { id, x, y }) => format!("touch down {id} {x} {y}"),
+            Self::Touch(VirtualTouch::Motion { id, x, y }) => format!("touch move {id} {x} {y}"),
+            Self::Touch(VirtualTouch::Up { id }) => format!("touch up {id}"),
+            Self::Touch(VirtualTouch::Cancel) => "touch cancel".into(),
+            Self::Pinch(VirtualPinch::Begin { fingers }) => format!("pinch begin {fingers}"),
+            Self::Pinch(VirtualPinch::Update { scale, dx, dy }) => {
+                format!("pinch update {scale} {dx} {dy}")
+            }
+            Self::Pinch(VirtualPinch::End { cancelled: false }) => "pinch end".into(),
+            Self::Pinch(VirtualPinch::End { cancelled: true }) => "pinch cancel".into(),
         }
+    }
+
+    /// The commands that drive input, by their words.
+    fn parse_input(words: &[&str]) -> Option<Self> {
+        let number = |word: &&str| word.parse::<f64>().ok().filter(|value| value.is_finite());
+        Some(match words {
+            ["pointer", x, y] => Self::Pointer {
+                x: number(x)?,
+                y: number(y)?,
+            },
+            ["button", "press"] => Self::Button { pressed: true },
+            ["button", "release"] => Self::Button { pressed: false },
+            ["touch", "down", id, x, y] => Self::Touch(VirtualTouch::Down {
+                id: id.parse().ok()?,
+                x: number(x)?,
+                y: number(y)?,
+            }),
+            ["touch", "move", id, x, y] => Self::Touch(VirtualTouch::Motion {
+                id: id.parse().ok()?,
+                x: number(x)?,
+                y: number(y)?,
+            }),
+            ["touch", "up", id] => Self::Touch(VirtualTouch::Up {
+                id: id.parse().ok()?,
+            }),
+            ["touch", "cancel"] => Self::Touch(VirtualTouch::Cancel),
+            ["pinch", "begin", fingers] => Self::Pinch(VirtualPinch::Begin {
+                fingers: fingers.parse().ok().filter(|fingers| *fingers >= 2)?,
+            }),
+            ["pinch", "update", scale] => Self::Pinch(VirtualPinch::Update {
+                scale: number(scale).filter(|scale| *scale > 0.0)?,
+                dx: 0.0,
+                dy: 0.0,
+            }),
+            ["pinch", "update", scale, dx, dy] => Self::Pinch(VirtualPinch::Update {
+                scale: number(scale).filter(|scale| *scale > 0.0)?,
+                dx: number(dx)?,
+                dy: number(dy)?,
+            }),
+            ["pinch", "end"] => Self::Pinch(VirtualPinch::End { cancelled: false }),
+            ["pinch", "cancel"] => Self::Pinch(VirtualPinch::End { cancelled: true }),
+            _ => return None,
+        })
     }
 
     fn parse(line: &str) -> Option<Self> {
@@ -71,6 +150,10 @@ impl Command {
             "quit" => Some(Self::Quit),
             "reload" => Some(Self::Reload),
             _ => {
+                let all: Vec<&str> = line.split_whitespace().collect();
+                if let Some(command) = Self::parse_input(&all) {
+                    return Some(command);
+                }
                 let mut words = line.strip_prefix("key ")?.split_whitespace();
                 let chord = words.next()?.to_string();
                 let hold_ms = match words.next() {
@@ -146,6 +229,19 @@ pub fn start(
                     Ok(())
                 }
                 Command::Key { chord, hold_ms } => state.inject_key_chord(&chord, hold_ms),
+                Command::Pointer { x, y } => state.inject_pointer(x, y),
+                Command::Button { pressed } => {
+                    state.inject_button(pressed);
+                    Ok(())
+                }
+                Command::Touch(touch) => {
+                    state.inject_touch(touch);
+                    Ok(())
+                }
+                Command::Pinch(pinch) => {
+                    state.inject_pinch(pinch);
+                    Ok(())
+                }
             };
             let _ = reply.send(result);
         }
@@ -238,7 +334,7 @@ pub fn send(command: Command) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Command;
+    use super::{Command, VirtualPinch, VirtualTouch};
 
     #[test]
     fn commands_round_trip_through_their_line() {
@@ -259,6 +355,58 @@ mod tests {
                 Some(command)
             );
         }
+    }
+
+    #[test]
+    fn input_commands_round_trip_through_their_line() {
+        for command in [
+            Command::Pointer { x: 812.5, y: 40.0 },
+            Command::Button { pressed: true },
+            Command::Button { pressed: false },
+            Command::Touch(VirtualTouch::Down {
+                id: 1,
+                x: 300.0,
+                y: 220.5,
+            }),
+            Command::Touch(VirtualTouch::Motion {
+                id: 0,
+                x: -40.0,
+                y: 9.0,
+            }),
+            Command::Touch(VirtualTouch::Up { id: 1 }),
+            Command::Touch(VirtualTouch::Cancel),
+            Command::Pinch(VirtualPinch::Begin { fingers: 2 }),
+            Command::Pinch(VirtualPinch::Update {
+                scale: 1.35,
+                dx: 4.0,
+                dy: -2.5,
+            }),
+            Command::Pinch(VirtualPinch::End { cancelled: false }),
+            Command::Pinch(VirtualPinch::End { cancelled: true }),
+        ] {
+            assert_eq!(
+                Command::parse(&format!("{}\n", command.to_line())),
+                Some(command)
+            );
+        }
+    }
+
+    #[test]
+    fn input_commands_refuse_what_no_device_would_send() {
+        assert_eq!(
+            Command::parse("pinch update 1.2"),
+            Some(Command::Pinch(VirtualPinch::Update {
+                scale: 1.2,
+                dx: 0.0,
+                dy: 0.0
+            }))
+        );
+        assert_eq!(Command::parse("pinch update 0"), None);
+        assert_eq!(Command::parse("pinch begin 1"), None);
+        assert_eq!(Command::parse("touch down 0 nan 4"), None);
+        assert_eq!(Command::parse("touch down 0 4"), None);
+        assert_eq!(Command::parse("pointer 4"), None);
+        assert_eq!(Command::parse("button hold"), None);
     }
 
     #[test]

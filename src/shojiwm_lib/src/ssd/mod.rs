@@ -51,6 +51,7 @@ pub use popup::{
 pub(crate) use popup_input::PopupInputState;
 pub use window_model::{
     GesturePinchEventSnapshot, GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
+    TouchEventSnapshot, TouchPhaseSnapshot,
     HdmiLinkSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
     ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
     ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
@@ -61,8 +62,8 @@ pub use window_model::{
     PointerMovePointSnapshot, PopupParentKindSnapshot, TransformOrigin, WaylandLayerSnapshot,
     WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
     WindowActivateRequestEventSnapshot, WindowActivateRequestSourceSnapshot, WindowContentType,
-    WindowDecorationClientSnapshot, WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
     X11WindowStateSnapshot,
+    WindowDecorationClientSnapshot, WindowDecorationDecisionSnapshot, WindowDecorationModeSnapshot,
     WindowDecorationPolicyContextSnapshot, WindowDecorationPolicyReasonSnapshot,
     WindowDecorationProtocolSnapshot, WindowDecorationStateSnapshot,
     WindowFullscreenRequestEventSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,

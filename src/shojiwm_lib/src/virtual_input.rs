@@ -230,6 +230,24 @@ impl InputBackend for VirtualInput {
     type SpecialEvent = ();
 }
 
+/// A touchscreen finger from the control socket or a test, in global
+/// logical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VirtualTouch {
+    Down { id: u32, x: f64, y: f64 },
+    Motion { id: u32, x: f64, y: f64 },
+    Up { id: u32 },
+    Cancel,
+}
+
+/// A touchpad pinch from the control socket or a test.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VirtualPinch {
+    Begin { fingers: u32 },
+    Update { scale: f64, dx: f64, dy: f64 },
+    End { cancelled: bool },
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AxisAmount {
     pub value: Option<f64>,
@@ -461,6 +479,94 @@ impl ShojiWM {
             return Err(format!("could not schedule the release: {error}"));
         }
         Ok(())
+    }
+
+    fn control_pointer() -> VirtualDevice {
+        VirtualDevice {
+            id: "shojiwm-control-pointer".into(),
+            name: "ShojiWM control socket pointer".into(),
+            keyboard: false,
+        }
+    }
+
+    /// Move the pointer to a global logical position, as relative motion from
+    /// where it is.
+    pub fn inject_pointer(&mut self, x: f64, y: f64) -> Result<(), String> {
+        let from = self
+            .seat
+            .get_pointer()
+            .ok_or_else(|| "the seat has no pointer".to_string())?
+            .current_location();
+        self.process_input_event(InputEvent::<VirtualInput>::PointerMotion {
+            event: VirtualMotion {
+                device: Self::control_pointer(),
+                time: self.virtual_input_time(),
+                dx: x - from.x,
+                dy: y - from.y,
+            },
+        });
+        Ok(())
+    }
+
+    /// Press or release the left button where the pointer is.
+    pub fn inject_button(&mut self, pressed: bool) {
+        self.process_input_event(InputEvent::<VirtualInput>::PointerButton {
+            event: VirtualButton {
+                device: Self::control_pointer(),
+                time: self.virtual_input_time(),
+                button: 0x110,
+                state: if pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                },
+            },
+        });
+    }
+
+    /// One finger of a touchscreen at a global logical position. Each call
+    /// is a frame of its own.
+    pub fn inject_touch(&mut self, touch: VirtualTouch) {
+        let time = (self.virtual_input_time() / 1000) as u32;
+        match touch {
+            VirtualTouch::Down { id, x, y } => {
+                self.touch_down_at(Some(id).into(), (x, y).into(), time)
+            }
+            VirtualTouch::Motion { id, x, y } => {
+                self.touch_motion_at(Some(id).into(), (x, y).into(), time)
+            }
+            VirtualTouch::Up { id } => self.touch_up(Some(id).into(), time),
+            VirtualTouch::Cancel => self.touch_cancel(time),
+        }
+        self.touch_frame();
+    }
+
+    /// A touchpad pinch, as libinput reports one: `scale` is the spread
+    /// since the start, `dx` and `dy` the movement since the last update.
+    pub fn inject_pinch(&mut self, pinch: VirtualPinch) {
+        use crate::ssd::GestureSwipePhaseSnapshot as Phase;
+        let time = self.virtual_input_time() / 1000;
+        match pinch {
+            VirtualPinch::Begin { fingers } => {
+                if self.session_lock_active {
+                    return;
+                }
+                self.runtime_gesture_pinch_fingers = fingers;
+                self.dispatch_gesture_pinch(Phase::Begin, time, 1.0, 0.0, 0.0, 0.0);
+            }
+            VirtualPinch::Update { scale, dx, dy } => {
+                if self.runtime_gesture_pinch_fingers != 0 {
+                    self.dispatch_gesture_pinch(Phase::Update, time, scale, 0.0, dx, dy);
+                }
+            }
+            VirtualPinch::End { cancelled } => {
+                if self.runtime_gesture_pinch_fingers != 0 {
+                    let phase = if cancelled { Phase::Cancel } else { Phase::End };
+                    self.dispatch_gesture_pinch(phase, time, 1.0, 0.0, 0.0, 0.0);
+                    self.runtime_gesture_pinch_fingers = 0;
+                }
+            }
+        }
     }
 
     /// Presses `codes` in order, or releases them in reverse, on the control

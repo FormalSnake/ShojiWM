@@ -560,6 +560,10 @@ pub struct ShojiWM {
     /// progress.
     pub runtime_gesture_pinch_async_enabled: bool,
     pub runtime_gesture_pinch_fingers: u32,
+    /// The config listens to touchscreen touches.
+    pub runtime_touch_async_enabled: bool,
+    /// The touchscreen touch in progress.
+    pub touch: crate::touch::TouchState,
     /// The config listens to drag and drop (`COMPOSITOR.dnd.event.onStart`).
     pub runtime_dnd_enabled: bool,
     /// The drag in progress and the drag views the config shows.
@@ -933,7 +937,7 @@ impl ShojiWM {
     /// The only writer of `session_lock_active` after construction: it also
     /// updates the copy `lock_scene` keeps for the runtime threads (unlock
     /// overlay creation), which must never disagree with it.
-    pub(crate) fn set_session_lock_active(&mut self, active: bool) {
+    pub fn set_session_lock_active(&mut self, active: bool) {
         self.session_lock_active = active;
         crate::backend::lock_scene::set_locked(active);
         self.text_input_epoch += 1;
@@ -1873,6 +1877,7 @@ impl ShojiWM {
         // Notify clients that we have a pointer (mouse)
         // Here we assume that there is always pointer plugged in
         seat.add_pointer();
+        seat.add_touch();
 
         // A space represents a two-dimensional plane. Windows and Outputs can be mapped onto it.
         //
@@ -2133,6 +2138,8 @@ impl ShojiWM {
             runtime_gesture_swipe_async_enabled: false,
             runtime_gesture_pinch_async_enabled: false,
             runtime_gesture_pinch_fingers: 0,
+            runtime_touch_async_enabled: false,
+            touch: Default::default(),
             runtime_dnd_enabled: false,
             dnd: Default::default(),
             runtime_gesture_swipe: None,
@@ -3329,6 +3336,7 @@ impl ShojiWM {
                 }
                 HostMessage::DragView(command) => self.apply_drag_view_command(command),
                 HostMessage::StartLocked => self.start_session_locked(),
+                HostMessage::TakeTouch => self.take_touch(),
                 HostMessage::ClearColor(color) => self.set_clear_color(color),
                 HostMessage::BackgroundEffect(config) => {
                     if self.configured_background_effect != config {
@@ -3429,6 +3437,7 @@ impl ShojiWM {
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
+            x11: None,
             id: "__warmup__".into(),
             title: "warmup".into(),
             app_id: Some("shoji_wm.warmup".into()),
@@ -3437,7 +3446,6 @@ impl ShojiWM {
             is_focused: false,
             is_floating: true,
             is_maximized: false,
-            x11: None,
             is_fullscreen: false,
             is_xwayland: false,
             decoration: Default::default(),
@@ -4331,6 +4339,7 @@ impl ShojiWM {
         self.runtime_gesture_swipe_enabled = update.gesture_swipe;
         self.runtime_gesture_swipe_async_enabled = update.gesture_swipe_async;
         self.runtime_gesture_pinch_async_enabled = update.gesture_pinch_async;
+        self.runtime_touch_async_enabled = update.touch_async;
     }
 
     pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {
@@ -4789,7 +4798,9 @@ impl ShojiWM {
     /// the Top layer (only Overlay stays in front of it). `with_committed_state`
     /// (client-acked) means this flips on only once the client has actually
     /// committed its fullscreen buffer, matching what is on screen.
-    pub(crate) fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
+    pub fn output_has_topmost_fullscreen_window(&self, output: &Output) -> bool {
+        // A window that floats over a fullscreen one (`aboveFullscreen`, a
+        // picture in picture) does not count: the first one under those does.
         self.windows_for_output_top_to_bottom(output)
             .into_iter()
             .find(|window| {
@@ -4805,8 +4816,6 @@ impl ShojiWM {
                         state.states.contains(
                             smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen,
                         )
-        // A window that floats over a fullscreen one (`aboveFullscreen`, a
-        // picture in picture) does not count: the first one under those does.
                     })
                 })
             })

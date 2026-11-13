@@ -85,6 +85,7 @@ pub(crate) struct Listeners {
     pub gesture_swipe: Vec<RefListener<GestureSwipeEventSnapshot>>,
     pub gesture_swipe_async: Vec<RefListener<GestureSwipeEventSnapshot>>,
     pub gesture_pinch_async: Vec<RefListener<shojiwm_lib::ssd::GesturePinchEventSnapshot>>,
+    pub touch_async: Vec<RefListener<shojiwm_lib::ssd::TouchEventSnapshot>>,
     pub pointer_region:
         Vec<RefListener<shojiwm_lib::runtime_pointer_region::PointerRegionEventSnapshot>>,
     pub create_layer: Vec<RefListener<WaylandLayerSnapshot>>,
@@ -465,6 +466,7 @@ pub(crate) fn publish_pending() {
                     gesture_swipe: !listeners.gesture_swipe.is_empty(),
                     gesture_swipe_async: !listeners.gesture_swipe_async.is_empty(),
                     gesture_pinch_async: !listeners.gesture_pinch_async.is_empty(),
+                    touch_async: !listeners.touch_async.is_empty(),
                     dnd: !listeners.dnd_start.is_empty(),
                 },
             ));

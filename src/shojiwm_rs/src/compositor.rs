@@ -901,6 +901,13 @@ impl InputController {
         reconfigure_input(false);
     }
 
+    /// Take the touchscreen touch in progress from the clients: they are
+    /// sent `wl_touch.cancel` and hear nothing more until the last finger has
+    /// lifted, while `on_touch_async` goes on reporting it.
+    pub fn take_touch(&self) {
+        runtime::send(HostMessage::TakeTouch);
+    }
+
     /// Connected input devices, by key.
     pub fn devices(&self) -> ReadSignal<BTreeMap<String, RuntimeInputDeviceSnapshot>> {
         runtime::global().inputs.read_only()
@@ -1623,6 +1630,16 @@ impl EventController {
         listener: impl Fn(&shojiwm_lib::ssd::GesturePinchEventSnapshot) + 'static,
     ) {
         add_filtered(|listeners| listeners.gesture_pinch_async.push(Rc::new(listener)));
+    }
+
+    /// Touchscreen touches, one event per finger down, moved, up or
+    /// cancelled, after the fact: the clients have them already unless the
+    /// touch was taken (`COMPOSITOR.input.take_touch`).
+    pub fn on_touch_async(
+        &self,
+        listener: impl Fn(&shojiwm_lib::ssd::TouchEventSnapshot) + 'static,
+    ) {
+        add_filtered(|listeners| listeners.touch_async.push(Rc::new(listener)));
     }
 }
 

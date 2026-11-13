@@ -4,7 +4,7 @@ use smithay::{
             AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, Event, GestureBeginEvent,
             GestureEndEvent, GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputBackend,
             InputEvent, KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent,
-            PointerMotionEvent, Switch, SwitchState, SwitchToggleEvent,
+            PointerMotionEvent, Switch, SwitchState, SwitchToggleEvent, TouchEvent,
         },
         session::Session,
     },
@@ -3165,6 +3165,11 @@ impl ShojiWM {
                 );
                 self.runtime_gesture_pinch_fingers = 0;
             }
+            InputEvent::TouchDown { event } => self.touch_down(&event),
+            InputEvent::TouchMotion { event } => self.touch_motion(&event),
+            InputEvent::TouchUp { event } => self.touch_up(event.slot(), event.time_msec()),
+            InputEvent::TouchFrame { .. } => self.touch_frame(),
+            InputEvent::TouchCancel { event } => self.touch_cancel(event.time_msec()),
             InputEvent::SwitchToggle { event } => {
                 if event.switch() == Some(Switch::Lid) {
                     self.lid_switch_toggled(event.state() == SwitchState::On);

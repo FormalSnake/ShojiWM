@@ -228,6 +228,7 @@ impl ConfigRuntime for TypeScriptRuntime {
             RuntimeEvent::GestureSwipe(event) => self.evaluator.gesture_swipe_async(event, now),
             // The TypeScript API has no pinch hook.
             RuntimeEvent::GesturePinch(_) => {}
+            RuntimeEvent::Touch(_) => {}
         }
     }
 
@@ -321,8 +322,8 @@ COMPOSITOR.window.composition = (window) => <Label text={{window.title}} />;
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
-            id: "w1".into(),
             x11: None,
+            id: "w1".into(),
             title: "hello".into(),
             app_id: Some("test".into()),
             position: Default::default(),
@@ -485,8 +486,8 @@ COMPOSITOR.window.composition = (window) => (
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
-            id: "w1".into(),
             x11: None,
+            id: "w1".into(),
             title: "hello".into(),
             app_id: Some("test".into()),
             position: Default::default(),
@@ -569,8 +570,8 @@ COMPOSITOR.window.composition = (window) => (
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
-            id: "w1".into(),
             x11: None,
+            id: "w1".into(),
             title: "hello".into(),
             app_id: Some("test".into()),
             position: Default::default(),
@@ -1071,8 +1072,8 @@ COMPOSITOR.window.composition = (window) => <Label text={window.title} />;
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
-            id: "w1".into(),
             x11: None,
+            id: "w1".into(),
             title: "hello".into(),
             app_id: None,
             position: Default::default(),

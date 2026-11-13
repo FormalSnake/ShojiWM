@@ -66,6 +66,7 @@ pub mod runtime_process;
 pub mod runtime_workspace;
 pub mod ssd;
 pub mod state;
+pub mod touch;
 pub mod virtual_input;
 pub mod virtual_keyboard;
 pub mod window_decoration;

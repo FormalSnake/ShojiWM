@@ -498,6 +498,10 @@ impl RuntimeHandle {
         self.post(now_ms as f64, RuntimeEvent::GesturePinch(event));
     }
 
+    pub fn touch_async(&mut self, event: crate::ssd::TouchEventSnapshot, now_ms: u64) {
+        self.post(now_ms as f64, RuntimeEvent::Touch(event));
+    }
+
     pub fn pointer_region(
         &mut self,
         event: &crate::runtime_pointer_region::PointerRegionEventSnapshot,

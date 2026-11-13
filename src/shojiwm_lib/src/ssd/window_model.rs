@@ -310,6 +310,31 @@ pub struct GesturePinchEventSnapshot {
     pub timestamp: u64,
 }
 
+/// One finger of a touchscreen touch: `id` tells the fingers of a touch
+/// apart, `fingers` is how many are down after this event, and `taken` says
+/// the config took the touch from the clients (`COMPOSITOR.input.takeTouch`).
+/// A cancelled finger has no position.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TouchEventSnapshot {
+    pub phase: TouchPhaseSnapshot,
+    pub id: i32,
+    pub position: Option<PointerMovePointSnapshot>,
+    pub output_name: Option<String>,
+    pub fingers: u32,
+    pub taken: bool,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TouchPhaseSnapshot {
+    Down,
+    Motion,
+    Up,
+    Cancel,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GestureSwipePhaseSnapshot {
@@ -851,6 +876,12 @@ pub struct ManagedWindowState {
     /// pointer confinement. Applied in `input` (`confine_pointer_window_area`).
     #[serde(default)]
     pub confine_pointer: bool,
+    /// `<ManagedWindow aboveFullscreen>`: the window floats over a fullscreen
+    /// one without ending its hold on the output. The Top layer stays behind
+    /// the fullscreen window, for the pointer as for the eye, as long as the
+    /// first window under the ones so marked is fullscreen.
+    #[serde(default)]
+    pub above_fullscreen: bool,
     #[serde(default)]
     pub z_index: Option<i32>,
     #[serde(default)]
@@ -876,13 +907,8 @@ impl Default for ManagedWindowState {
             force_rect_size: false,
             tiled: false,
             allow_tearing: None,
-    /// `<ManagedWindow aboveFullscreen>`: the window floats over a fullscreen
-    /// one without ending its hold on the output. The Top layer stays behind
-    /// the fullscreen window, for the pointer as for the eye, as long as the
-    /// first window under the ones so marked is fullscreen.
-    #[serde(default)]
-    pub above_fullscreen: bool,
             confine_pointer: false,
+            above_fullscreen: false,
             z_index: None,
             transform: WindowTransform::default(),
             surface_policy: None,
@@ -908,7 +934,6 @@ pub enum WaylandWindowAction {
     /// Focus the window because it was asked for by name. Unlike `Focus`,
     /// it is not refused in favour of a window that opened later.
     FocusOnRequest,
-            above_fullscreen: false,
     /// Take the keyboard from the window if it has it. No window has it
     /// then, until one is focused.
     Unfocus,
@@ -1030,6 +1055,7 @@ impl ShojiWM {
             foreign_toplevel_id: foreign_toplevel_id(window),
             tag: toplevel_tag(toplevel.wl_surface()),
             content_type: window_content_type(toplevel.wl_surface()),
+            x11: None,
             pid: toplevel
                 .wl_surface()
                 .client()
@@ -1055,7 +1081,6 @@ impl ShojiWM {
                 decoration: WindowDecorationStateSnapshot::default(),
                 size_constraints: WindowSizeConstraintsSnapshot::default(),
                 is_resizable: true,
-            x11: None,
                 is_transient: false,
                 suggests_float: false,
                 parent_id: None,
@@ -1066,6 +1091,7 @@ impl ShojiWM {
                 foreign_toplevel_id: None,
                 tag: None,
                 content_type: None,
+                x11: None,
             };
         };
 
@@ -1113,7 +1139,6 @@ impl ShojiWM {
             .element_location(window)
             .map(|loc| {
                 let geometry = window.geometry();
-                x11: None,
                 WindowPositionSnapshot {
                     x: (loc.x + geometry.loc.x) as f64,
                     y: (loc.y + geometry.loc.y) as f64,
@@ -1170,6 +1195,19 @@ impl ShojiWM {
             foreign_toplevel_id: foreign_toplevel_id(window),
             tag: None,
             content_type: None,
+            x11: Some(X11WindowStateSnapshot {
+                above: x11.is_above(),
+                sticky: x11.is_sticky(),
+                fixed_aspect: x11
+                    .size_hints()
+                    .and_then(|hints| hints.aspect)
+                    .is_some_and(|(least, most)| {
+                        least.numerator > 0
+                            && least.denominator > 0
+                            && i64::from(least.numerator) * i64::from(most.denominator)
+                                == i64::from(most.numerator) * i64::from(least.denominator)
+                    }),
+            }),
             pid: x11.pid().and_then(|pid| i32::try_from(pid).ok()),
         }
     }
@@ -1195,19 +1233,6 @@ impl ShojiWM {
 
     pub fn snapshot_layer_surface(
         &self,
-            x11: Some(X11WindowStateSnapshot {
-                above: x11.is_above(),
-                sticky: x11.is_sticky(),
-                fixed_aspect: x11
-                    .size_hints()
-                    .and_then(|hints| hints.aspect)
-                    .is_some_and(|(least, most)| {
-                        least.numerator > 0
-                            && least.denominator > 0
-                            && i64::from(least.numerator) * i64::from(most.denominator)
-                                == i64::from(most.numerator) * i64::from(least.denominator)
-                    }),
-            }),
         output_name: &str,
         layer: &LayerSurface,
         geometry: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
@@ -1638,6 +1663,7 @@ mod tests {
             foreign_toplevel_id: None,
             tag: None,
             content_type: None,
+            x11: None,
         };
         let unmapped = serde_json::to_value(&snapshot).expect("serialize unmapped");
         assert!(unmapped.get("foreignToplevelId").is_none());
@@ -1663,7 +1689,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PointerHitTargetSnapshot::Layer {
                 layer_id: "layer-1".into(),
-            x11: None,
             })
             .expect("serialize layer"),
             serde_json::json!({ "kind": "layer", "layerId": "layer-1" }),

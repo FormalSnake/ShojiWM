@@ -1372,6 +1372,14 @@ impl ConfigRuntime for ReactiveRuntime {
                         )
                     });
                 }
+                RuntimeEvent::Touch(event) => {
+                    batch(|| {
+                        emit(
+                            |listeners| listeners.touch_async.clone(),
+                            |listener| listener(&event),
+                        )
+                    });
+                }
             }
             Ok(())
         });

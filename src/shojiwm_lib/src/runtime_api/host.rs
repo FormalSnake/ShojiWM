@@ -95,6 +95,9 @@ pub enum HostMessage {
     /// (`COMPOSITOR.output.setClearColor`). Sent while the config first
     /// loads, it is in force from the first frame.
     ClearColor([f32; 4]),
+    /// Take the touchscreen touch in progress from the clients
+    /// (`COMPOSITOR.input.takeTouch`).
+    TakeTouch,
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)
