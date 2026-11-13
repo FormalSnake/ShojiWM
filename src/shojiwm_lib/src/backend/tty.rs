@@ -360,6 +360,31 @@ fn in_flight_vblank(
     })
 }
 
+/// Commits a frame rendered for `frame_target` through `queue`; once it is queued,
+/// `in_flight` is the vblank it flips at. The commit is timed by `clock` read right before
+/// `queue`: the frame's vblank is set when it is queued, and a read after it (diagnostics,
+/// bookkeeping, a deschedule) can land past that vblank and put the frame a period late.
+/// A frame held for the cursor deadline or rendered ahead is committed later than it was
+/// staged, so it goes through here when it is submitted, not when it is staged.
+fn queue_in_flight<E>(
+    in_flight: &mut Option<Duration>,
+    frame_target: Duration,
+    last_grid_next: Option<Duration>,
+    period: Duration,
+    clock: impl FnOnce() -> Duration,
+    queue: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let queued_at = clock();
+    queue()?;
+    *in_flight = Some(in_flight_vblank(
+        frame_target,
+        last_grid_next,
+        period,
+        queued_at,
+    ));
+    Ok(())
+}
+
 /// The time a frame is sampled at, and whether `next_frame_target` was thrown out for it.
 /// `last_frame_time` is the time the output's previous frame was sampled at; the result is never
 /// earlier, whether it comes from the prediction, the render-ahead chain or the clock, so
@@ -2484,9 +2509,10 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 #[cfg(test)]
 mod vblank_grid_tests {
     use super::{
-        VBLANK_GRID_HISTORY, in_flight_vblank, predict_next_frame, sanitize_next_frame_target,
-        vblank_grid,
+        VBLANK_GRID_HISTORY, in_flight_vblank, predict_next_frame, queue_in_flight,
+        sanitize_next_frame_target, vblank_grid,
     };
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -2690,6 +2716,83 @@ mod vblank_grid_tests {
             grid + period
         );
         assert_eq!(in_flight_vblank(grid, None, period, grid + us(300.0)), grid);
+    }
+
+    fn ms(value: f64) -> Duration {
+        Duration::from_secs_f64(value / 1_000.0)
+    }
+
+    /// A frame rendered for 1010 ms is held for the cursor deadline at 1001 ms; the busy main
+    /// thread fires the deadline at 1011 ms. It flips at 1020 ms, and the frame rendered ahead
+    /// of it is for 1030 ms. Placed when it was held, it stayed at 1010 and the next frame was
+    /// sampled at 1020 to be shown at 1030.
+    #[test]
+    fn a_held_frame_is_placed_when_it_is_committed() {
+        let period = ms(10.0);
+        let grid = Some(ms(1_010.0));
+        // Staging records what it was rendered for (`submit_ahead_frame`, a held fresh frame).
+        let mut in_flight = Some(ms(1_010.0));
+        queue_in_flight(
+            &mut in_flight,
+            ms(1_010.0),
+            grid,
+            period,
+            || ms(1_011.0),
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(in_flight, Some(ms(1_020.0)));
+        assert_eq!(in_flight.map(|target| target + period), Some(ms(1_030.0)));
+        // Held and committed before the vblank: the one it was rendered for.
+        let mut in_flight = Some(ms(1_010.0));
+        queue_in_flight(
+            &mut in_flight,
+            ms(1_010.0),
+            grid,
+            period,
+            || ms(1_008.5),
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(in_flight, Some(ms(1_010.0)));
+    }
+
+    /// Queued at 1009 ms for 1010; the thread is descheduled inside the queue call and gets
+    /// back at 1011. The frame still flips at 1010.
+    #[test]
+    fn a_commit_is_timed_at_the_queue_call() {
+        let period = ms(10.0);
+        let clock = Cell::new(ms(1_009.0));
+        let mut in_flight = None;
+        queue_in_flight(
+            &mut in_flight,
+            ms(1_010.0),
+            Some(ms(1_010.0)),
+            period,
+            || clock.get(),
+            || {
+                clock.set(ms(1_011.0));
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(in_flight, Some(ms(1_010.0)));
+    }
+
+    /// A rejected commit flips nothing and leaves the frame in flight as it was.
+    #[test]
+    fn a_failed_commit_leaves_the_frame_in_flight() {
+        let mut in_flight = Some(ms(1_000.0));
+        let queued = queue_in_flight(
+            &mut in_flight,
+            ms(1_010.0),
+            Some(ms(1_010.0)),
+            ms(10.0),
+            || ms(1_011.0),
+            || Err(()),
+        );
+        assert_eq!(queued, Err(()));
+        assert_eq!(in_flight, Some(ms(1_000.0)));
     }
 
     #[test]
@@ -3554,15 +3657,24 @@ fn submit_deferred_frame(
     let queue_started_at = Instant::now();
     let submit_error = {
         timescope::scope!("tty deferred queue_frame");
-        match &mut surface.target {
-            SurfaceTarget::Drm(drm_output) => drm_output
-                .queue_frame_tearing(Some(deferred.feedback), false)
-                .err(),
-            SurfaceTarget::Headless(headless) => {
-                headless.queue_frame(deferred.feedback);
-                None
-            }
-        }
+        let (last_grid_next, period) = (surface.last_grid_next, surface.frame_duration);
+        queue_in_flight(
+            &mut surface.in_flight_frame_target,
+            deferred.frame_target,
+            last_grid_next,
+            period,
+            || Duration::from(state.clock.now()),
+            || match &mut surface.target {
+                SurfaceTarget::Drm(drm_output) => {
+                    drm_output.queue_frame_tearing(Some(deferred.feedback), false)
+                }
+                SurfaceTarget::Headless(headless) => {
+                    headless.queue_frame(deferred.feedback);
+                    Ok(())
+                }
+            },
+        )
+        .err()
     };
     match submit_error {
         None => {
@@ -3659,12 +3771,8 @@ fn submit_ahead_frame(
         return;
     };
     surface.frame_pending = true;
-    surface.in_flight_frame_target = Some(in_flight_vblank(
-        ahead.frame_target,
-        surface.last_grid_next,
-        surface.frame_duration,
-        now,
-    ));
+    // Staged until `submit_deferred_frame` commits it, at the deadline or right away.
+    surface.in_flight_frame_target = Some(ahead.frame_target);
     surface.redraw_state = TtyRedrawState::WaitingForVBlank { redraw_needed };
     surface.deferred_submit = Some(ahead);
     let generation = surface.deferred_submit_generation.wrapping_add(1);
@@ -6572,14 +6680,24 @@ fn render_surface(
                 // otherwise. See `should_tear` / the tearing fast-path block above.
                 {
                     timescope::scope!("tty queue_frame");
-                    let queued = match &mut surface.target {
-                        SurfaceTarget::Drm(drm_output) => drm_output
-                            .queue_frame_tearing(Some(output_presentation_feedback), should_tear),
-                        SurfaceTarget::Headless(headless) => {
-                            headless.queue_frame(output_presentation_feedback);
-                            Ok(())
-                        }
-                    };
+                    let (last_grid_next, period) = (surface.last_grid_next, surface.frame_duration);
+                    let queued = queue_in_flight(
+                        &mut surface.in_flight_frame_target,
+                        frame_time,
+                        last_grid_next,
+                        period,
+                        || Duration::from(state.clock.now()),
+                        || match &mut surface.target {
+                            SurfaceTarget::Drm(drm_output) => drm_output.queue_frame_tearing(
+                                Some(output_presentation_feedback),
+                                should_tear,
+                            ),
+                            SurfaceTarget::Headless(headless) => {
+                                headless.queue_frame(output_presentation_feedback);
+                                Ok(())
+                            }
+                        },
+                    );
                     if let Err(err) = queued {
                         if error_chain_has_permission_denied(&err) {
                             warn!(
@@ -6644,17 +6762,10 @@ fn render_surface(
                 surface.queued_cpu_duration = total_cpu_elapsed;
             }
             surface.frame_pending = true;
-            // An ahead frame is only staged here; `submit_ahead_frame` places it when it commits.
-            surface.in_flight_frame_target = Some(if rendering_ahead {
-                frame_time
-            } else {
-                in_flight_vblank(
-                    frame_time,
-                    surface.last_grid_next,
-                    surface.frame_duration,
-                    Duration::from(state.clock.now()),
-                )
-            });
+            if rendering_ahead || deferred {
+                // Staged, not committed: `submit_deferred_frame` places it when it is.
+                surface.in_flight_frame_target = Some(frame_time);
+            }
             surface.skipped_while_pending_count = 0;
             surface.frame_callback_timer_armed = false;
             surface.frame_callback_timer_generation =
