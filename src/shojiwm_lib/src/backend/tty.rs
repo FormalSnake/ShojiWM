@@ -299,10 +299,17 @@ fn ratchet_frame_target(
 }
 
 /// Records a flip observed at `observed` and returns the vblank it completed at and the next
-/// frame's presentation time, keeping `observations` and `last_grid_next` for the next flip.
+/// frame's presentation time, keeping `observations`, `last_grid_next` and `last_target` for
+/// the next flip.
+///
+/// The target never goes back past `last_target`: after a bump, a phase re-estimate can put the
+/// next grid point short of the bumped one (120 Hz flips handled 2, 7, 4.3 and 0.1 ms late gave
+/// 1035.33 then 1032.00 ms). `last_target` only floors the result; the duplicate test stays on
+/// the raw grid points, or a bump would feed itself again.
 fn predict_next_frame(
     observations: &mut std::collections::VecDeque<Duration>,
     last_grid_next: &mut Option<Duration>,
+    last_target: &mut Option<Duration>,
     observed: Duration,
     period: Duration,
 ) -> (Duration, Duration) {
@@ -312,14 +319,22 @@ fn predict_next_frame(
     observations.push_back(observed);
     let (vblank, grid_next) = vblank_grid(observations, observed, period);
     let target = ratchet_frame_target(*last_grid_next, grid_next, period);
+    let target = last_target.map_or(target, |last| target.max(last));
     *last_grid_next = Some(grid_next);
+    *last_target = Some(target);
     (vblank, target)
 }
 
+/// The time a frame is sampled at, and whether `next_frame_target` was thrown out for it.
+/// `last_frame_time` is the time the output's previous frame was sampled at; the result is never
+/// earlier, whether it comes from the prediction, the render-ahead chain or the clock, so
+/// animations never step back. It cannot hold the time far ahead: it was itself at most three
+/// periods past an earlier clock reading.
 fn sanitize_next_frame_target(
     next_frame_target: Option<Duration>,
     fallback_frame_time: Duration,
     frame_duration: Duration,
+    last_frame_time: Option<Duration>,
 ) -> (Duration, bool) {
     let stale_before = fallback_frame_time
         .checked_sub(frame_duration)
@@ -327,13 +342,14 @@ fn sanitize_next_frame_target(
     // The target is at most about a period past the fallback (now + one period); anything
     // further is a bad prediction, and sampling animations there skips them to their end.
     let too_far_after = fallback_frame_time + frame_duration * 2;
-    match next_frame_target {
+    let (time, stale) = match next_frame_target {
         Some(target) if target < stale_before || target > too_far_after => {
             (fallback_frame_time, true)
         }
         Some(target) => (target, false),
         None => (fallback_frame_time, false),
-    }
+    };
+    (last_frame_time.map_or(time, |last| time.max(last)), stale)
 }
 
 pub(super) fn error_chain_has_permission_denied(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -1160,9 +1176,12 @@ struct SurfaceData {
     vblank_observations: std::collections::VecDeque<Duration>,
     /// The vblank after the last flip, on the grid and before `ratchet_frame_target`.
     last_grid_next: Option<Duration>,
+    /// The last `next_frame_target` `predict_next_frame` returned.
+    last_frame_target: Option<Duration>,
     estimated_render_duration: Duration,
     last_presented_at: Option<Duration>,
-    last_frame_callback_at: Option<Duration>,
+    /// The time the last frame was sampled at; see `sanitize_next_frame_target`.
+    last_frame_time: Option<Duration>,
     /// Whether the driver supports immediate (async) page flips on this
     /// surface, i.e. tearing. Queried once at surface creation since it is a
     /// constant device capability. Gates the fullscreen tearing fast path.
@@ -1550,9 +1569,10 @@ impl SurfaceData {
             next_frame_target: None,
             vblank_observations: std::collections::VecDeque::with_capacity(VBLANK_GRID_HISTORY),
             last_grid_next: None,
+            last_frame_target: None,
             estimated_render_duration: Duration::from_millis(4),
             last_presented_at: None,
-            last_frame_callback_at: None,
+            last_frame_time: None,
             supports_async_flip,
             tearing_active: false,
             cursor_on_plane: false,
@@ -2486,22 +2506,55 @@ mod vblank_grid_tests {
         );
     }
 
+    /// What `frame_finish` predicts for flips at real vblanks `1 s + n * period`, each handled
+    /// `delay` later, in microseconds.
+    fn frame_targets(delays: &[f64]) -> Vec<f64> {
+        let period = us(PERIOD_US);
+        let (mut history, mut last_grid_next, mut last_target) = (VecDeque::new(), None, None);
+        delays
+            .iter()
+            .enumerate()
+            .map(|(index, delay)| {
+                let observed = us(1_000_000.0 + index as f64 * PERIOD_US + delay);
+                let (_, target) = predict_next_frame(
+                    &mut history,
+                    &mut last_grid_next,
+                    &mut last_target,
+                    observed,
+                    period,
+                );
+                target.as_secs_f64() * 1e6
+            })
+            .collect()
+    }
+
     /// Tearing flips from a fullscreen game complete faster than the refresh period. The
     /// duplicate-target bump must not accumulate: it ran the target seconds ahead of the
     /// clock, and window animations sampled there finished instantly.
     #[test]
     fn flips_faster_than_the_period_keep_the_target_near_the_clock() {
         let period = us(PERIOD_US);
-        let mut history = VecDeque::new();
-        let mut last = None;
+        let (mut history, mut last_grid_next, mut last_target) = (VecDeque::new(), None, None);
+        let mut previous = Duration::ZERO;
         // 200 fps for a minute on a 120 Hz output.
         for index in 0..12_000u32 {
             let observed = us(1_000_000.0 + f64::from(index) * 5_000.0);
-            let target = predict_next_frame(&mut history, &mut last, observed, period).1;
+            let (_, target) = predict_next_frame(
+                &mut history,
+                &mut last_grid_next,
+                &mut last_target,
+                observed,
+                period,
+            );
             assert!(
                 target <= observed + period * 2,
                 "flip {index}: target {target:?} ran ahead of observation {observed:?}"
             );
+            assert!(
+                target >= previous,
+                "flip {index}: target {target:?} before the previous {previous:?}"
+            );
+            previous = target;
         }
     }
 
@@ -2510,22 +2563,31 @@ mod vblank_grid_tests {
     /// point) bumped every later frame too, holding each target 4.3 ms past the real vblank.
     #[test]
     fn one_late_event_does_not_hold_later_targets_off_the_grid() {
-        let period = us(PERIOD_US);
-        let mut history = VecDeque::new();
-        let mut last = None;
-        for index in 0..200u32 {
-            let delay = if index == 0 { 4_300.0 } else { 100.0 };
-            let vblank = 1_000_000.0 + f64::from(index) * PERIOD_US;
-            let observed = us(vblank + delay);
-            let target = predict_next_frame(&mut history, &mut last, observed, period).1;
-            let target = target.as_secs_f64() * 1e6;
-            if index >= 2 {
-                let expected = vblank + PERIOD_US + 100.0;
-                assert!(
-                    (target - expected).abs() < 1.0,
-                    "flip {index}: target {target} us, the next vblank is {expected} us"
-                );
-            }
+        let delays: Vec<f64> = (0..200)
+            .map(|i| if i == 0 { 4_300.0 } else { 100.0 })
+            .collect();
+        for (index, target) in frame_targets(&delays).iter().enumerate().skip(2) {
+            let expected = 1_000_000.0 + (index + 1) as f64 * PERIOD_US + 100.0;
+            assert!(
+                (target - expected).abs() < 1.0,
+                "flip {index}: target {target} us, the next vblank is {expected} us"
+            );
+        }
+    }
+
+    /// The third flip duplicates the second's grid point and is bumped; the fourth's phase
+    /// re-estimate puts its grid point 3.3 ms short of that bump.
+    #[test]
+    fn a_target_after_a_bump_does_not_go_back() {
+        let targets = frame_targets(&[2_000.0, 7_000.0, 4_300.0, 100.0]);
+        for (index, pair) in targets.windows(2).enumerate() {
+            assert!(
+                pair[1] >= pair[0],
+                "flip {}: target {} us before the previous {} us",
+                index + 1,
+                pair[1],
+                pair[0]
+            );
         }
     }
 
@@ -2534,12 +2596,32 @@ mod vblank_grid_tests {
         let period = us(PERIOD_US);
         let fallback = us(2_000_000.0);
         assert_eq!(
-            sanitize_next_frame_target(Some(fallback + period * 600), fallback, period),
+            sanitize_next_frame_target(Some(fallback + period * 600), fallback, period, None),
             (fallback, true)
         );
         assert_eq!(
-            sanitize_next_frame_target(Some(fallback + period), fallback, period),
+            sanitize_next_frame_target(Some(fallback + period), fallback, period, None),
             (fallback + period, false)
+        );
+    }
+
+    /// Neither a falling-back nor an earlier prediction takes a frame before the last one.
+    #[test]
+    fn a_frame_is_never_sampled_before_the_last_one() {
+        let period = us(PERIOD_US);
+        let fallback = us(2_000_000.0);
+        let last = Some(fallback + period * 2);
+        assert_eq!(
+            sanitize_next_frame_target(Some(fallback + period * 600), fallback, period, last),
+            (fallback + period * 2, true)
+        );
+        assert_eq!(
+            sanitize_next_frame_target(Some(fallback + period), fallback, period, last),
+            (fallback + period * 2, false)
+        );
+        assert_eq!(
+            sanitize_next_frame_target(None, fallback, period, last),
+            (fallback + period * 2, false)
         );
     }
 }
@@ -2967,6 +3049,7 @@ fn frame_finish(
     let (grid_vblank, next_frame_target) = predict_next_frame(
         &mut surface.vblank_observations,
         &mut surface.last_grid_next,
+        &mut surface.last_frame_target,
         presentation_clock,
         surface.frame_duration,
     );
@@ -4660,6 +4743,7 @@ fn render_surface(
             upcoming_frame_target(surface),
             fallback_frame_time,
             frame_duration,
+            surface.last_frame_time,
         );
         if let Some(target) = upcoming_frame_target(surface)
             && target > fallback_frame_time + frame_duration * 2
@@ -4791,13 +4875,17 @@ fn render_surface(
             .map(|surface| surface.frame_duration)
             .unwrap_or(Duration::ZERO);
         let fallback_frame_time = Duration::from(state.clock.now()) + frame_duration;
-        let raw_frame_target = state
+        let surface = state
             .tty_backends
             .get(&node)
-            .and_then(|backend| backend.surfaces.get(&crtc))
-            .and_then(upcoming_frame_target);
-        let (frame_target, stale_frame_target) =
-            sanitize_next_frame_target(raw_frame_target, fallback_frame_time, frame_duration);
+            .and_then(|backend| backend.surfaces.get(&crtc));
+        let raw_frame_target = surface.and_then(upcoming_frame_target);
+        let (frame_target, stale_frame_target) = sanitize_next_frame_target(
+            raw_frame_target,
+            fallback_frame_time,
+            frame_duration,
+            surface.and_then(|surface| surface.last_frame_time),
+        );
         (
             frame_duration,
             fallback_frame_time,
@@ -4979,9 +5067,13 @@ fn render_surface(
         } else {
             surface.next_frame_target.take()
         };
-        let (frame_time, stale_frame_time) =
-            sanitize_next_frame_target(raw_frame_time, fallback_frame_time, frame_duration);
-        surface.last_frame_callback_at = Some(frame_time);
+        let (frame_time, stale_frame_time) = sanitize_next_frame_target(
+            raw_frame_time,
+            fallback_frame_time,
+            frame_duration,
+            surface.last_frame_time,
+        );
+        surface.last_frame_time = Some(frame_time);
         if has_visible_mpv {
             info!(
                 output = %output.name(),
