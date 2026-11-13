@@ -75,10 +75,21 @@ enum Seen {
     Leave,
 }
 
+/// What the locker's text input was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Text {
+    Enter,
+    CommitString(String),
+    PreeditString,
+    DeleteSurroundingText,
+    /// With its serial.
+    Done(u32),
+}
+
 thread_local! {
     static FIRED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
-    /// What the input method's keyboard grab was sent.
+    /// What the keyboard grab of an input method not the locker's was sent.
     static IM_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
     /// What the locker's keyboard was sent.
     static LOCKER_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
@@ -88,12 +99,17 @@ thread_local! {
     static LOCK_SIZE: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
     static GRAB: RefCell<Option<InputGrab>> = const { RefCell::new(None) };
     static BUTTON_SERIAL: Cell<u32> = const { Cell::new(0) };
-    /// Every event an input method's keyboard grab was sent, by name.
+    /// Every event the keyboard grab of an input method not the locker's was
+    /// sent, by name.
     static IM_GRAB_EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
-    /// What the locker's text input was sent, by name.
-    static LOCKER_TEXT: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
-    /// What the input methods were sent, by name.
+    /// What the locker's text input was sent.
+    static LOCKER_TEXT: RefCell<Vec<Text>> = const { RefCell::new(Vec::new()) };
+    /// What the input methods not the locker's were sent, by name.
     static IM_EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    /// What the locker's input method's keyboard grab was sent.
+    static LOCKER_IM_SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    /// What the locker's input method was sent, by name.
+    static LOCKER_IM_EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
 fn fired(name: &'static str) -> impl Fn() + 'static {
@@ -991,6 +1007,38 @@ fn locker_text_input(session: &mut common::Session) -> zwp_text_input_v3::ZwpTex
     text_input
 }
 
+fn locker(session: &common::Session) -> usize {
+    session
+        .peers
+        .iter()
+        .position(|peer| peer.client.name == "locker")
+        .unwrap()
+}
+
+/// An input method of the locker's own.
+fn locker_input_method(session: &mut common::Session) -> zwp_input_method_v2::ZwpInputMethodV2 {
+    let peer = &session.peers[locker(session)];
+    let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let input_method = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    session.roundtrip();
+    input_method
+}
+
+/// The serial an input method's next commit carries: the `done` events it
+/// was sent since its last `unavailable`, where smithay counts from 0 again.
+fn dones(events: &[&str]) -> u32 {
+    let since = events
+        .iter()
+        .rposition(|event| *event == "unavailable")
+        .map_or(0, |at| at + 1);
+    events[since..]
+        .iter()
+        .filter(|event| **event == "done")
+        .count() as u32
+}
+
 /// An input method that held the keyboard before the lock, and one asked
 /// for under it, poll the modifiers through fresh grabs while the user types
 /// the password with Shift.
@@ -1030,25 +1078,181 @@ fn an_input_method_gets_no_keyboard_grab_under_the_lock() {
 }
 
 /// Another client's input method commits text while the locker's password
-/// field has a text input enabled.
+/// field is active with the locker's own input method.
 #[test]
 fn an_input_method_cannot_type_into_the_lockers_text_input() {
     let mut session = focused_session();
-    let (_im, input_method) = input_method(&mut session);
     let locked = lock(&mut session);
-    let _text_input = locker_text_input(&mut session);
-    let seen = take(&LOCKER_TEXT);
-    assert!(
-        seen.contains(&"enter"),
-        "the locker's text input has no focus: {seen:?}"
-    );
+    let locker_im = locker_input_method(&mut session);
+    let text_input = locker_text_input(&mut session);
+    assert_eq!(take(&LOCKER_TEXT), vec![Text::Enter]);
+    let mut heard = take(&LOCKER_IM_EVENTS);
+    assert!(heard.contains(&"activate"), "{heard:?}");
 
+    let im = session.connect("input-method");
+    let peer = &session.peers[im];
+    let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let input_method = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    session.roundtrip();
+    // Smithay enters the focused text input again for each new input method,
+    // and tells the one it keeps that it is unavailable.
+    assert_eq!(take(&LOCKER_TEXT), vec![Text::Enter]);
+    heard.extend(take(&LOCKER_IM_EVENTS));
+    assert_eq!(heard.last(), Some(&"unavailable"));
     input_method.set_preedit_string("hun".into(), 0, 3);
     input_method.commit_string("hunter2".into());
     input_method.delete_surrounding_text(4, 0);
-    input_method.commit(1);
+    input_method.commit(dones(&heard));
     session.roundtrip();
-    assert_eq!(take(&LOCKER_TEXT), Vec::<&str>::new());
+    assert_eq!(take(&LOCKER_TEXT), vec![]);
+
+    // The locker's own input method still types into it.
+    locker_im.commit_string("a".into());
+    locker_im.commit(dones(&heard));
+    session.roundtrip();
+    assert_eq!(
+        take(&LOCKER_TEXT),
+        vec![Text::CommitString("a".into()), Text::Done(1)]
+    );
+    text_input.set_surrounding_text("a".into(), 1, 1);
+    text_input.commit();
+    session.roundtrip();
+    heard.extend(take(&LOCKER_IM_EVENTS));
+    locker_im.commit_string("b".into());
+    locker_im.commit(dones(&heard));
+    session.roundtrip();
+    assert_eq!(
+        take(&LOCKER_TEXT),
+        vec![Text::CommitString("b".into()), Text::Done(2)]
+    );
+    unlock(&mut session, locked);
+}
+
+/// The locker's password field holds `enable` and its text, not committed
+/// yet, while its own input method is the seat's. Another client creates an
+/// input method and destroys it, which makes the seat forget the locker's,
+/// and creates the one the seat takes next.
+#[test]
+fn a_replacement_input_method_hears_nothing_the_locker_left_pending() {
+    let mut session = focused_session();
+    let locked = lock(&mut session);
+    let _locker_im = locker_input_method(&mut session);
+    let peer = &session.peers[locker(&session)];
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let manager: zwp_text_input_manager_v3::ZwpTextInputManagerV3 =
+        peer.bind("zwp_text_input_manager_v3", 1);
+    let text_input = manager.get_text_input(&seat, &peer.queue.handle(), ());
+    session.roundtrip();
+    text_input.enable();
+    text_input.set_content_type(
+        zwp_text_input_v3::ContentHint::SensitiveData,
+        zwp_text_input_v3::ContentPurpose::Password,
+    );
+    text_input.set_surrounding_text("hunter2".into(), 7, 7);
+    session.roundtrip();
+
+    let im = session.connect("input-method");
+    let peer = &session.peers[im];
+    let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let first = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    session.roundtrip();
+    first.destroy();
+    session.roundtrip();
+    assert!(!session.state.seat.input_method().has_instance());
+    let peer = &session.peers[im];
+    let _replacement = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    session.roundtrip();
+    assert!(session.state.seat.input_method().has_instance());
+    take(&IM_EVENTS);
+
+    text_input.commit();
+    session.roundtrip();
+    let heard = take(&IM_EVENTS);
+    assert!(
+        !heard
+            .iter()
+            .any(|event| matches!(*event, "activate" | "surrounding_text" | "content_type")),
+        "{heard:?}"
+    );
+
+    // Nor does a whole new state.
+    text_input.enable();
+    text_input.set_surrounding_text("hunter2".into(), 7, 7);
+    text_input.commit();
+    session.roundtrip();
+    let heard = take(&IM_EVENTS);
+    assert!(
+        !heard
+            .iter()
+            .any(|event| matches!(*event, "activate" | "surrounding_text" | "content_type")),
+        "{heard:?}"
+    );
+    unlock(&mut session, locked);
+}
+
+/// The locker's own input method grabs the keyboard under the lock and
+/// hears the keys, where a grab another client held before the lock went
+/// at the first key.
+#[test]
+fn the_lockers_input_method_keeps_its_keyboard_grab_under_the_lock() {
+    let mut session = focused_session();
+    let (_im, _input_method) = input_method(&mut session);
+    let locked = lock(&mut session);
+    press(&mut session, K);
+    release(&mut session, K);
+    assert_eq!(take(&IM_SEEN), vec![]);
+    assert_eq!(take(&LOCKER_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+
+    let locker_im = locker_input_method(&mut session);
+    locker_im.grab_keyboard(&session.peers[locker(&session)].queue.handle(), ());
+    session.roundtrip();
+    assert_eq!(take(&LOCKER_IM_SEEN), vec![Seen::Mods(0)]);
+    for _ in 0..2 {
+        press(&mut session, K);
+        release(&mut session, K);
+        assert_eq!(take(&LOCKER_IM_SEEN), vec![Seen::Down(K), Seen::Up(K)]);
+    }
+    assert!(session.state.seat.get_keyboard().unwrap().is_grabbed());
+    assert_eq!(take(&LOCKER_SEEN), vec![]);
+    assert_eq!(take(&IM_SEEN), vec![]);
+    unlock(&mut session, locked);
+}
+
+/// An input method refused a grab under the lock while the locker's own
+/// input method holds the keyboard, and an on-screen keyboard presses Shift.
+#[test]
+fn an_input_method_refused_a_grab_hears_no_modifiers() {
+    let mut session = focused_session();
+    let osk = session.connect("on-screen-keyboard");
+    let keyboard = virtual_keyboard(&mut session, osk);
+    let locked = lock(&mut session);
+
+    let im = session.connect("input-method");
+    let peer = &session.peers[im];
+    let manager: zwp_input_method_manager_v2::ZwpInputMethodManagerV2 =
+        peer.bind("zwp_input_method_manager_v2", 1);
+    let seat: wl_seat::WlSeat = peer.bind("wl_seat", 1);
+    let input_method = manager.get_input_method(&seat, &peer.queue.handle(), ());
+    input_method.grab_keyboard(&peer.queue.handle(), ());
+    session.roundtrip();
+    let locker_im = locker_input_method(&mut session);
+    locker_im.grab_keyboard(&session.peers[locker(&session)].queue.handle(), ());
+    session.roundtrip();
+    assert_eq!(take(&LOCKER_IM_SEEN), vec![Seen::Mods(0)]);
+
+    keyboard.modifiers(SHIFT_MASK, 0, 0, 0);
+    session.roundtrip();
+    keyboard.modifiers(0, 0, 0, 0);
+    session.roundtrip();
+    assert_eq!(take(&IM_GRAB_EVENTS), Vec::<&str>::new());
+    assert_eq!(
+        take(&LOCKER_IM_SEEN),
+        vec![Seen::Mods(SHIFT_MASK), Seen::Mods(0)]
+    );
     unlock(&mut session, locked);
 }
 
@@ -1194,22 +1398,25 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
     for common::Client
 {
     fn event(
-        _: &mut Self,
+        client: &mut Self,
         _: &zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
         event: zwp_input_method_keyboard_grab_v2::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        IM_GRAB_EVENTS.with(|events| {
-            events.borrow_mut().push(match &event {
-                zwp_input_method_keyboard_grab_v2::Event::Keymap { .. } => "keymap",
-                zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { .. } => "repeat_info",
-                zwp_input_method_keyboard_grab_v2::Event::Modifiers { .. } => "modifiers",
-                zwp_input_method_keyboard_grab_v2::Event::Key { .. } => "key",
-                _ => "other",
-            })
-        });
+        let lockers = client.name == "locker";
+        if !lockers {
+            IM_GRAB_EVENTS.with(|events| {
+                events.borrow_mut().push(match &event {
+                    zwp_input_method_keyboard_grab_v2::Event::Keymap { .. } => "keymap",
+                    zwp_input_method_keyboard_grab_v2::Event::RepeatInfo { .. } => "repeat_info",
+                    zwp_input_method_keyboard_grab_v2::Event::Modifiers { .. } => "modifiers",
+                    zwp_input_method_keyboard_grab_v2::Event::Key { .. } => "key",
+                    _ => "other",
+                })
+            });
+        }
         let seen = match event {
             zwp_input_method_keyboard_grab_v2::Event::Key { key, state, .. } => {
                 seen_key(key, state)
@@ -1219,13 +1426,14 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
             }
             _ => return,
         };
-        IM_SEEN.with(|seen_list| seen_list.borrow_mut().push(seen));
+        let list = if lockers { &LOCKER_IM_SEEN } else { &IM_SEEN };
+        list.with(|seen_list| seen_list.borrow_mut().push(seen));
     }
 }
 
 impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for common::Client {
     fn event(
-        _: &mut Self,
+        client: &mut Self,
         _: &zwp_input_method_v2::ZwpInputMethodV2,
         event: zwp_input_method_v2::Event,
         _: &(),
@@ -1242,7 +1450,12 @@ impl Dispatch<zwp_input_method_v2::ZwpInputMethodV2, ()> for common::Client {
             zwp_input_method_v2::Event::Unavailable => "unavailable",
             _ => return,
         };
-        IM_EVENTS.with(|events| events.borrow_mut().push(name));
+        let list = if client.name == "locker" {
+            &LOCKER_IM_EVENTS
+        } else {
+            &IM_EVENTS
+        };
+        list.with(|events| events.borrow_mut().push(name));
     }
 }
 
@@ -1258,15 +1471,17 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for common::Client {
         if client.name != "locker" {
             return;
         }
-        let name = match event {
-            zwp_text_input_v3::Event::Enter { .. } => "enter",
-            zwp_text_input_v3::Event::CommitString { .. } => "commit_string",
-            zwp_text_input_v3::Event::PreeditString { .. } => "preedit_string",
-            zwp_text_input_v3::Event::DeleteSurroundingText { .. } => "delete_surrounding_text",
-            zwp_text_input_v3::Event::Done { .. } => "done",
+        let text = match event {
+            zwp_text_input_v3::Event::Enter { .. } => Text::Enter,
+            zwp_text_input_v3::Event::CommitString { text } => {
+                Text::CommitString(text.unwrap_or_default())
+            }
+            zwp_text_input_v3::Event::PreeditString { .. } => Text::PreeditString,
+            zwp_text_input_v3::Event::DeleteSurroundingText { .. } => Text::DeleteSurroundingText,
+            zwp_text_input_v3::Event::Done { serial } => Text::Done(serial),
             _ => return,
         };
-        LOCKER_TEXT.with(|seen| seen.borrow_mut().push(name));
+        LOCKER_TEXT.with(|seen| seen.borrow_mut().push(text));
     }
 }
 

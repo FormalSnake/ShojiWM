@@ -64,6 +64,13 @@ impl GlobalDispatch2<ZwpInputMethodManagerV2, ShojiWM> for InputMethodManagerGlo
     }
 }
 
+fn new_object_id(msg: &Message<ObjectId, OwnedFd>) -> Option<ObjectId> {
+    msg.args.iter().find_map(|arg| match arg {
+        Argument::NewId(id) => Some(id.clone()),
+        _ => None,
+    })
+}
+
 /// The manager's object data: puts [`InputMethodShim`] in front of each
 /// input method smithay makes.
 struct ManagerShim {
@@ -78,14 +85,11 @@ impl ObjectData<ShojiWM> for ManagerShim {
         client_id: ClientId,
         msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData<ShojiWM>>> {
-        let new_id = msg.args.iter().find_map(|arg| match arg {
-            Argument::NewId(id) => Some(id.clone()),
-            _ => None,
-        });
+        let new_id = new_object_id(&msg);
         let inner = self.inner.clone();
         let input_method = forward_request(self, inner, handle, state, client_id, msg)?;
-        // Smithay's seat keeps the first live input method and marks later
-        // ones unavailable.
+        // Smithay's seat keeps the first live input method; a later one only
+        // tells it `unavailable`.
         if state.input_method_object.is_none() {
             state.input_method_object = new_id;
         }
@@ -134,6 +138,9 @@ impl ObjectData<ShojiWM> for InputMethodShim {
                 | zwp_input_method_v2::REQ_COMMIT_OPCODE => return None,
                 _ => {}
             }
+        }
+        if msg.opcode == zwp_input_method_v2::REQ_GRAB_KEYBOARD_OPCODE {
+            state.input_method_grab = new_object_id(&msg);
         }
         let inner = self.inner.clone();
         forward_request(self, inner, handle, state, client_id, msg)

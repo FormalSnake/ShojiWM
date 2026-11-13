@@ -145,8 +145,8 @@ window. A key whose press reached the client gets its release there too, also
 when an `on: "release"` binding fires on it. The client's modifiers follow the
 keyboard's even when a binding took the modifier key, and a keyboard unplugged
 or a switch to another VT lets go of the keys it held in the client. While
-the session is locked, no input method or menu keyboard grab hears a key, and
-an input method has to grab the keyboard again after the unlock (fcitx5 and
+the session is locked, no input method or menu keyboard grab but the locker's
+own hears a key, and an input method has to grab the keyboard again after the unlock (fcitx5 and
 ibus do when they are next activated). A key held across the unlock goes no
 further than the locker. Under the lock the virtual keyboard of a client that
 has been an input method cannot type, even after it gave the input method up;
@@ -163,7 +163,9 @@ again when it is next activated), cannot write into the locker's text input,
 and shows no popup over the lock screen. No input method but the locker's
 hears a text input's state under the lock (activation, content type,
 surrounding text, cursor rectangle), so a password field reaches none of
-them; after the unlock the input method starts again from a deactivate; and a panel mapped on demand behind
+them. That is decided at each commit, against the input method the state
+would go to, and state left uncommitted when the session locks or unlocks is
+dropped. After the unlock the input method starts again from a deactivate; and a panel mapped on demand behind
 the lock screen does not take the keyboard at the unlock. A button held on the
 lock screen at the unlock comes up there, and its own release goes nowhere.
 `nonConsuming: true` runs the handler and still delivers the key or the button

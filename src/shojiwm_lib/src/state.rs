@@ -542,6 +542,12 @@ pub struct ShojiWM {
         std::collections::HashSet<smithay::reexports::wayland_server::backend::ClientId>,
     /// The `zwp_input_method_v2` smithay's seat uses, as smithay picks it.
     pub input_method_object: Option<smithay::reexports::wayland_server::backend::ObjectId>,
+    /// The `zwp_input_method_keyboard_grab_v2` smithay's input method grab
+    /// sends to: the last one an input method asked for.
+    pub input_method_grab: Option<smithay::reexports::wayland_server::backend::ObjectId>,
+    /// Counts lock and unlock: text input state held back across either is
+    /// dropped (see [`crate::protocols::text_input`]).
+    pub text_input_epoch: u64,
     pub runtime_active_keyboard_device: Option<RuntimeInputDeviceSnapshot>,
     pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
     pub runtime_libinput_devices: HashMap<String, input::Device>,
@@ -886,6 +892,7 @@ impl ShojiWM {
     pub(crate) fn set_session_lock_active(&mut self, active: bool) {
         self.session_lock_active = active;
         crate::backend::lock_scene::set_locked(active);
+        self.text_input_epoch += 1;
         // The releases of the keys down now go to the locker; the pointer
         // leaves every client.
         if active {
@@ -2069,6 +2076,8 @@ impl ShojiWM {
             bind_keycode_override: None,
             input_method_clients: Default::default(),
             input_method_object: None,
+            input_method_grab: None,
+            text_input_epoch: 0,
             runtime_active_keyboard_device: None,
             runtime_input_devices: Default::default(),
             runtime_libinput_devices: Default::default(),

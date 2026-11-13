@@ -336,8 +336,9 @@ impl ShojiWM {
         ) -> FilterResult<KeyboardAction>,
     ) -> Option<KeyboardAction> {
         // Every key event under the lock comes through here, a release this
-        // compositor makes up included: none may reach a keyboard grab.
-        if self.session_lock_active {
+        // compositor makes up included: none may reach a keyboard grab but
+        // the locker's.
+        if self.session_lock_active && !self.keyboard_grab_is_lockers() {
             self.take_keyboard_from_grabs();
         }
         let keyboard = self.seat.get_keyboard().unwrap();
@@ -377,16 +378,21 @@ impl ShojiWM {
             return;
         }
         let mods = keyboard.modifier_state().serialized;
-        for grab in self.input_method_keyboard_grabs() {
-            // A serial of the seat's own, as smithay sends when the grab starts.
-            grab.modifiers(
-                SERIAL_COUNTER.next_serial().into(),
-                mods.depressed,
-                mods.latched,
-                mods.locked,
-                mods.layout_effective,
-            );
-        }
+        // The one grab object smithay sends the keys to: older ones, and the
+        // ones refused under the lock, hear nothing.
+        let Some(grab) = self.input_method_grab.clone().and_then(|grab| {
+            ZwpInputMethodKeyboardGrabV2::from_id(&self.display_handle, grab).ok()
+        }) else {
+            return;
+        };
+        // A serial of the seat's own, as smithay sends when the grab starts.
+        grab.modifiers(
+            SERIAL_COUNTER.next_serial().into(),
+            mods.depressed,
+            mods.latched,
+            mods.locked,
+            mods.layout_effective,
+        );
     }
 
     /// The seat's keyboard grab is an input method's. Its
@@ -399,21 +405,27 @@ impl ShojiWM {
             .unwrap_or(false)
     }
 
-    /// The input method clients' keyboard grab objects, which smithay keeps
-    /// to itself.
-    fn input_method_keyboard_grabs(&self) -> Vec<ZwpInputMethodKeyboardGrabV2> {
-        let backend = self.display_handle.backend_handle();
-        let mut objects = Vec::new();
-        for client in &self.input_method_clients {
-            // The backend is locked while this runs: collect, then look up.
-            let _ = backend.with_all_objects_for(client.clone(), |object| objects.push(object));
-        }
-        objects
-            .into_iter()
-            .filter_map(|object| {
-                ZwpInputMethodKeyboardGrabV2::from_id(&self.display_handle, object).ok()
+    /// The seat's keyboard grab belongs to the locker: its input method's
+    /// grab, or a popup grab on one of its surfaces.
+    fn keyboard_grab_is_lockers(&self) -> bool {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+        keyboard
+            .with_grab(|_, grab| {
+                if grab.is::<InputMethodKeyboardGrab>() {
+                    // Smithay's input method grab names no surface.
+                    self.input_method_grab
+                        .as_ref()
+                        .is_some_and(|grab| self.of_session_locker(grab))
+                } else {
+                    grab.start_data()
+                        .focus
+                        .as_ref()
+                        .is_some_and(|surface| self.of_session_locker(&surface.id()))
+                }
             })
-            .collect()
+            .unwrap_or(false)
     }
 
     /// Lets go of every key the keyboard `device` holds, as if it had sent
