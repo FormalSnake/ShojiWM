@@ -794,6 +794,22 @@ impl CompositorHandler for ShojiWM {
                 );
             }
             self.window_commit_times.insert(window.clone(), commit_time);
+            // A window that picks its own size (no forced rect, e.g. after a
+            // configure with no size) changes it with nothing but a commit;
+            // nothing else would tell the config.
+            let resized_itself = self.window_decorations.get(&window).is_some_and(|cached| {
+                !cached.managed_window.force_rect_size
+                    && (
+                        cached.snapshot.position.width,
+                        cached.snapshot.position.height,
+                    ) != (snapshot.position.width, snapshot.position.height)
+            });
+            if resized_itself {
+                self.runtime_dirty_window_ids.insert(snapshot.id.clone());
+                self.runtime_managed_only_window_ids.remove(&snapshot.id);
+                self.runtime_node_only_window_ids.remove(&snapshot.id);
+                self.runtime_poll_dirty = true;
+            }
             if self.window_allows_render(&window) || self.window_drawn_by_composition(&window) {
                 self.snapshot_dirty_window_ids.insert(snapshot.id.clone());
                 self.window_source_damage

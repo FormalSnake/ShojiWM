@@ -6,6 +6,7 @@ use smithay::reexports::rustix::{
     process::{getpid, getuid},
 };
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs::{self, OpenOptions},
     io,
@@ -18,7 +19,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tracing::{info, warn};
@@ -178,6 +179,25 @@ pub enum SatelliteEvent {
     Exited { generation: u64, panicked: bool },
 }
 
+/// Whether each xdg_toplevel of one satellite run, by its protocol id on that
+/// run's connection, suggests floating by its X11 window's traits (window
+/// type, modal state, `WM_TRANSIENT_FOR`, `WM_WINDOW_ROLE`), which the
+/// toplevel itself cannot carry. Satellite fills it in before the toplevel's
+/// requests reach the compositor.
+#[derive(Clone, Default)]
+pub struct FloatHints(Arc<Mutex<HashMap<u32, bool>>>);
+
+impl FloatHints {
+    pub fn suggests_float(&self, toplevel: u32) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&toplevel)
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
 /// Delay before the first restart after a quick failure.
 const INITIAL_RESTART_DELAY: Duration = Duration::from_millis(500);
 /// Longest delay between restarts while satellite keeps failing.
@@ -220,8 +240,9 @@ impl EmbeddedSatellite {
     }
 
     /// Start satellite on a new thread. Returns the compositor's end of its
-    /// Wayland connection, to be inserted as a client.
-    pub fn start(&mut self) -> io::Result<UnixStream> {
+    /// Wayland connection, to be inserted as a client, and that run's float
+    /// hints.
+    pub fn start(&mut self) -> io::Result<(UnixStream, FloatHints)> {
         let (compositor_end, satellite_end) = UnixStream::pair()?;
         let listenfds = self
             .listeners
@@ -231,6 +252,7 @@ impl EmbeddedSatellite {
         self.generation += 1;
         self.ready = false;
         let generation = self.generation;
+        let float_hints = FloatHints::default();
         let data = EmbeddedRunData {
             display: self.display_name.clone(),
             listenfds: Mutex::new(listenfds),
@@ -238,6 +260,7 @@ impl EmbeddedSatellite {
             server: Mutex::new(Some(satellite_end)),
             events: self.events.clone(),
             generation,
+            float_hints: float_hints.clone(),
         };
         let events = self.events.clone();
         std::thread::Builder::new()
@@ -258,7 +281,7 @@ impl EmbeddedSatellite {
             generation,
             "started embedded xwayland-satellite"
         );
-        Ok(compositor_end)
+        Ok((compositor_end, float_hints))
     }
 
     /// The current run reported Xwayland ready.
@@ -320,6 +343,7 @@ struct EmbeddedRunData {
     server: Mutex<Option<UnixStream>>,
     events: Sender<SatelliteEvent>,
     generation: u64,
+    float_hints: FloatHints,
 }
 
 impl satellite::RunData for EmbeddedRunData {
@@ -337,6 +361,16 @@ impl satellite::RunData for EmbeddedRunData {
 
     fn server(&self) -> Option<UnixStream> {
         self.server.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn float_hints(&self) -> Option<satellite::FloatHints> {
+        let hints = self.float_hints.0.clone();
+        Some(Box::new(move |toplevel, floats| {
+            hints
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(toplevel, floats);
+        }))
     }
 
     fn xwayland_ready(&self, display: String, pid: u32) {

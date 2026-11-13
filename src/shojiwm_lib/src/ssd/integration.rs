@@ -5279,7 +5279,12 @@ impl ShojiWM {
 
             let configure_client_size = {
                 timescope::scope!("ssd apply managed configure size");
-                if let Some(final_root) = active_rect_override_target {
+                if !force_rect_size && (desired_root.width <= 0 || desired_root.height <= 0) {
+                    // A rect with no size leaves the size to the client, as
+                    // in the first configure: a config takes back a size it
+                    // told a mapped window this way.
+                    (0, 0)
+                } else if let Some(final_root) = active_rect_override_target {
                     let final_client = managed_client_rect_from_current_insets(
                         current_root,
                         current_client,
@@ -5448,7 +5453,7 @@ impl ShojiWM {
                         decoration.last_configured_client_size = Some(configure_client_size);
                     }
                 } else if let Some(x11) = window.x11_surface() {
-                    if configure_size_changed {
+                    if configure_size_changed && configure_client_size != (0, 0) {
                         let placed = Rectangle::<i32, Logical>::new(
                             Point::from((desired_client.x, desired_client.y)),
                             Size::from(configure_client_size),

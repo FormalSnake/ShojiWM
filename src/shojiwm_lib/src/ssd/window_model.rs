@@ -13,6 +13,7 @@ use smithay::{
         },
         shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData},
     },
+    xwayland::xwm::WmWindowType,
 };
 
 use super::DecorationInteractionSnapshot;
@@ -36,6 +37,11 @@ pub struct WaylandWindowSnapshot {
     pub size_constraints: WindowSizeConstraintsSnapshot,
     pub is_resizable: bool,
     pub is_transient: bool,
+    /// Hyprland's `suggestsFloat`: a parent or a fixed size, and for an X11
+    /// window also a float window type, `_NET_WM_STATE_MODAL`,
+    /// `WM_TRANSIENT_FOR` or a dialog `WM_WINDOW_ROLE`. See
+    /// `xdg_suggests_float` and `x11_suggests_float`.
+    pub suggests_float: bool,
     pub parent_id: Option<String>,
     pub icon: Option<WindowIconSnapshot>,
     pub interaction: DecorationInteractionSnapshot,
@@ -923,6 +929,8 @@ impl ShojiWM {
             .as_ref()
             .and_then(|surface| self.runtime_id_for_toplevel_surface(surface));
         let is_transient = parent_surface.is_some();
+        let suggests_float = xdg_suggests_float(is_transient, min_size, max_size)
+            || crate::state::satellite_suggests_float(&toplevel);
 
         // Active window, not raw keyboard focus: a layer-shell panel that
         // borrowed the keyboard must not make every window report itself as
@@ -985,6 +993,7 @@ impl ShojiWM {
             size_constraints,
             is_resizable,
             is_transient,
+            suggests_float,
             parent_id,
             icon: app_id.as_ref().map(|name| WindowIconSnapshot {
                 name: Some(name.clone()),
@@ -1022,6 +1031,7 @@ impl ShojiWM {
                 size_constraints: WindowSizeConstraintsSnapshot::default(),
                 is_resizable: true,
                 is_transient: false,
+                suggests_float: false,
                 parent_id: None,
                 icon: None,
                 interaction: DecorationInteractionSnapshot::default(),
@@ -1041,8 +1051,30 @@ impl ShojiWM {
         let size_constraints = window_size_constraints(min_size, max_size);
         let is_resizable = window_constraints_are_resizable(min_size, max_size);
         let transient_for = x11.is_transient_for();
-        let parent_id = transient_for.map(|parent| format!("x11:{parent}"));
+        // The parent's runtime id where it is mapped, as an xdg toplevel's.
+        let parent_id = transient_for.map(|parent| {
+            self.space
+                .elements()
+                .find(|window| {
+                    window
+                        .x11_surface()
+                        .is_some_and(|surface| surface.window_id() == parent)
+                })
+                .map(|window| {
+                    self.window_decorations
+                        .get(window)
+                        .map(|decoration| decoration.snapshot.id.clone())
+                        .unwrap_or_else(|| runtime_id_for_window(window))
+                })
+                .unwrap_or_else(|| format!("x11:{parent}"))
+        });
         let is_transient = parent_id.is_some() || x11.is_modal();
+        let suggests_float = x11_suggests_float(
+            x11.window_type(),
+            is_transient || x11.is_override_redirect(),
+            min_size,
+            max_size,
+        );
 
         // Active window, not raw keyboard focus — see the xdg-toplevel branch
         // above and `ShojiWM::activated_window_surface`.
@@ -1099,6 +1131,7 @@ impl ShojiWM {
             size_constraints,
             is_resizable,
             is_transient,
+            suggests_float,
             parent_id,
             icon: app_id.as_ref().map(|name| WindowIconSnapshot {
                 name: Some(name.clone()),
@@ -1319,6 +1352,54 @@ fn size_constraint_snapshot(
     })
 }
 
+/// Hyprland's `suggestsFloat` for an xdg toplevel (`WaylandBackend.cpp`
+/// `traitsFrom`): a parent, or both minimums set and one axis fixed. The
+/// xdg-dialog-v1 modal hint is not part of it: the protocol gives it no
+/// effect without a parent, and a parent already floats the window. An X11
+/// window carried by the embedded xwayland-satellite arrives as an xdg
+/// toplevel; its X11 traits come from satellite (`FloatHints`).
+fn xdg_suggests_float(
+    has_parent: bool,
+    min_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> bool {
+    let fixed = min_size.w != 0
+        && min_size.h != 0
+        && (min_size.w == max_size.w || min_size.h == max_size.h);
+    has_parent || fixed
+}
+
+/// Hyprland's X11 `suggestsFloat` (`X11Backend.cpp` `traitsFrom`) for a
+/// window on ShojiWM's own X11 window manager: a float window type, a parent
+/// or modal hint (`transient`), or both axes fixed. smithay's `X11Surface`
+/// exposes neither `WM_WINDOW_ROLE` nor `_KDE_NET_WM_WINDOW_TYPE_OVERRIDE`,
+/// so those two of Hyprland's predicates are missing here; the default
+/// xwayland-satellite path has them.
+fn x11_suggests_float(
+    window_type: Option<WmWindowType>,
+    transient: bool,
+    min_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> bool {
+    let fixed = min_size.w > 0 && min_size.h > 0 && min_size == max_size;
+    transient
+        || fixed
+        || matches!(
+            window_type,
+            Some(
+                WmWindowType::Dialog
+                    | WmWindowType::Splash
+                    | WmWindowType::Toolbar
+                    | WmWindowType::Utility
+                    | WmWindowType::Tooltip
+                    | WmWindowType::PopupMenu
+                    | WmWindowType::Dock
+                    | WmWindowType::DropdownMenu
+                    | WmWindowType::Menu
+            )
+        )
+}
+
 fn window_constraints_are_resizable(
     min_size: smithay::utils::Size<i32, smithay::utils::Logical>,
     max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
@@ -1419,7 +1500,75 @@ fn anchor_to_edge_snapshot(anchor: WlrAnchor) -> Option<LayerEdgeSnapshot> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PointerHitTargetSnapshot, WaylandWindowAction, WaylandWindowSnapshot};
+    use super::{
+        PointerHitTargetSnapshot, WaylandWindowAction, WaylandWindowSnapshot, WmWindowType,
+        x11_suggests_float, xdg_suggests_float,
+    };
+
+    #[test]
+    fn an_xdg_window_floats_by_hyprlands_traits() {
+        let size = |w, h| (w, h).into();
+        assert!(xdg_suggests_float(true, size(0, 0), size(0, 0)));
+        assert!(xdg_suggests_float(false, size(560, 249), size(560, 249)));
+        assert!(xdg_suggests_float(false, size(400, 300), size(400, 0)));
+        assert!(!xdg_suggests_float(false, size(400, 300), size(0, 0)));
+        // A fixed width with no minimum height is not a fixed size.
+        assert!(!xdg_suggests_float(false, size(400, 0), size(400, 0)));
+    }
+
+    #[test]
+    fn an_x11_window_floats_by_hyprlands_traits() {
+        let none = (0, 0).into();
+        for kind in [
+            WmWindowType::Dialog,
+            WmWindowType::Utility,
+            WmWindowType::Splash,
+            WmWindowType::Toolbar,
+            WmWindowType::Menu,
+            WmWindowType::PopupMenu,
+            WmWindowType::DropdownMenu,
+            WmWindowType::Tooltip,
+            WmWindowType::Dock,
+        ] {
+            assert!(
+                x11_suggests_float(Some(kind), false, none, none),
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            None,
+            Some(WmWindowType::Normal),
+            Some(WmWindowType::Notification),
+        ] {
+            assert!(!x11_suggests_float(kind, false, none, none), "{kind:?}");
+        }
+        // WM_TRANSIENT_FOR or _NET_WM_STATE_MODAL on a normal window.
+        assert!(x11_suggests_float(
+            Some(WmWindowType::Normal),
+            true,
+            none,
+            none
+        ));
+        // Both axes fixed floats; one axis does not, unlike an xdg toplevel.
+        assert!(x11_suggests_float(
+            None,
+            false,
+            (400, 300).into(),
+            (400, 300).into()
+        ));
+        assert!(!x11_suggests_float(
+            None,
+            false,
+            (400, 300).into(),
+            (400, 0).into()
+        ));
+        assert!(!x11_suggests_float(
+            None,
+            false,
+            (400, 0).into(),
+            (800, 0).into()
+        ));
+    }
 
     #[test]
     fn foreign_toplevel_id_is_sent_once_known() {
@@ -1439,6 +1588,7 @@ mod tests {
             size_constraints: Default::default(),
             is_resizable: true,
             is_transient: false,
+            suggests_float: false,
             parent_id: None,
             icon: None,
             interaction: Default::default(),

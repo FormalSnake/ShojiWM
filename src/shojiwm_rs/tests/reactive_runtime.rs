@@ -39,6 +39,7 @@ fn snapshot(id: &str, title: &str, focused: bool) -> WaylandWindowSnapshot {
         size_constraints: Default::default(),
         is_resizable: true,
         is_transient: false,
+        suggests_float: false,
         parent_id: None,
         icon: None,
         interaction: Default::default(),
