@@ -22,6 +22,8 @@ uniform vec4 shoji_border_color_top;
 uniform vec4 shoji_border_color_right;
 uniform vec4 shoji_border_color_bottom;
 uniform vec4 shoji_border_color_left;
+// The border's alpha at the bottom edge as a share of its top's.
+uniform float shoji_border_fade;
 uniform float shoji_opacity;
 
 // Clips applied after `paint_main`, relative to the node.

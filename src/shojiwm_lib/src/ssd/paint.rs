@@ -184,6 +184,8 @@ pub struct PaintItem {
     pub background: Color,
     /// `[top, right, bottom, left]`.
     pub border_colors: [Color; 4],
+    /// The border's alpha at the bottom edge as a share of its top's.
+    pub border_fade: f32,
     pub opacity: f32,
     pub uniforms: BTreeMap<String, ShaderUniformValue>,
 }
@@ -511,12 +513,14 @@ pub(crate) fn paint_item(
             .map(|border| border.color)
             .unwrap_or(Color::TRANSPARENT)
     });
+    let border_fade = node.style.border_fade.unwrap_or(1.0).clamp(0.0, 1.0) as f32;
     let opacity = node.style.opacity.unwrap_or(1.0).clamp(0.0, 1.0);
     let item = |program, geometry, uniforms| PaintItem {
         program,
         geometry,
         background,
         border_colors,
+        border_fade,
         opacity,
         uniforms,
     };
@@ -595,4 +599,72 @@ pub(crate) fn item_logical_rect(frame: LayoutFrame, item: &PaintItem) -> super::
         draw = PxRect::new(x, y, (right - x).max(0), (bottom - y).max(0));
     }
     frame.logical_rect(draw.to_resolved())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssd::{
+        BoxNode, DecorationNode, DecorationStyle, DecorationTree, LayoutDirection, LogicalRect,
+    };
+
+    fn ring(width: f64, color: Color) -> Option<super::super::BorderStyle> {
+        Some(super::super::BorderStyle { width, color })
+    }
+
+    /// A frame of two rings round the client: the outer on the
+    /// `<WindowBorder>`, a faded one on a box inside it.
+    #[test]
+    fn a_faded_ring_inside_a_frame_meets_it_and_the_client_corner_for_corner() {
+        let inner = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_style(DecorationStyle {
+            border: ring(1.0, Color::WHITE),
+            border_fade: Some(0.0),
+            border_radius: Some(11.0),
+            flex_grow: Some(1.0),
+            ..Default::default()
+        })
+        .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]);
+        let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
+            .with_style(DecorationStyle {
+                border: ring(1.0, Color::BLACK),
+                border_radius: Some(12.0),
+                ..Default::default()
+            })
+            .with_children(vec![inner]);
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(0, 0, 300, 200))
+            .expect("layout should succeed");
+        assert_eq!(
+            layout.window_slot_rect(),
+            Some(LogicalRect::new(2, 2, 296, 196))
+        );
+
+        let outer_node = &layout.root;
+        let ring_node = &outer_node.children[0];
+        let clips = PaintClipState::default();
+        let outer = node_geometry(outer_node, clips);
+        let inner = node_geometry(ring_node, clips.for_children(outer_node));
+        // The ring's outer edge is the frame's inner edge, arc for arc.
+        assert_eq!(inner.node, outer.inner);
+        assert_eq!(inner.radius, outer.inner_radius);
+        assert_eq!(inner.radius, [11; 4]);
+        // And its inner edge is where the client is cut.
+        let slot = &ring_node.children[0];
+        let cut = slot.resolved_effective_clip.expect("the client is clipped");
+        assert_eq!(PxRect::from_resolved(cut.rect), inner.inner);
+        assert_eq!(cut.radius.raw(), inner.inner_radius[0]);
+        assert_eq!(inner.inner_radius, [10; 4]);
+
+        let program = PaintSlot::Box;
+        let outer_item = paint_item(outer_node, program, outer).unwrap();
+        let ring_item = paint_item(ring_node, program, inner).unwrap();
+        assert_eq!(outer_item.border_fade, 1.0);
+        assert_eq!(ring_item.border_fade, 0.0);
+        // Both hollow, so each costs only its rim.
+        assert!(outer_item.transparent_interior().is_some());
+        assert!(ring_item.transparent_interior().is_some());
+    }
 }

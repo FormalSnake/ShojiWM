@@ -75,6 +75,7 @@ fn builtin_uniform_names() -> Vec<UniformName<'static>> {
         "shoji_rounded_clip_enabled",
         "shoji_box_fill",
         "shoji_box_border",
+        "shoji_border_fade",
         "shoji_shadow_sigma",
         "shoji_shadow_spread",
         "shoji_shadow_inset",
@@ -275,6 +276,7 @@ fn uniforms_for_item(item: &PaintItem) -> Vec<Uniform<'static>> {
         "shoji_box_border",
         if border { 1.0f32 } else { 0.0 },
     ));
+    uniforms.push(Uniform::new("shoji_border_fade", item.border_fade));
 
     let shadow = match item.program {
         PaintProgram::Shadow(shadow) => Some(shadow),

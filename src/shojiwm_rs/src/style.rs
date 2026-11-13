@@ -250,6 +250,9 @@ style_fields! {
     border_bottom: Border,
     border_left: Border,
     border_fit: BorderFit,
+    /// The border's alpha at the bottom edge as a share of its top's, the
+    /// sides fading between.
+    border_fade: f64,
     border_radius: f64,
     /// CSS-like shadows; the first entry is painted on top.
     box_shadow: Vec<BoxShadow>,
@@ -374,6 +377,7 @@ impl Style {
             border_bottom: read(&self.border_bottom).map(Into::into),
             border_left: read(&self.border_left).map(Into::into),
             border_fit: read(&self.border_fit),
+            border_fade: read(&self.border_fade),
             border_radius: read(&self.border_radius),
             visible: read(&self.visible),
             cursor: read(&self.cursor),

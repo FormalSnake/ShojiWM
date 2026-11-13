@@ -1500,6 +1500,9 @@ pub struct DecorationStyle {
     pub border_bottom: Option<BorderStyle>,
     pub border_left: Option<BorderStyle>,
     pub border_fit: Option<BorderFit>,
+    /// The border's alpha at the node's bottom edge as a share of its alpha
+    /// at the top, the sides fading between. Absent is 1.
+    pub border_fade: Option<f64>,
     pub border_radius: Option<f64>,
     pub visible: Option<bool>,
     pub cursor: Option<String>,

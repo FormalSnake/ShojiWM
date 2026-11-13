@@ -2888,6 +2888,11 @@ export interface SSDStyle {
   borderBottom?: MaybeSignal<BorderValue>;
   borderLeft?: MaybeSignal<BorderValue>;
   borderFit?: MaybeSignal<"normal" | "fit-children">;
+  /**
+   * The border's alpha at the bottom edge as a share of its top's, the sides
+   * fading between. 1 when absent.
+   */
+  borderFade?: MaybeSignal<number>;
   borderRadius?: MaybeSignal<number>;
   /**
    * CSS-like shadows; the first entry is painted on top.
