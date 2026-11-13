@@ -33,6 +33,9 @@ pub struct MoveSurfaceGrab {
     pub source: WindowMoveSourceSnapshot,
     pub runtime_managed: bool,
     pub last_pointer: Point<f64, Logical>,
+    /// The button that held the grab was let go, so `unset` ends it with
+    /// `End` rather than `Cancel`.
+    released: bool,
 }
 
 impl MoveSurfaceGrab {
@@ -51,6 +54,7 @@ impl MoveSurfaceGrab {
             initial_event_rect,
             source,
             runtime_managed: false,
+            released: false,
             last_pointer,
         }
     }
@@ -246,14 +250,8 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
 
         if !handle.current_pressed().contains(&BTN_LEFT) {
             // No more buttons are pressed, release the grab.
+            self.released = true;
             handle.unset_grab(self, data, event.serial, event.time, true);
-            if self.runtime_managed {
-                let window_id = data.snapshot_window(&self.window).id;
-                let event =
-                    self.runtime_event(data, WindowMovePhaseSnapshot::End, self.last_pointer);
-                data.queue_grab_end_dispatch(PendingGrabMotion::WindowMove { window_id, event });
-            }
-            data.update_decoration_cursor_icon(self.last_pointer);
         }
     }
 
@@ -346,8 +344,21 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
         &self.start_data
     }
 
+    /// Every way the grab ends comes through here once: the button let go,
+    /// or the grab taken away, as a session lock or another grab does. The
+    /// config hears `End` or `Cancel`.
     fn unset(&mut self, data: &mut ShojiWM) {
         data.pointer_dispatch.discard_grab_motion();
+        if self.runtime_managed {
+            let phase = if self.released {
+                WindowMovePhaseSnapshot::End
+            } else {
+                WindowMovePhaseSnapshot::Cancel
+            };
+            let window_id = data.snapshot_window(&self.window).id;
+            let event = self.runtime_event(data, phase, self.last_pointer);
+            data.queue_grab_end_dispatch(PendingGrabMotion::WindowMove { window_id, event });
+        }
         data.update_decoration_cursor_icon(self.last_pointer);
     }
 }
