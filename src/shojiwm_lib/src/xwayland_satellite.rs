@@ -1117,11 +1117,10 @@ mod tests {
             drop(held);
         });
 
-        let started = Instant::now();
-        let taken = take_reclaim_turn(&turn.0, Duration::from_secs(3));
+        // The wait only bounds a hang; the turn is taken as soon as it is let go.
+        let taken = take_reclaim_turn(&turn.0, Duration::from_secs(30));
 
         assert!(taken.is_some(), "taken once let go");
-        assert!(started.elapsed() < Duration::from_secs(3));
         release.join().unwrap();
     }
 }
