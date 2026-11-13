@@ -1,7 +1,10 @@
 use smithay::{
     backend::renderer::{
         Renderer,
-        element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
+        element::{
+            Element, Id, Kind, RenderElement, UnderlyingStorage,
+            utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
+        },
         utils::{CommitCounter, DamageSet, OpaqueRegions},
     },
     utils::{
@@ -595,8 +598,21 @@ pub struct WindowVisualState {
     pub opacity: f32,
 }
 
+/// A window's snapshot under its visual transform: scaled about `origin`,
+/// then moved by `translation`.
+pub fn transformed_snapshot_element<E: Element>(
+    element: E,
+    visual: WindowVisualState,
+) -> RelocateRenderElement<RescaleRenderElement<E>> {
+    RelocateRenderElement::from_element(
+        RescaleRenderElement::from_element(element, visual.origin, visual.scale),
+        visual.translation,
+        Relocate::Relative,
+    )
+}
+
 /// Where `rect`, in output physical pixels, lands once the window's visual
-/// transform is applied to it as `transform_snapshot_elements` applies it to
+/// transform is applied to it as `transformed_snapshot_element` applies it to
 /// the window's snapshot: scaled about `origin`, then moved by `translation`.
 pub fn visually_transformed_physical_rect(
     rect: Rectangle<i32, Physical>,
@@ -607,8 +623,18 @@ pub fn visually_transformed_physical_rect(
     };
     Rectangle::new(
         Point::from((
-            map(rect.loc.x, visual.origin.x, visual.scale.x, visual.translation.x),
-            map(rect.loc.y, visual.origin.y, visual.scale.y, visual.translation.y),
+            map(
+                rect.loc.x,
+                visual.origin.x,
+                visual.scale.x,
+                visual.translation.x,
+            ),
+            map(
+                rect.loc.y,
+                visual.origin.y,
+                visual.scale.y,
+                visual.translation.y,
+            ),
         )),
         (
             rect.size.w as f64 * visual.scale.x,
@@ -857,12 +883,13 @@ pub fn relative_physical_rect_from_root_global_edges_precise(
 #[cfg(test)]
 mod tests {
     use super::{
-        PreciseLogicalRect, WindowVisualState, backdrop_sample_rects, is_identity_visual_geometry,
-        visually_transformed_physical_rect,
+        PreciseLogicalRect, RootSubpixelEdges, WindowVisualState, backdrop_sample_rects,
+        is_identity_visual_geometry, logical_size_to_physical_buffer_size,
         relative_physical_rect_from_root, relative_physical_rect_from_root_snapped_edges,
-        requires_full_window_snapshot, snapped_precise_logical_rect_in_area_space,
-        snapped_precise_logical_rect_in_element_space,
-        snapped_precise_logical_rect_in_root_frame_area_space,
+        requires_full_window_snapshot, root_physical_origin_precise,
+        snapped_precise_logical_rect_in_area_space, snapped_precise_logical_rect_in_element_space,
+        snapped_precise_logical_rect_in_root_frame_area_space, transformed_snapshot_element,
+        window_backdrop_geometry, window_visual_state,
     };
     use crate::ssd::{LogicalRect, WindowTransform};
     use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
@@ -898,34 +925,160 @@ mod tests {
         assert_eq!((precise.x, precise.width), (17.5, 994.5));
     }
 
-    /// The physical rect of a backdrop under a window that scales about its
-    /// left edge to three times its width and slides 40 px right: the
-    /// pipeline samples where the snapshot puts it, not where it is laid out.
-    #[test]
-    fn a_backdrop_is_sampled_where_the_snapshot_draws_it() {
-        let visual = WindowVisualState {
-            origin: Point::<i32, Physical>::from((12, 12)),
-            scale: Scale::from((3.0, 1.0)),
-            translation: Point::<i32, Physical>::from((40, 0)),
-            opacity: 1.0,
-        };
-        let laid_out = Rectangle::<i32, Physical>::new((15, 15).into(), (415, 1570).into());
-        let drawn = visually_transformed_physical_rect(laid_out, visual);
-        assert_eq!(
-            (drawn.loc.x, drawn.loc.y, drawn.size.w, drawn.size.h),
-            (61.0, 15.0, 1245.0, 1570.0)
-        );
+    const OUTPUT_SIZE: (i32, i32) = (2048, 1280);
 
-        let rest = WindowVisualState {
-            scale: Scale::from((1.0, 1.0)),
-            translation: Point::<i32, Physical>::from((0, 0)),
-            ..visual
+    fn output() -> Rectangle<i32, Logical> {
+        Rectangle::from_size(OUTPUT_SIZE.into())
+    }
+
+    fn scaled_by(scale_x: f64, scale_y: f64) -> WindowTransform {
+        let mut transform = WindowTransform::default();
+        transform.origin.x = 0.0;
+        transform.origin.y = 0.0;
+        transform.scale_x = scale_x;
+        transform.scale_y = scale_y;
+        transform
+    }
+
+    /// A column laid out a third of the output wide and drawn three times as
+    /// wide by its snapshot (formalwm widening it with SUPER+R), and a window
+    /// zoomed out to 0.3 by the overview: its backdrop is sampled where the
+    /// window's snapshot element, scaled and moved as the backends move it,
+    /// puts the backdrop node, and the capture holds that.
+    #[test]
+    fn a_scaled_windows_backdrop_is_sampled_where_its_snapshot_draws_it() {
+        use smithay::backend::renderer::{
+            element::{Element, Id, Kind, solid::SolidColorRenderElement},
+            utils::CommitCounter,
         };
-        let drawn = visually_transformed_physical_rect(laid_out, rest);
-        assert_eq!(
-            (drawn.loc.x, drawn.loc.y, drawn.size.w, drawn.size.h),
-            (15.0, 15.0, 415.0, 1570.0)
+        let scale = Scale::from(1.25);
+        for (root, node, transform) in [
+            (
+                LogicalRect::new(10, 10, 336, 1260),
+                LogicalRect::new(12, 12, 332, 1256),
+                scaled_by(3.0, 1.0),
+            ),
+            (
+                LogicalRect::new(700, 10, 1008, 1260),
+                LogicalRect::new(702, 40, 1004, 1226),
+                scaled_by(0.3, 0.3),
+            ),
+        ] {
+            let backdrop = window_backdrop_geometry(
+                node,
+                None,
+                root,
+                RootSubpixelEdges::default(),
+                transform,
+                24,
+                None,
+                output(),
+                scale,
+            );
+            let root_origin =
+                root_physical_origin_precise(root, RootSubpixelEdges::default(), output(), scale);
+            let laid_out = SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::new(root_origin + backdrop.geometry.loc, backdrop.geometry.size),
+                CommitCounter::default(),
+                [0.0, 0.0, 0.0, 1.0],
+                Kind::Unspecified,
+            );
+            let visual = window_visual_state(root, transform, output(), scale);
+            let drawn = transformed_snapshot_element(laid_out, visual).geometry(scale);
+            let sampled = backdrop.sample_region;
+            let at = |physical: i32, origin: i32, sampled: f64| {
+                ((physical - origin) as f64 - sampled).abs()
+            };
+            assert!(
+                at(drawn.loc.x, backdrop.capture_origin.x, sampled.loc.x) <= 1.0,
+                "{drawn:?} {backdrop:?}"
+            );
+            assert!(
+                at(drawn.loc.y, backdrop.capture_origin.y, sampled.loc.y) <= 1.0,
+                "{drawn:?} {backdrop:?}"
+            );
+            assert!(
+                (drawn.size.w as f64 - sampled.size.w).abs() <= 1.0,
+                "{drawn:?} {backdrop:?}"
+            );
+            assert!(
+                (drawn.size.h as f64 - sampled.size.h).abs() <= 1.0,
+                "{drawn:?} {backdrop:?}"
+            );
+
+            let (w, h) = logical_size_to_physical_buffer_size(
+                backdrop.capture.size.w,
+                backdrop.capture.size.h,
+                scale,
+            );
+            assert!(sampled.loc.x >= 0.0 && sampled.loc.y >= 0.0, "{backdrop:?}");
+            assert!(
+                sampled.loc.x + sampled.size.w <= w as f64 + 0.5,
+                "{backdrop:?}"
+            );
+            assert!(
+                sampled.loc.y + sampled.size.h <= h as f64 + 0.5,
+                "{backdrop:?}"
+            );
+        }
+    }
+
+    fn animate(
+        frames: impl Iterator<Item = f64>,
+        start: Option<Rectangle<i32, Logical>>,
+    ) -> Vec<Rectangle<i32, Logical>> {
+        let root = LogicalRect::new(700, 10, 1008, 1260);
+        let node = LogicalRect::new(702, 12, 1004, 1256);
+        let mut previous = start;
+        frames
+            .map(|scale| {
+                let capture = window_backdrop_geometry(
+                    node,
+                    None,
+                    root,
+                    RootSubpixelEdges::default(),
+                    scaled_by(scale, scale),
+                    24,
+                    previous,
+                    output(),
+                    Scale::from(1.25),
+                )
+                .capture;
+                previous = Some(capture);
+                capture
+            })
+            .collect()
+    }
+
+    /// The overview zooming a window out from rest to 0.3 over 60 frames: one
+    /// capture region for the whole animation, so one capture size and one
+    /// blur pyramid.
+    #[test]
+    fn a_window_scaling_down_keeps_one_capture_region() {
+        let captures = animate((0..=60).map(|frame| 1.0 - 0.7 * frame as f64 / 60.0), None);
+        assert!(
+            captures.iter().all(|capture| *capture == captures[0]),
+            "{captures:?}"
         );
+        assert_eq!(
+            captures[0],
+            Rectangle::new((678, 0).into(), (1052, 1280).into())
+        );
+    }
+
+    /// A column widened from a third of its width with no region to start
+    /// from: the first animated frame's region already reaches the rest rect,
+    /// so the whole animation shares it, and the window at rest goes back to
+    /// the tight one.
+    #[test]
+    fn a_widening_column_shares_one_capture_region_until_it_rests() {
+        let captures = animate((0..=60).map(|frame| 0.3 + 0.7 * frame as f64 / 60.0), None);
+        let mut regions = captures.clone();
+        regions.dedup();
+        assert!(regions.len() <= 2, "{regions:?}");
+        let at_rest = animate(std::iter::once(1.0), None)[0];
+        assert_eq!(captures.last(), Some(&at_rest));
     }
 
     #[test]
@@ -1210,6 +1363,117 @@ pub fn backdrop_sample_rects(
         .map(|precise| transformed_precise_rect(precise, reference_rect, transform))
         .unwrap_or_else(|| precise_rect_from_logical(sampled));
     (sampled, precise)
+}
+
+/// The region a window node's backdrop is captured and blurred over, clipped
+/// to the output. At rest it is `sampled` plus `padding`, the blur's reach.
+/// While the window's transform animates it keeps the previous region as long
+/// as that still holds `sampled` plus half the padding, so a window scaling
+/// down (or back up to where it started) is sampled from one capture and one
+/// blur at one size, at the price of a little less reach at its edges. When
+/// the window leaves it, it grows to cover both, `at_rest` (where a resize
+/// animation ends) and a quarter of the window each way, so the window
+/// outruns it at most a few times per animation.
+pub fn backdrop_capture_region(
+    sampled: LogicalRect,
+    at_rest: LogicalRect,
+    padding: i32,
+    previous: Option<Rectangle<i32, Logical>>,
+    animating: bool,
+    output_geo: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let padded = |rect: LogicalRect, padding: i32| {
+        Rectangle::<i32, Logical>::new(
+            Point::from((rect.x - padding, rect.y - padding)),
+            (rect.width + padding * 2, rect.height + padding * 2).into(),
+        )
+    };
+    let clip = |rect: Rectangle<i32, Logical>| rect.intersection(output_geo).unwrap_or(rect);
+    let needed = clip(padded(sampled, padding));
+    if !animating {
+        return needed;
+    }
+    match previous {
+        Some(previous) if previous.contains_rect(clip(padded(sampled, padding / 2))) => previous,
+        previous => {
+            let reach = Point::<i32, Logical>::from((needed.size.w / 4, needed.size.h / 4));
+            let grown = Rectangle::new(
+                needed.loc - reach,
+                (needed.size.w + reach.x * 2, needed.size.h + reach.y * 2).into(),
+            )
+            .merge(padded(at_rest, padding));
+            clip(previous.map_or(grown, |previous| previous.merge(grown)))
+        }
+    }
+}
+
+/// Where a window node's backdrop comes from and goes, for one frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowBackdropGeometry {
+    /// The node's rect under the transform the window is drawn with.
+    pub sampled: LogicalRect,
+    /// What is captured and blurred, see [`backdrop_capture_region`].
+    pub capture: Rectangle<i32, Logical>,
+    /// The capture's top left corner in output physical pixels.
+    pub capture_origin: Point<i32, Physical>,
+    /// Where the window draws the node, in the capture's pixels.
+    pub sample_region: Rectangle<f64, Buffer>,
+    /// The node laid out in its window, relative to the window's root, in
+    /// physical pixels: the backdrop element's geometry.
+    pub geometry: Rectangle<i32, Physical>,
+}
+
+/// The backdrop of the node at `rect` in a window laid out at `root_rect`
+/// and drawn with `transform`: sampled where the window's snapshot puts the
+/// node, drawn back at the node's layout rect, which the snapshot then moves
+/// to where it was sampled.
+pub fn window_backdrop_geometry(
+    rect: LogicalRect,
+    rect_precise: Option<PreciseLogicalRect>,
+    root_rect: LogicalRect,
+    root_subpixel: RootSubpixelEdges,
+    transform: WindowTransform,
+    padding: i32,
+    previous_capture: Option<Rectangle<i32, Logical>>,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+) -> WindowBackdropGeometry {
+    let (sampled, _) = backdrop_sample_rects(rect, rect_precise, root_rect, transform);
+    let visual = window_visual_state(root_rect, transform, output_geo, scale);
+    let capture = backdrop_capture_region(
+        sampled,
+        rect,
+        padding.max(0),
+        previous_capture,
+        !is_identity_visual_geometry(visual),
+        output_geo,
+    );
+    let capture_origin =
+        logical_point_to_physical_point_global_edges(capture.loc, output_geo.loc, scale);
+    let geometry = relative_physical_rect_from_root_precise(
+        rect_precise.unwrap_or_else(|| precise_rect_from_logical(rect)),
+        root_rect,
+        root_subpixel,
+        output_geo,
+        scale,
+    );
+    let root_origin = root_physical_origin_precise(root_rect, root_subpixel, output_geo, scale);
+    let laid_out = Rectangle::new(root_origin + geometry.loc, geometry.size);
+    let drawn = visually_transformed_physical_rect(laid_out, visual);
+    let sample_region = Rectangle::new(
+        Point::from((
+            drawn.loc.x - capture_origin.x as f64,
+            drawn.loc.y - capture_origin.y as f64,
+        )),
+        (drawn.size.w, drawn.size.h).into(),
+    );
+    WindowBackdropGeometry {
+        sampled,
+        capture,
+        capture_origin,
+        sample_region,
+        geometry,
+    }
 }
 
 pub fn transformed_precise_rect(

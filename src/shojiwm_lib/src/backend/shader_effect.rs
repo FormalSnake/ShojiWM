@@ -105,6 +105,17 @@ pub struct CachedBackdropTexture {
     pub id: Id,
     pub commit_counter: CommitCounter,
     pub sub_elements: HashMap<String, CachedBackdropSubElement>,
+    /// Set by window backdrops, which keep their capture between frames.
+    pub region: Option<CapturedBackdropRegion>,
+}
+
+/// A window backdrop's capture: the region it covers and the snapshots it
+/// was drawn into, drawn into again while the region keeps its size.
+#[derive(Debug, Clone)]
+pub struct CapturedBackdropRegion {
+    pub rect: Rectangle<i32, Logical>,
+    pub backdrop: Option<crate::backend::snapshot::LiveWindowSnapshot>,
+    pub xray: Option<crate::backend::snapshot::LiveWindowSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -4252,18 +4263,6 @@ pub fn backdrop_shader_element_with_geometry(
     clip_radius: f32,
     debug_label: String,
 ) -> Result<StableBackdropTextureElement, ShaderEffectError> {
-    // Plain backdrop blur is fully opaque, so the default display program
-    // forces alpha to 1.0 to hide capture/blur alpha noise at the edges (see
-    // EffectAlphaMode). Effects that declare `alpha: "preserve"` keep the
-    // pipeline's alpha intact — otherwise masked-out areas would show up as
-    // opaque black. The mode is an explicit opt-in from the config, never
-    // inferred from the pipeline contents.
-    let program = match shader.alpha {
-        crate::ssd::EffectAlphaMode::Preserve => {
-            compile_display_texture_program_preserve_alpha(renderer)?
-        }
-        crate::ssd::EffectAlphaMode::Opaque => compile_display_texture_program(renderer)?,
-    };
     let texture_size = texture.size();
     let captured_width_px = texture_size.w.max(1);
     let captured_height_px = texture_size.h.max(1);
@@ -4303,24 +4302,66 @@ pub fn backdrop_shader_element_with_geometry(
         smithay::utils::Point::from((sample_left_px as f64, sample_top_px as f64)),
         (sample_width_px as f64, sample_height_px as f64).into(),
     );
+    backdrop_shader_element_sampling(
+        renderer,
+        element_id,
+        commit_counter,
+        texture,
+        display_rect,
+        geometry,
+        src,
+        sample_uv_phase,
+        shader,
+        alpha,
+        render_scale,
+        clip_rect,
+        clip_radius,
+        debug_label,
+    )
+}
+
+/// A backdrop element drawing `src`, in `texture`'s pixels, over `geometry`.
+pub fn backdrop_shader_element_sampling(
+    renderer: &mut GlesRenderer,
+    element_id: Id,
+    commit_counter: CommitCounter,
+    texture: GlesTexture,
+    display_rect: Rectangle<i32, Logical>,
+    geometry: Rectangle<i32, Physical>,
+    src: Rectangle<f64, Buffer>,
+    sample_uv_phase: [f32; 2],
+    shader: &CompiledEffect,
+    alpha: f32,
+    render_scale: f32,
+    clip_rect: Option<SnappedLogicalRect>,
+    clip_radius: f32,
+    debug_label: String,
+) -> Result<StableBackdropTextureElement, ShaderEffectError> {
+    // Plain backdrop blur is fully opaque, so the default display program
+    // forces alpha to 1.0 to hide capture/blur alpha noise at the edges (see
+    // EffectAlphaMode). Effects that declare `alpha: "preserve"` keep the
+    // pipeline's alpha intact, otherwise masked-out areas would show up as
+    // opaque black. The mode is an explicit opt-in from the config, never
+    // inferred from the pipeline contents.
+    let program = match shader.alpha {
+        crate::ssd::EffectAlphaMode::Preserve => {
+            compile_display_texture_program_preserve_alpha(renderer)?
+        }
+        crate::ssd::EffectAlphaMode::Opaque => compile_display_texture_program(renderer)?,
+    };
+    let texture_size = texture.size();
+    let (width_px, height_px) = (texture_size.w.max(1) as f32, texture_size.h.max(1) as f32);
     let uv_offset = [
-        (sample_left_px as f32 + sample_uv_phase[0]) / captured_width_px.max(1) as f32,
-        (sample_top_px as f32 + sample_uv_phase[1]) / captured_height_px.max(1) as f32,
+        (src.loc.x as f32 + sample_uv_phase[0]) / width_px,
+        (src.loc.y as f32 + sample_uv_phase[1]) / height_px,
     ];
-    let uv_scale = [
-        sample_width_px as f32 / captured_width_px.max(1) as f32,
-        sample_height_px as f32 / captured_height_px.max(1) as f32,
-    ];
+    let uv_scale = [src.size.w as f32 / width_px, src.size.h as f32 / height_px];
     if crate::env_flag!("SHOJI_GAP_DEBUG") {
         tracing::info!(
             debug_label = %debug_label,
             texture_size = ?texture_size,
             display_rect = ?display_rect,
             geometry = ?geometry,
-            sample_rect = ?sample_rect,
-            captured_rect = ?captured_rect,
-            sample_px = ?(sample_left_px, sample_top_px, sample_width_px, sample_height_px),
-            captured_px = ?(captured_width_px, captured_height_px),
             src = ?src,
             uv_offset = ?uv_offset,
             uv_scale = ?uv_scale,
@@ -6315,7 +6356,11 @@ pub fn preblur_backdrop_texture(
         let source = levels[pass.from]
             .clone()
             .expect("a kawase pass reads a level an earlier pass wrote");
-        let program = if pass.up { &programs.up } else { &programs.down };
+        let program = if pass.up {
+            &programs.up
+        } else {
+            &programs.down
+        };
         levels[pass.to] = Some(blur_texture_pass(
             renderer,
             source,
@@ -6398,7 +6443,11 @@ fn preblur_using_pyramid(
 
     let (sizes, plan) = kawase_plan(source_size, passes);
     for pass in plan {
-        let source_tex = if pass.from == 0 { &source } else { &pyramid[pass.from] };
+        let source_tex = if pass.from == 0 {
+            &source
+        } else {
+            &pyramid[pass.from]
+        };
         let (label, program) = if pass.up {
             ("blur-upsample-pass", &programs.up)
         } else {
@@ -6416,7 +6465,11 @@ fn preblur_using_pyramid(
         )?;
         if stage_readback {
             let direction = if pass.up { "up" } else { "down" };
-            gap_stage_readback(renderer, &format!("blur-{direction}-{}", pass.to), &pyramid[pass.to]);
+            gap_stage_readback(
+                renderer,
+                &format!("blur-{direction}-{}", pass.to),
+                &pyramid[pass.to],
+            );
         }
     }
 
@@ -7276,7 +7329,10 @@ mod kawase_plan_tests {
     fn passes_walk_the_pyramid_down_then_back_up() {
         let (sizes, plan) = kawase_plan((2560, 1440), 2);
         assert_eq!(sizes, vec![(2560, 1440), (1280, 720), (640, 360)]);
-        let steps: Vec<_> = plan.iter().map(|pass| (pass.up, pass.from, pass.to)).collect();
+        let steps: Vec<_> = plan
+            .iter()
+            .map(|pass| (pass.up, pass.from, pass.to))
+            .collect();
         assert_eq!(
             steps,
             vec![(false, 0, 1), (false, 1, 2), (true, 2, 1), (true, 1, 0)]
