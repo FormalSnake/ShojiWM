@@ -13,7 +13,10 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -245,6 +248,39 @@ impl Copies {
     }
 }
 
+/// Every copy of this GL context goes: an output of its has gone or has
+/// changed mode, and a copy of the size it drew at would stay otherwise
+/// until some pass copied again.
+pub fn forget_copies(renderer: &mut GlesRenderer) {
+    copies(renderer)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .held
+        .clear();
+}
+
+/// The passes of one frame of an output, counted over every windows node
+/// the frame draws: what one node cannot see of the others.
+#[derive(Debug, Clone, Default)]
+pub struct Frame(Arc<AtomicUsize>);
+
+impl Frame {
+    /// `passes` more are in the frame.
+    pub fn add(&self, passes: usize) {
+        self.0.fetch_add(passes, Ordering::Relaxed);
+    }
+
+    fn crowded(&self) -> bool {
+        self.0.load(Ordering::Relaxed) > 1
+    }
+}
+
+/// A commit no pass has had: one more for every pass built.
+fn fresh_commit() -> CommitCounter {
+    static BUILT: AtomicUsize = AtomicUsize::new(0);
+    CommitCounter::from((usize::MAX / 2).wrapping_add(BUILT.fetch_add(1, Ordering::Relaxed)))
+}
+
 /// `None` where the shader does not compile, found out once.
 #[derive(Debug)]
 struct Program(Option<GlesTexProgram>);
@@ -275,6 +311,11 @@ fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
 pub struct MotionBlurElement {
     id: Id,
     commit: CommitCounter,
+    /// Its commit in a frame with other passes in it: they share the copy,
+    /// so each has to copy again, which a new commit makes the damage
+    /// tracker ask for. Known only once every node of the frame is built.
+    among_others: CommitCounter,
+    frame: Frame,
     /// The box round `regions`.
     geometry: Rectangle<i32, Physical>,
     /// What is redrawn: each window and its margin, on the output.
@@ -296,7 +337,9 @@ pub fn element(
     windows: &[LogicalRect],
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
-    alone: bool,
+    // The size of the output's framebuffer.
+    target: Size<i32, Physical>,
+    frame: &Frame,
 ) -> Option<MotionBlurElement> {
     let plan = plan(streak)?;
     let program = program(renderer)?;
@@ -325,16 +368,19 @@ pub fn element(
     streak.map(f32::to_bits).hash(&mut hasher);
     let signature = hasher.finish();
     let copies = copies(renderer);
-    // Another pass has copied into the texture since this one did, or will
-    // before this one draws: it has to copy again, which a new commit makes
-    // the damage tracker ask for.
-    let kept = alone
-        && copies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .held
-            .iter()
-            .any(|copy| copy.of.as_ref() == Some(&(state.id.clone(), geometry.loc)));
+    // Another pass has copied into the output's texture since this one
+    // did: it has to copy again. A copy of part of the output is in a
+    // texture of its own size and says nothing of the output's.
+    let kept = copies
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .held
+        .iter()
+        .any(|copy| {
+            let size = copy.texture.size();
+            [(size.w, size.h), (size.h, size.w)].contains(&(target.w, target.h))
+                && copy.of.as_ref() == Some(&(state.id.clone(), geometry.loc))
+        });
     if state.signature != signature || !kept {
         state.signature = signature;
         state.commit_counter.increment();
@@ -342,6 +388,8 @@ pub fn element(
     Some(MotionBlurElement {
         id: state.id.clone(),
         commit: state.commit_counter,
+        among_others: fresh_commit(),
+        frame: frame.clone(),
         geometry,
         regions,
         streak,
@@ -381,6 +429,9 @@ impl Stack {
         output_name: &str,
         output_geo: Rectangle<i32, Logical>,
         scale: Scale<f64>,
+        // The size of the output's framebuffer.
+        target: Size<i32, Physical>,
+        frame: &Frame,
     ) -> Vec<(usize, MotionBlurElement)> {
         let cache = format!("motion-blur@{output_name}");
         let drawn: Vec<_> = self
@@ -429,13 +480,15 @@ impl Stack {
                     .window_effect_cache
                     .entry(cache.clone())
                     .or_default();
-                let alone = runs.len() == 1;
                 Some((
                     at,
-                    element(renderer, state, streak, &rects, output_geo, scale, alone)?,
+                    element(
+                        renderer, state, streak, &rects, output_geo, scale, target, frame,
+                    )?,
                 ))
             })
             .collect();
+        frame.add(passes.len());
         passes.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
         passes
     }
@@ -460,7 +513,11 @@ impl Element for MotionBlurElement {
     }
 
     fn current_commit(&self) -> CommitCounter {
-        self.commit
+        if self.frame.crowded() {
+            self.among_others
+        } else {
+            self.commit
+        }
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
@@ -993,7 +1050,8 @@ mod tests {
                     windows,
                     output_geo,
                     Scale::from(1.0),
-                    true,
+                    size,
+                    &Frame::default(),
                 );
                 let elements: Vec<Drawn> = blur
                     .into_iter()
@@ -1162,6 +1220,9 @@ mod tests {
                     &mark_texture,
                     (f64::from(mark.0), f64::from(mark.1)),
                 ))];
+                // Built as two windows nodes of one frame build them: each
+                // knows of its own pass alone.
+                let frame = Frame::default();
                 for (run, streak, rects) in [(&runs[0], leaving, &left), (&runs[1], coming, &came)]
                 {
                     let state = states.entry(run[0]).or_default();
@@ -1172,8 +1233,10 @@ mod tests {
                         rects,
                         output_geo,
                         Scale::from(1.0),
-                        false,
+                        DESK.into(),
+                        &frame,
                     );
+                    frame.add(1);
                     elements.push(Drawn::Blur(blur.expect("the tiles are on the output")));
                 }
                 elements.push(Drawn::Under(shown(&under_id, &desk_texture, (0.0, 0.0))));
@@ -1283,7 +1346,8 @@ mod tests {
                 windows,
                 output_geo,
                 Scale::from(1.0),
-                true,
+                DESK.into(),
+                &Frame::default(),
             );
             let elements: Vec<Drawn> = blur
                 .into_iter()
@@ -1369,5 +1433,175 @@ mod tests {
                 "frame {index}, streak {streak:?}: {worst} levels out"
             );
         }
+    }
+
+    /// Two outputs of one size with a pass each, a copy of the first one's
+    /// corner taken in between, and then a frame of the first in which its
+    /// pass holds still and only a mark above it moves.
+    #[test]
+    #[ignore = "requires surfaceless EGL; renders only offscreen buffers"]
+    fn a_copy_of_the_outputs_corner_does_not_stand_for_the_outputs_own() {
+        use smithay::{
+            backend::{
+                allocator::Fourcc,
+                egl::{EGLContext, EGLDisplay, native::EGLSurfacelessDisplay},
+                renderer::{
+                    Bind, ExportMem, ImportMem, Offscreen, Renderer,
+                    damage::OutputDamageTracker,
+                    element::{
+                        Id, Kind,
+                        texture::TextureRenderElement,
+                        utils::{Relocate, RelocateRenderElement},
+                    },
+                    gles::GlesTexture,
+                },
+            },
+            utils::Transform,
+        };
+
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.unwrap();
+        let context = EGLContext::new(&display).unwrap();
+        let mut renderer = unsafe { GlesRenderer::new(context) }.unwrap();
+        let desk = desk();
+        let desk_texture = renderer
+            .import_memory(&desk, Fourcc::Abgr8888, DESK.into(), false)
+            .unwrap();
+        const MARK: i32 = 40;
+        let red = [200, 30, 30, 255].repeat((MARK * MARK) as usize);
+        let mark_texture = renderer
+            .import_memory(&red, Fourcc::Abgr8888, (MARK, MARK).into(), false)
+            .unwrap();
+        let (under_id, mark_id, context) = (Id::new(), Id::new(), renderer.context_id());
+        let shown = |id: &Id, texture: &GlesTexture, at: (f64, f64)| {
+            TextureRenderElement::from_static_texture(
+                id.clone(),
+                context.clone(),
+                at,
+                texture.clone(),
+                1,
+                Transform::Normal,
+                None,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+        };
+        let output_geo = Rectangle::from_size(DESK.into());
+        let mut buffer = |size: (i32, i32)| -> GlesTexture {
+            Offscreen::<GlesTexture>::create_buffer(&mut renderer, Fourcc::Abgr8888, size.into())
+                .unwrap()
+        };
+        const PART: (i32, i32) = (320, 220);
+        let (mut first, mut second, mut part) = (buffer(DESK), buffer(DESK), buffer(PART));
+        let mut on_first = OutputDamageTracker::new(DESK, 1.0, Transform::Normal);
+        let mut on_second = OutputDamageTracker::new(DESK, 1.0, Transform::Normal);
+        let mut on_part = OutputDamageTracker::new(PART, 1.0, Transform::Normal);
+        let (mut state, mut other) = Default::default();
+        let streak = [9.0, 0.0];
+        let windows = [LogicalRect::new(150, 120, 200, 150)];
+        let (wanted, _) = filtered(&desk, streak, &windows);
+        for (index, mark) in [(200, 150), (230, 170)].into_iter().enumerate() {
+            let mut pass = |state: &mut WindowEffectElementState| {
+                element(
+                    &mut renderer,
+                    state,
+                    streak,
+                    &windows,
+                    output_geo,
+                    Scale::from(1.0),
+                    DESK.into(),
+                    &Frame::default(),
+                )
+                .expect("the window is on the output")
+            };
+            let elements = [
+                Drawn::Under(shown(
+                    &mark_id,
+                    &mark_texture,
+                    (f64::from(mark.0), f64::from(mark.1)),
+                )),
+                Drawn::Blur(pass(&mut state)),
+                Drawn::Under(shown(&under_id, &desk_texture, (0.0, 0.0))),
+            ];
+            let others = [
+                Drawn::Blur(pass(&mut other)),
+                Drawn::Under(shown(&under_id, &desk_texture, (0.0, 0.0))),
+            ];
+            let age = usize::from(index > 0);
+            {
+                let mut framebuffer = renderer.bind(&mut first).unwrap();
+                on_first
+                    .render_output(&mut renderer, &mut framebuffer, age, &elements, [0.0; 4])
+                    .unwrap();
+            }
+            let mapping = renderer
+                .copy_texture(&first, Rectangle::from_size(DESK.into()), Fourcc::Abgr8888)
+                .unwrap();
+            let read = renderer.map_texture(&mapping).unwrap().to_vec();
+            // The first output's corner, then the second output's frame.
+            let moved: Vec<_> = elements
+                .iter()
+                .map(|element| {
+                    RelocateRenderElement::from_element(
+                        element,
+                        Point::<i32, Physical>::from((0, 0)),
+                        Relocate::Relative,
+                    )
+                })
+                .collect();
+            {
+                let mut framebuffer = renderer.bind(&mut part).unwrap();
+                on_part
+                    .render_output(&mut renderer, &mut framebuffer, age, &moved, [0.0; 4])
+                    .unwrap();
+            }
+            {
+                let mut framebuffer = renderer.bind(&mut second).unwrap();
+                on_second
+                    .render_output(&mut renderer, &mut framebuffer, age, &others, [0.0; 4])
+                    .unwrap();
+            }
+            let at = |x: i32, y: i32| ((y * DESK.0 + x) * 4) as usize;
+            let row = (DESK.0 * 4) as usize;
+            let mut drawn = read.clone();
+            if drawn[at(mark.0, mark.1)..][..4] != red[..4] {
+                drawn = read.chunks(row).rev().flatten().copied().collect();
+            }
+            let mut worst = 0;
+            for y in 0..DESK.1 {
+                for x in 0..DESK.0 {
+                    let marked = (mark.0..mark.0 + MARK).contains(&x)
+                        && (mark.1..mark.1 + MARK).contains(&y);
+                    for channel in 0..4 {
+                        let at = at(x, y) + channel;
+                        let wanted = if marked { red[channel] } else { wanted[at] };
+                        worst = worst.max(drawn[at].abs_diff(wanted));
+                    }
+                }
+            }
+            assert!(worst <= 2, "frame {index}: {worst} levels out");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires surfaceless EGL; renders only offscreen buffers"]
+    fn an_output_that_goes_takes_the_copies_with_it() {
+        use smithay::backend::egl::{EGLContext, EGLDisplay, native::EGLSurfacelessDisplay};
+
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.unwrap();
+        let context = EGLContext::new(&display).unwrap();
+        let mut renderer = unsafe { GlesRenderer::new(context) }.unwrap();
+        let copies = copies(&mut renderer);
+        for size in [DESK, (DESK.1, 300)] {
+            copies
+                .lock()
+                .unwrap()
+                .fit(&mut renderer, size.into())
+                .unwrap();
+        }
+        assert_eq!(copies.lock().unwrap().held.len(), 2);
+        forget_copies(&mut renderer);
+        assert!(copies.lock().unwrap().held.is_empty());
     }
 }

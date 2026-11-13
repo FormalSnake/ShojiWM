@@ -5944,6 +5944,7 @@ fn render_surface(
             scale,
             primary: true,
             scope: output.name(),
+            passes: Default::default(),
         };
         let built = crate::backend::composition::Builder::new(&composition_plan, &output.name())
             .build(&mut scene, &mut composition_targets, &scene_context);
@@ -13523,6 +13524,7 @@ fn connector_disconnected(
     let Some(surface) = backend.surfaces.remove(&crtc) else {
         return;
     };
+    crate::backend::motion_blur::forget_copies(&mut backend.renderer);
     if let Some(color_state) = state.output_color.remove(&output_name)
         && let Some(blob) = color_state.hdr_metadata_blob
     {
@@ -14227,6 +14229,7 @@ pub fn apply_tty_output_mode(
                 &mut backend.renderer,
                 &DrmOutputRenderElements::default(),
             )?;
+            crate::backend::motion_blur::forget_copies(&mut backend.renderer);
             surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
             if surface.powered_off {
                 // The new mode applies at power-on. `use_mode` itself may commit (smithay's
@@ -17564,6 +17567,11 @@ fn tty_window_stack_elements(
             &output.name(),
             output_geo,
             scale,
+            output
+                .current_mode()
+                .map(|mode| mode.size)
+                .unwrap_or_default(),
+            &ctx.passes,
         ) {
             scene_elements.insert(
                 at,

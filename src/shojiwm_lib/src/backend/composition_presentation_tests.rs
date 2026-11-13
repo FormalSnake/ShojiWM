@@ -269,6 +269,7 @@ fn composition_gpu_preserves_live_source_visibility_across_cached_and_hidden_fra
         scale: Scale::from(1.0),
         primary: true,
         scope: "test".into(),
+        passes: Default::default(),
     };
     let mut targets = CompositionTargets::default();
     let mut tracker = OutputDamageTracker::new((16, 16), 1.0, Transform::Normal);

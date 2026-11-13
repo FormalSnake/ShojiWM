@@ -1046,6 +1046,7 @@ pub fn init_winit(
         .insert_source(winit, move |event, _, state| {
             match event {
                 WinitEvent::Resized { size, .. } => {
+                    crate::backend::motion_blur::forget_copies(backend.borrow_mut().renderer());
                     output.change_current_state(
                         Some(Mode {
                             size,
@@ -1168,6 +1169,7 @@ pub fn init_winit(
                             scale,
                             primary: true,
                             scope: output.name(),
+                            passes: Default::default(),
                         };
                         let built = {
                             let mut scene = WinitScene {
@@ -6044,6 +6046,11 @@ fn winit_window_stack_elements(
             &output.name(),
             output_geo,
             scale,
+            output
+                .current_mode()
+                .map(|mode| mode.size)
+                .unwrap_or_default(),
+            &ctx.passes,
         ) {
             scene_elements.insert(
                 at,

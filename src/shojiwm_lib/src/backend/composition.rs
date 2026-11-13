@@ -605,6 +605,8 @@ pub struct SceneContext {
     /// Identifies the render target for per-target caches; the output name
     /// for the output itself.
     pub scope: String,
+    /// The motion blur passes of the frame, over all its windows nodes.
+    pub passes: crate::backend::motion_blur::Frame,
 }
 
 impl SceneContext {
@@ -1210,6 +1212,7 @@ impl<'p> Builder<'p> {
             scale,
             primary: false,
             scope: format!("{}#{}", self.output_name, spec.key),
+            passes: Default::default(),
         };
         let physical: Size<i32, Physical> = (
             ((width as f64 * scale.x).round() as i32).clamp(1, MAX_TEXTURE_EDGE),
@@ -1622,6 +1625,7 @@ mod tests {
             scale: Scale::from(1.0),
             primary: true,
             scope: "out".into(),
+            passes: Default::default(),
         };
         let built = Builder::new(plan, "out")
             .build(&mut scene, &mut CompositionTargets::default(), &ctx)
