@@ -797,6 +797,46 @@ fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
     )
 }
 
+/// What an EDID read after the output was made names it. A dock can show a
+/// fallback mode before its EDID is there, and Smithay keeps the make, model
+/// and serial an output was created with, which `wl_output` goes on sending;
+/// the config's snapshot takes these instead.
+struct LateEdidIdentity(std::sync::Mutex<crate::color::drm_metadata::EdidIdentity>);
+
+/// Names `output` by an EDID read since it was made. Says whether that
+/// changed what the config sees.
+pub fn set_output_edid_identity(
+    output: &Output,
+    identity: crate::color::drm_metadata::EdidIdentity,
+) -> bool {
+    if output_identity(output)
+        == (
+            identity.make.clone(),
+            identity.model.clone(),
+            identity.serial.clone(),
+        )
+    {
+        return false;
+    }
+    let user_data = output.user_data();
+    user_data
+        .insert_if_missing_threadsafe(|| LateEdidIdentity(std::sync::Mutex::new(identity.clone())));
+    if let Some(late) = user_data.get::<LateEdidIdentity>() {
+        *late.0.lock().unwrap() = identity;
+    }
+    true
+}
+
+/// Make, model and serial: a late EDID's, else what the output was made with.
+fn output_identity(output: &Output) -> (String, String, String) {
+    if let Some(late) = output.user_data().get::<LateEdidIdentity>() {
+        let late = late.0.lock().unwrap();
+        return (late.make.clone(), late.model.clone(), late.serial.clone());
+    }
+    let physical = output.physical_properties();
+    (physical.make, physical.model, physical.serial_number)
+}
+
 /// A frame ticks the runtime for work due within this much past its presentation time;
 /// the TypeScript runtime uses the same tolerance.
 const FRAME_DUE_TOLERANCE_MS: f64 = 0.5;
@@ -3633,6 +3673,7 @@ impl ShojiWM {
             .map(|output| {
                 let name = output.name();
                 let physical = output.physical_properties();
+                let (make, model, serial) = output_identity(&output);
                 // Prefer the DRM-backed list, which still carries each mode's
                 // pixel clock; fall back to the wl_output modes (no clock) for
                 // backends with no DRM behind them.
@@ -3677,9 +3718,9 @@ impl ShojiWM {
                     WaylandOutputSnapshot {
                         name: name.clone(),
                         description: Some(output.description()),
-                        make: Some(physical.make),
-                        model: Some(physical.model),
-                        serial: Some(physical.serial_number),
+                        make: Some(make),
+                        model: Some(model),
+                        serial: Some(serial),
                         connector: Some(name.clone()),
                         enabled: self.runtime_output_workspace_enabled(&name),
                         resolution,

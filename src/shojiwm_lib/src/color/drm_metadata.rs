@@ -119,13 +119,14 @@ pub fn read_edid_hdr(
 /// match against: "ASUSTek COMPUTER INC PA278CGV T1LMQS063802".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdidIdentity {
-    /// The manufacturer's name from hwdata's PNP ID list, else its
-    /// three-letter PNP ID.
+    /// The manufacturer's name from hwdata's PNP ID list, else its PNP ID as
+    /// `PNP(ZZY)`.
     pub make: String,
-    /// The display product name descriptor, else the product code as `0x1234`.
+    /// The first display product name descriptor with text, else the product
+    /// code as `0x1234`.
     pub model: String,
-    /// The serial number descriptor, else the base block's serial number as
-    /// `0x0000ABCD`, empty when that is 0.
+    /// The first serial number descriptor with text, else the base block's
+    /// serial number as `0x0000ABCD`, empty when that is 0.
     pub serial: String,
 }
 
@@ -170,7 +171,8 @@ pub fn parse_edid_identity(
     let product = u16::from_le_bytes([edid[10], edid[11]]);
     let number = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
     // A display descriptor starts with three zero bytes where a detailed
-    // timing has its pixel clock; its text ends at a line feed.
+    // timing has its pixel clock; its text ends at a line feed. One with no
+    // text leaves the value to the next, then to the number.
     let text = |tag: u8| {
         edid[54..126].chunks_exact(18).find_map(|block| {
             if block[..3] != [0, 0, 0] || block[3] != tag {
@@ -178,11 +180,12 @@ pub fn parse_edid_identity(
             }
             let text = &block[5..];
             let end = text.iter().position(|&b| b == b'\n').unwrap_or(text.len());
-            Some(String::from_utf8_lossy(&text[..end]).trim_end().to_owned())
+            let text = String::from_utf8_lossy(&text[..end]).trim_end().to_owned();
+            (!text.is_empty()).then_some(text)
         })
     };
     Some(EdidIdentity {
-        make: company(&id).unwrap_or(id),
+        make: company(&id).unwrap_or_else(|| format!("PNP({id})")),
         model: text(0xfc).unwrap_or_else(|| format!("0x{product:04X}")),
         serial: text(0xff).unwrap_or_else(|| {
             if number == 0 {
@@ -888,8 +891,14 @@ mod tests {
         let pa278cgv = "00ffffffffffff0006b3ed270101010103230103803c22782a9325ad4f44a9260d5054bf4f00714f818081409500a940b300d100e1c0565e00a0a0a029503020350055502100001a000000fd0018901eda3c000a202020202020000000fc0050413237384347560a20202020000000ff0054314c4d51533036333830320a0134";
         let mb16qhg = "00ffffffffffff0006b3f316000000002d200104b52316783a2825ad5143b1270e5054bdef00d1cf818081c0814081009500b300714fe26800a0a0402e603020360059d71000001a000000fd0030781ed23c010a202020202020000000fc004d4231365148470a2020202020000000ff0052434c4d54463033373936340a0103";
         let panel = "00ffffffffffff0009e5e40c000000000c220104b5271878033e15ae5043b0250e505400000001010101010101010101010101010101c07200a0a040c8603020660084f21000001a000000fd0c30f0b1b176010a202020202020000000fe003d4c33303131202020202020ff000000fc004e4531383051444d2d4e5a430a0127";
-        assert_eq!(described(pa278cgv), "ASUSTek COMPUTER INC PA278CGV T1LMQS063802");
-        assert_eq!(described(mb16qhg), "ASUSTek COMPUTER INC MB16QHG RCLMTF037964");
+        assert_eq!(
+            described(pa278cgv),
+            "ASUSTek COMPUTER INC PA278CGV T1LMQS063802"
+        );
+        assert_eq!(
+            described(mb16qhg),
+            "ASUSTek COMPUTER INC MB16QHG RCLMTF037964"
+        );
         // No serial descriptor and a zero serial number: nothing after the model.
         assert_eq!(described(panel), "BOE NE180QDM-NZC ");
 
@@ -898,7 +907,28 @@ mod tests {
         bare[8..16].copy_from_slice(&[0x10, 0xac, 0x34, 0x12, 0x78, 0x56, 0, 0]);
         bare[54..126].fill(1);
         let id = parse_edid_identity(&bare, company).unwrap();
-        assert_eq!((id.make.as_str(), id.model.as_str(), id.serial.as_str()), ("DEL", "0x1234", "0x00005678"));
+        assert_eq!(
+            (id.make.as_str(), id.model.as_str(), id.serial.as_str()),
+            ("PNP(DEL)", "0x1234", "0x00005678")
+        );
+
+        // Name and serial descriptors with no text: the numbers stand in.
+        let mut empty = hex(pa278cgv);
+        empty[12..16].copy_from_slice(&[0x78, 0x56, 0, 0]);
+        for start in [90, 108] {
+            empty[start + 5] = b'\n';
+            empty[start + 6..start + 18].fill(b' ');
+        }
+        assert_eq!(
+            (empty[93], empty[111]),
+            (0xfc, 0xff),
+            "the name and serial descriptors"
+        );
+        let id = parse_edid_identity(&empty, company).unwrap();
+        assert_eq!(
+            (id.model.as_str(), id.serial.as_str()),
+            ("0x27ED", "0x00005678")
+        );
         assert_eq!(parse_edid_identity(&bare[..100], company), None);
         bare[0] = 1;
         assert_eq!(parse_edid_identity(&bare, company), None);

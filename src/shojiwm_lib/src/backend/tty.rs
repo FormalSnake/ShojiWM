@@ -12942,7 +12942,10 @@ fn connector_connected(
 
     let identity = {
         let backend = state.tty_backends.get(&node).unwrap();
-        crate::color::drm_metadata::read_edid_identity(backend.drm_output_manager.device(), &connector)
+        crate::color::drm_metadata::read_edid_identity(
+            backend.drm_output_manager.device(),
+            &connector,
+        )
     };
     let (width_mm, height_mm) = connector.size().unwrap_or((0, 0));
     let output = Output::new(
@@ -12950,8 +12953,12 @@ fn connector_connected(
         PhysicalProperties {
             size: (width_mm as i32, height_mm as i32).into(),
             subpixel: connector.subpixel().into(),
-            make: identity.as_ref().map_or("Unknown".into(), |id| id.make.clone()),
-            model: identity.as_ref().map_or("Unknown".into(), |id| id.model.clone()),
+            make: identity
+                .as_ref()
+                .map_or("Unknown".into(), |id| id.make.clone()),
+            model: identity
+                .as_ref()
+                .map_or("Unknown".into(), |id| id.model.clone()),
             serial_number: identity.map_or("Unknown".into(), |id| id.serial),
         },
     );
@@ -13210,12 +13217,20 @@ pub fn device_changed(
                 connector,
                 crtc: Some(crtc),
             } => {
-                if let Some(surface) = state
-                    .tty_backends
-                    .get_mut(&node)
-                    .and_then(|backend| backend.surfaces.get_mut(&crtc))
-                {
-                    surface.available_modes = connector.modes().to_vec();
+                if let Some(backend) = state.tty_backends.get_mut(&node) {
+                    // The EDID too: it can land after a fallback mode did.
+                    let identity = crate::color::drm_metadata::read_edid_identity(
+                        backend.drm_output_manager.device(),
+                        &connector,
+                    );
+                    if let Some(surface) = backend.surfaces.get_mut(&crtc) {
+                        surface.available_modes = connector.modes().to_vec();
+                        if let Some(identity) = identity
+                            && crate::state::set_output_edid_identity(&surface.output, identity)
+                        {
+                            info!(output = %surface.output.name(), "named the output from an EDID read after it connected");
+                        }
+                    }
                 }
                 state.apply_runtime_display_configuration();
                 changed = true;
