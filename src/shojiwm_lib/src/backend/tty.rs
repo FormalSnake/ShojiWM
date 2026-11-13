@@ -361,27 +361,29 @@ fn in_flight_vblank(
 }
 
 /// Commits a frame rendered for `frame_target` through `queue`; once it is queued,
-/// `in_flight` is the vblank it flips at. The commit is timed by `clock` read right before
-/// `queue`: the frame's vblank is set when it is queued, and a read after it (diagnostics,
-/// bookkeeping, a deschedule) can land past that vblank and put the frame a period late.
-/// A frame held for the cursor deadline or rendered ahead is committed later than it was
-/// staged, so it goes through here when it is submitted, not when it is staged.
+/// `in_flight` is the vblank it flips at, or `None` when that is not known. The kernel takes
+/// the commit somewhere inside `queue` (after Smithay's locks, building the atomic request and,
+/// on a modeset, a test commit), so `clock` is read on both sides: with no vblank between the
+/// reads the frame flips at the first one after them, and with one between, it may flip at
+/// either. A guess is a period wrong half the time, and every frame rendered ahead of it would
+/// carry that, so the frame is left without a target, as after a cursor-only commit: nothing
+/// renders ahead of it, and the next frame times itself from the flip event. A frame held for
+/// the cursor deadline or rendered ahead is committed later than it was staged, so it goes
+/// through here when it is submitted, not when it is staged.
 fn queue_in_flight<E>(
     in_flight: &mut Option<Duration>,
     frame_target: Duration,
     last_grid_next: Option<Duration>,
     period: Duration,
-    clock: impl FnOnce() -> Duration,
+    clock: impl Fn() -> Duration,
     queue: impl FnOnce() -> Result<(), E>,
 ) -> Result<(), E> {
-    let queued_at = clock();
+    let before = clock();
     queue()?;
-    *in_flight = Some(in_flight_vblank(
-        frame_target,
-        last_grid_next,
-        period,
-        queued_at,
-    ));
+    let after = clock();
+    let earliest = in_flight_vblank(frame_target, last_grid_next, period, before);
+    let latest = in_flight_vblank(frame_target, last_grid_next, period, after);
+    *in_flight = (earliest == latest).then_some(earliest);
     Ok(())
 }
 
@@ -1313,7 +1315,8 @@ struct SurfaceData {
     ahead_attempted: bool,
     /// The vblank the newest submitted (or held) frame flips at (see `in_flight_vblank`); an
     /// ahead frame targets the vblank after it. `None` while what is in flight is not a rendered
-    /// frame (a cursor-only commit) or nothing is.
+    /// frame (a cursor-only commit), its vblank is not known (see `queue_in_flight`), or nothing
+    /// is.
     in_flight_frame_target: Option<Duration>,
     /// Whether the last render used the fullscreen fast path (a fullscreen window scanned
     /// out or composited alone); render-ahead stays off for it.
@@ -2757,26 +2760,70 @@ mod vblank_grid_tests {
         assert_eq!(in_flight, Some(ms(1_010.0)));
     }
 
-    /// Queued at 1009 ms for 1010; the thread is descheduled inside the queue call and gets
-    /// back at 1011. The frame still flips at 1010.
+    /// Queued for 1010 ms from 1008 to 1009: no vblank between the reads, so 1010.
     #[test]
-    fn a_commit_is_timed_at_the_queue_call() {
-        let period = ms(10.0);
-        let clock = Cell::new(ms(1_009.0));
+    fn a_commit_with_no_vblank_inside_the_queue_call_flips_at_the_next() {
+        let clock = Cell::new(ms(1_008.0));
         let mut in_flight = None;
         queue_in_flight(
             &mut in_flight,
             ms(1_010.0),
             Some(ms(1_010.0)),
-            period,
+            ms(10.0),
             || clock.get(),
             || {
-                clock.set(ms(1_011.0));
+                clock.set(ms(1_009.0));
                 Ok::<(), ()>(())
             },
         )
         .unwrap();
         assert_eq!(in_flight, Some(ms(1_010.0)));
+    }
+
+    /// The queue call starts at 1009 ms and is descheduled while Smithay prepares the commit;
+    /// the kernel takes it at 1011 and the frame flips at 1020. Timed from the read before the
+    /// call it was put at 1010, and the next frame rendered ahead was a period short.
+    #[test]
+    fn a_vblank_before_the_kernel_takes_the_commit_leaves_its_flip_unknown() {
+        let clock = Cell::new(ms(1_009.0));
+        let mut in_flight = Some(ms(1_000.0));
+        queue_in_flight(
+            &mut in_flight,
+            ms(1_010.0),
+            Some(ms(1_010.0)),
+            ms(10.0),
+            || clock.get(),
+            || {
+                // Accepted here, at 1011.
+                clock.set(ms(1_011.0));
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(in_flight, None);
+    }
+
+    /// The kernel takes the commit at 1009.5 ms and the frame flips at 1010; the thread is
+    /// descheduled before the call returns, at 1011. Timed from a read after the call it was
+    /// put at 1020, and the next frame rendered ahead was a period long.
+    #[test]
+    fn a_vblank_after_the_kernel_takes_the_commit_leaves_its_flip_unknown() {
+        let clock = Cell::new(ms(1_009.0));
+        let mut in_flight = Some(ms(1_000.0));
+        queue_in_flight(
+            &mut in_flight,
+            ms(1_010.0),
+            Some(ms(1_010.0)),
+            ms(10.0),
+            || clock.get(),
+            || {
+                // Accepted at 1009.5; the call returns at 1011.
+                clock.set(ms(1_011.0));
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(in_flight, None);
     }
 
     /// A rejected commit flips nothing and leaves the frame in flight as it was.
