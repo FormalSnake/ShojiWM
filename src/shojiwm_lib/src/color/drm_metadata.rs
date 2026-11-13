@@ -1,4 +1,5 @@
-//! EDID HDR capability probing and DRM connector properties for HDR10
+//! What a display's EDID says it is and whether it does HDR, and the DRM
+//! connector properties for HDR10
 //! signaling: `max bpc`, `Colorspace`, and the `HDR_OUTPUT_METADATA`
 //! (SMPTE ST 2086 / CTA-861.3) property blob.
 //!
@@ -111,6 +112,86 @@ pub fn read_edid_hdr(
     }
     let edid = device.get_property_blob(blob_id).ok()?;
     parse_edid_hdr(&edid)
+}
+
+/// Who made a display, its model and its serial, spelled as libdisplay-info
+/// spells them, which is what Hyprland's `desc:` and a host's `description`
+/// match against: "ASUSTek COMPUTER INC PA278CGV T1LMQS063802".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdidIdentity {
+    /// The manufacturer's name from hwdata's PNP ID list, else its
+    /// three-letter PNP ID.
+    pub make: String,
+    /// The display product name descriptor, else the product code as `0x1234`.
+    pub model: String,
+    /// The serial number descriptor, else the base block's serial number as
+    /// `0x0000ABCD`, empty when that is 0.
+    pub serial: String,
+}
+
+pub fn read_edid_identity(
+    device: &impl ControlDevice,
+    conn: &connector::Info,
+) -> Option<EdidIdentity> {
+    let (_, blob_id) = find_connector_property(device, conn, PROP_EDID)?;
+    if blob_id == 0 {
+        return None;
+    }
+    let edid = device.get_property_blob(blob_id).ok()?;
+    parse_edid_identity(&edid, pnp_company)
+}
+
+/// The company hwdata's `pnp.ids` lists for a PNP ID. libdisplay-info builds
+/// the same list in.
+fn pnp_company(id: &str) -> Option<String> {
+    let list = std::fs::read("/usr/share/hwdata/pnp.ids").ok()?;
+    String::from_utf8_lossy(&list).lines().find_map(|line| {
+        let (code, company) = line.split_once('\t')?;
+        (code == id).then(|| company.trim().to_owned())
+    })
+}
+
+/// The base block's vendor and product section and its display
+/// descriptors. `company` names a PNP ID.
+pub fn parse_edid_identity(
+    edid: &[u8],
+    company: impl Fn(&str) -> Option<String>,
+) -> Option<EdidIdentity> {
+    const HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+    if edid.get(..8)? != HEADER || edid.len() < 128 {
+        return None;
+    }
+    // Three five-bit letters, big endian, 1 for A.
+    let vendor = u16::from_be_bytes([edid[8], edid[9]]);
+    let id: String = [10, 5, 0]
+        .into_iter()
+        .map(|shift| char::from(b'@' + ((vendor >> shift) & 0x1f) as u8))
+        .collect();
+    let product = u16::from_le_bytes([edid[10], edid[11]]);
+    let number = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+    // A display descriptor starts with three zero bytes where a detailed
+    // timing has its pixel clock; its text ends at a line feed.
+    let text = |tag: u8| {
+        edid[54..126].chunks_exact(18).find_map(|block| {
+            if block[..3] != [0, 0, 0] || block[3] != tag {
+                return None;
+            }
+            let text = &block[5..];
+            let end = text.iter().position(|&b| b == b'\n').unwrap_or(text.len());
+            Some(String::from_utf8_lossy(&text[..end]).trim_end().to_owned())
+        })
+    };
+    Some(EdidIdentity {
+        make: company(&id).unwrap_or(id),
+        model: text(0xfc).unwrap_or_else(|| format!("0x{product:04X}")),
+        serial: text(0xff).unwrap_or_else(|| {
+            if number == 0 {
+                String::new()
+            } else {
+                format!("0x{number:08X}")
+            }
+        }),
+    })
 }
 
 /// Call `visit(tag, payload)` for every CTA-861 data block in the EDID, where
@@ -783,6 +864,45 @@ pub fn destroy_metadata_blob(device: &impl ControlDevice, blob: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The base blocks of g815's three displays, from
+    /// /sys/class/drm/card2-*/edid, with the descriptions Hyprland gave them.
+    #[test]
+    fn identity_is_spelled_as_libdisplay_info_spells_it() {
+        let company = |id: &str| match id {
+            "AUS" => Some("ASUSTek COMPUTER INC".to_owned()),
+            "BOE" => Some("BOE".to_owned()),
+            _ => None,
+        };
+        let described = |edid: &str| {
+            let id = parse_edid_identity(&hex(edid), company).unwrap();
+            format!("{} {} {}", id.make, id.model, id.serial)
+        };
+        let pa278cgv = "00ffffffffffff0006b3ed270101010103230103803c22782a9325ad4f44a9260d5054bf4f00714f818081409500a940b300d100e1c0565e00a0a0a029503020350055502100001a000000fd0018901eda3c000a202020202020000000fc0050413237384347560a20202020000000ff0054314c4d51533036333830320a0134";
+        let mb16qhg = "00ffffffffffff0006b3f316000000002d200104b52316783a2825ad5143b1270e5054bdef00d1cf818081c0814081009500b300714fe26800a0a0402e603020360059d71000001a000000fd0030781ed23c010a202020202020000000fc004d4231365148470a2020202020000000ff0052434c4d54463033373936340a0103";
+        let panel = "00ffffffffffff0009e5e40c000000000c220104b5271878033e15ae5043b0250e505400000001010101010101010101010101010101c07200a0a040c8603020660084f21000001a000000fd0c30f0b1b176010a202020202020000000fe003d4c33303131202020202020ff000000fc004e4531383051444d2d4e5a430a0127";
+        assert_eq!(described(pa278cgv), "ASUSTek COMPUTER INC PA278CGV T1LMQS063802");
+        assert_eq!(described(mb16qhg), "ASUSTek COMPUTER INC MB16QHG RCLMTF037964");
+        // No serial descriptor and a zero serial number: nothing after the model.
+        assert_eq!(described(panel), "BOE NE180QDM-NZC ");
+
+        // A display hwdata does not know, with no name and no serial text.
+        let mut bare = hex(panel);
+        bare[8..16].copy_from_slice(&[0x10, 0xac, 0x34, 0x12, 0x78, 0x56, 0, 0]);
+        bare[54..126].fill(1);
+        let id = parse_edid_identity(&bare, company).unwrap();
+        assert_eq!((id.make.as_str(), id.model.as_str(), id.serial.as_str()), ("DEL", "0x1234", "0x00005678"));
+        assert_eq!(parse_edid_identity(&bare[..100], company), None);
+        bare[0] = 1;
+        assert_eq!(parse_edid_identity(&bare, company), None);
+    }
 
     /// Base EDID block + one CTA-861 extension carrying an HDR static
     /// metadata data block (extended tag 0x06).

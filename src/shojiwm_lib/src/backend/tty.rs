@@ -12940,14 +12940,19 @@ fn connector_connected(
         })
         .collect::<Vec<_>>();
 
+    let identity = {
+        let backend = state.tty_backends.get(&node).unwrap();
+        crate::color::drm_metadata::read_edid_identity(backend.drm_output_manager.device(), &connector)
+    };
+    let (width_mm, height_mm) = connector.size().unwrap_or((0, 0));
     let output = Output::new(
         output_name,
         PhysicalProperties {
-            size: (0, 0).into(),
+            size: (width_mm as i32, height_mm as i32).into(),
             subpixel: connector.subpixel().into(),
-            make: "Unknown".into(),
-            model: "Unknown".into(),
-            serial_number: "Unknown".into(),
+            make: identity.as_ref().map_or("Unknown".into(), |id| id.make.clone()),
+            model: identity.as_ref().map_or("Unknown".into(), |id| id.model.clone()),
+            serial_number: identity.map_or("Unknown".into(), |id| id.serial),
         },
     );
     let wl_mode = WlMode::from(mode);
@@ -12961,6 +12966,9 @@ fn connector_connected(
         ?node,
         ?crtc,
         output = %output.name(),
+        make = %output.physical_properties().make,
+        model = %output.physical_properties().model,
+        serial = %output.physical_properties().serial_number,
         size = ?wl_mode.size,
         refresh_mhz = wl_mode.refresh,
         available_modes = ?available_modes,
