@@ -9756,15 +9756,13 @@ fn backdrop_shader_elements_for_window(
                         display_rect,
                     ))
                 });
-            // Keep the effect sampling space aligned with the geometry space used for the element
-            // itself. In snapshot mode `display_rect` is intentionally left raw so the complete
-            // window can be captured once and transformed once; continuing to sample backdrop
-            // input from a separately transformed rect here reintroduces the old per-element
-            // transform path and causes subtle wobble/tearing on shader-backed nodes.
-            let source_effect_rect = display_rect;
-            let source_effect_rect_precise = display_rect_precise.unwrap_or_else(|| {
-                crate::backend::visual::precise_rect_from_logical(source_effect_rect)
-            });
+            let (source_effect_rect, source_effect_rect_precise) =
+                crate::backend::visual::backdrop_sample_rects(
+                    cached.rect,
+                    cached.rect_precise,
+                    decoration.layout.root.rect,
+                    decoration.visual_transform,
+                );
             (
                 source_effect_rect.x,
                 source_effect_rect.y,
@@ -10148,16 +10146,27 @@ fn backdrop_shader_elements_for_window(
                 )),
                 geometry.size,
             );
+            // The pipeline samples where the window's visual transform draws
+            // the backdrop, which is where its capture was taken.
+            let sampled_screen_rect = if apply_visual_transform {
+                final_backdrop_screen_rect.to_f64()
+            } else {
+                crate::backend::visual::visually_transformed_physical_rect(
+                    final_backdrop_screen_rect,
+                    crate::backend::visual::window_visual_state(
+                        root_rect,
+                        decoration.visual_transform,
+                        output_geo,
+                        scale,
+                    ),
+                )
+            };
             let sample_region = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
-                    (final_backdrop_screen_rect.loc.x - capture_origin_physical.x) as f64,
-                    (final_backdrop_screen_rect.loc.y - capture_origin_physical.y) as f64,
+                    sampled_screen_rect.loc.x - capture_origin_physical.x as f64,
+                    sampled_screen_rect.loc.y - capture_origin_physical.y as f64,
                 )),
-                (
-                    final_backdrop_screen_rect.size.w as f64,
-                    final_backdrop_screen_rect.size.h as f64,
-                )
-                    .into(),
+                (sampled_screen_rect.size.w, sampled_screen_rect.size.h).into(),
             );
             if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
                 crate::backend::shader_effect::log_gap_texture_region_readback(
