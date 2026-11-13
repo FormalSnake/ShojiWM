@@ -132,7 +132,109 @@ pub fn raise_event_loop_thread() {
 
 #[cfg(test)]
 mod tests {
-    use super::target_nice;
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Soft rlimits are per process, so the tests that set them take turns.
+    static LIMITS: Mutex<()> = Mutex::new(());
+
+    fn attr() -> SchedAttr {
+        // SAFETY: SchedAttr is plain integers, and sched_getattr fills it for the calling thread.
+        unsafe {
+            let mut attr: SchedAttr = std::mem::zeroed();
+            let status = libc::syscall(
+                libc::SYS_sched_getattr,
+                0,
+                &mut attr as *mut SchedAttr,
+                std::mem::size_of::<SchedAttr>() as u32,
+                0,
+            );
+            assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
+            attr
+        }
+    }
+
+    fn set_soft_limit(resource: libc::__rlimit_resource_t, value: u64) -> u64 {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit and setrlimit with valid pointers.
+        unsafe {
+            assert_eq!(libc::getrlimit(resource, &mut limit), 0);
+            let previous = limit.rlim_cur as u64;
+            limit.rlim_cur = value.min(limit.rlim_max as u64) as libc::rlim_t;
+            assert_eq!(libc::setrlimit(resource, &limit), 0);
+            previous
+        }
+    }
+
+    /// Raises a fresh thread with these soft limits and returns its sched_attr and that of a
+    /// thread it spawns afterwards.
+    fn raise_with(rtprio: u64, nice: u64) -> (SchedAttr, SchedAttr) {
+        let _turn = LIMITS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rtprio = set_soft_limit(libc::RLIMIT_RTPRIO, rtprio);
+        let nice = set_soft_limit(libc::RLIMIT_NICE, nice);
+        let attrs = std::thread::spawn(|| {
+            raise_event_loop_thread();
+            (attr(), std::thread::spawn(attr).join().unwrap())
+        })
+        .join()
+        .unwrap();
+        set_soft_limit(libc::RLIMIT_RTPRIO, rtprio);
+        set_soft_limit(libc::RLIMIT_NICE, nice);
+        attrs
+    }
+
+    fn hard_limit(resource: libc::__rlimit_resource_t) -> u64 {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit with a valid out pointer.
+        assert_eq!(unsafe { libc::getrlimit(resource, &mut limit) }, 0);
+        limit.rlim_max as u64
+    }
+
+    #[test]
+    fn without_either_limit_the_thread_is_left_as_it_was() {
+        let before = std::thread::spawn(attr).join().unwrap();
+        let (raised, child) = raise_with(0, 0);
+        assert_eq!(raised.sched_policy, SCHED_OTHER);
+        assert_eq!(raised.sched_nice, before.sched_nice);
+        assert_eq!(raised.sched_flags & SCHED_FLAG_RESET_ON_FORK, 0);
+        assert_eq!(child.sched_policy, SCHED_OTHER);
+    }
+
+    #[test]
+    #[ignore = "needs a hard RLIMIT_RTPRIO of 1: prlimit --rtprio=1:1"]
+    fn rtprio_puts_only_this_thread_on_sched_rr() {
+        assert!(hard_limit(libc::RLIMIT_RTPRIO) >= 1);
+        let (raised, child) = raise_with(1, 0);
+        assert_eq!(raised.sched_policy, SCHED_RR);
+        assert_eq!(raised.sched_priority, RT_PRIORITY);
+        assert_ne!(raised.sched_flags & SCHED_FLAG_RESET_ON_FORK, 0);
+        assert_eq!(
+            (child.sched_policy, child.sched_priority, child.sched_nice),
+            (SCHED_OTHER, 0, 0)
+        );
+        assert_eq!(child.sched_flags & SCHED_FLAG_RESET_ON_FORK, 0);
+    }
+
+    #[test]
+    #[ignore = "needs a hard RLIMIT_NICE of 30: prlimit --nice=30:30"]
+    fn without_rtprio_the_thread_runs_at_nice_minus_ten() {
+        assert!(hard_limit(libc::RLIMIT_NICE) >= 30);
+        let (raised, child) = raise_with(0, 30);
+        assert_eq!(
+            (raised.sched_policy, raised.sched_nice),
+            (SCHED_OTHER, NICE)
+        );
+        assert_ne!(raised.sched_flags & SCHED_FLAG_RESET_ON_FORK, 0);
+        assert_eq!((child.sched_policy, child.sched_nice), (SCHED_OTHER, 0));
+    }
 
     #[test]
     fn asks_for_minus_ten_when_the_limit_allows_it() {
