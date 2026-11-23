@@ -118,6 +118,9 @@ fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// How long the session's start waits out another process holding a card's master.
+const CARD_PATIENCE: Duration = Duration::from_secs(5);
+
 pub fn run_tty_udev(
     runtime: crate::runtime_api::RuntimeBoot,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -247,6 +250,7 @@ pub fn run_tty_udev(
             &mut session,
             candidate.node,
             &candidate.path,
+            CARD_PATIENCE,
         );
         match added {
             Ok(()) => {}
@@ -295,9 +299,14 @@ pub fn run_tty_udev(
                     if std::env::var_os("SHOJI_TTY_DRM_DEVICE").is_none() {
                         state.tty_device_paths.insert(node, path.clone());
                     }
-                    if let Err(err) =
-                        device_added(state, &udev_loop_handle, &mut udev_session, node, &path)
-                    {
+                    if let Err(err) = device_added(
+                        state,
+                        &udev_loop_handle,
+                        &mut udev_session,
+                        node,
+                        &path,
+                        Duration::ZERO,
+                    ) {
                         warn!(?node, ?path, ?err, "failed to initialize added drm device");
                         if state.tty_backends.contains_key(&node) {
                             device_removed(state, node);

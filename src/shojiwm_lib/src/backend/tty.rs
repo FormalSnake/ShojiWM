@@ -41,7 +41,7 @@ use smithay::{
             gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture},
             utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
-        session::{Session, libseat::LibSeatSession},
+        session::{AsErrno, Session, libseat::LibSeatSession},
     },
     desktop::{layer_map_for_output, utils::send_dmabuf_feedback_surface_tree},
     input::pointer::{CursorImageAttributes, CursorImageStatus},
@@ -2345,18 +2345,79 @@ fn driver_load_error(path: &Path, step: &str, error: &dyn std::fmt::Display) -> 
     ))
 }
 
+/// Takes the card from the seat, trying again for `patience` while another process holds its
+/// master. The kernel makes whoever opens a card that has no master its master, logind then
+/// answers TakeDevice with EBUSY and leaves the retry to the caller, and at a boot's login
+/// something does open the card in the moment after the boot screen lets it go.
+fn open_card(
+    session: &mut LibSeatSession,
+    path: &Path,
+    patience: Duration,
+) -> Result<std::os::fd::OwnedFd, <LibSeatSession as Session>::Error> {
+    let flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
+    let start = Instant::now();
+    loop {
+        match session.open(path, flags) {
+            Err(err) if err.as_errno() == Some(libc::EBUSY) && start.elapsed() < patience => {
+                if start.elapsed() < CARD_BUSY_STEP {
+                    warn!(
+                        ?path,
+                        holders = ?card_holders(path),
+                        "drm device has another master; waiting for it to let go"
+                    );
+                }
+                std::thread::sleep(CARD_BUSY_STEP);
+            }
+            Err(err) => {
+                if err.as_errno() == Some(libc::EBUSY) {
+                    error!(?path, holders = ?card_holders(path), "drm device kept another master");
+                }
+                return Err(err);
+            }
+            Ok(fd) => {
+                if start.elapsed() >= CARD_BUSY_STEP {
+                    info!(?path, waited = ?start.elapsed(), "drm device's other master let go");
+                }
+                return Ok(fd);
+            }
+        }
+    }
+}
+
+const CARD_BUSY_STEP: Duration = Duration::from_millis(20);
+
+/// The processes this user can see holding `path` open, as `pid comm`, for the log.
+fn card_holders(path: &Path) -> Vec<String> {
+    let own = std::process::id().to_string();
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().into_string().ok()?;
+            if pid == own || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let holds = std::fs::read_dir(entry.path().join("fd"))
+                .ok()?
+                .filter_map(Result::ok)
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == path));
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            holds.then(|| format!("{pid} {}", comm.trim()))
+        })
+        .collect()
+}
+
 pub fn device_added(
     state: &mut ShojiWM,
     loop_handle: &LoopHandle<'_, ShojiWM>,
     session: &mut LibSeatSession,
     node: DrmNode,
     path: &Path,
+    patience: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(?node, path = ?path, "opening drm device");
-    let fd = session.open(
-        path,
-        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-    )?;
+    let fd = open_card(session, path, patience)?;
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
 
     let (drm, drm_events) = DrmDevice::new(fd.clone(), true)?;
@@ -2589,7 +2650,14 @@ pub fn open_tty_device(state: &mut ShojiWM, node: DrmNode) {
     };
     info!(?node, ?path, "opening drm device that is not open yet");
     let loop_handle = state.loop_handle.clone();
-    if let Err(err) = device_added(state, &loop_handle, &mut session, node, &path) {
+    if let Err(err) = device_added(
+        state,
+        &loop_handle,
+        &mut session,
+        node,
+        &path,
+        Duration::ZERO,
+    ) {
         warn!(?node, ?path, ?err, "failed to open drm device");
         if state.tty_backends.contains_key(&node) {
             device_removed(state, node);
