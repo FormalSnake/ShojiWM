@@ -235,11 +235,20 @@ const VBLANK_GRID_PROMPT: Duration = Duration::from_millis(1);
 /// itself. The grid then sat that far early until the event left the history, and the next
 /// flip's grid point read as a duplicate and was bumped a period.
 ///
+/// A driver timestamp is never before its vblank, but the phase is one of them, so it runs
+/// late of the real vblanks by up to `VBLANK_GRID_PROMPT` (see `queue_in_flight`): a timestamp
+/// within that of the next grid point is that vblank's flip. Taken for the previous vblank's,
+/// stamped most of a period late, its next frame was predicted a period early. On g815 the beat
+/// of HDMI-A-1's 144 Hz with DP-3's 120 Hz in the nvidia-modeset thread steps HDMI-A-1's stamps
+/// half a millisecond earlier than the history's phase about 85 times a minute. A handled time
+/// can be most of a period late, so it gets no such window.
+///
 /// Returns the vblank the latest flip completed at and the first vblank after the
 /// observation, which is when a frame rendered now can be shown.
 fn vblank_grid(
     history: &std::collections::VecDeque<Duration>,
     observed: Duration,
+    driver_timed: bool,
     period: Duration,
 ) -> (Duration, Duration) {
     if period.is_zero() || history.is_empty() {
@@ -271,7 +280,12 @@ fn vblank_grid(
                 .then_with(|| right_total.total_cmp(&left_total))
         })
         .unwrap_or(observed);
-    let vblank = observed.saturating_sub(Duration::from_secs_f64(lateness(observed, phase)));
+    let late = lateness(observed, phase);
+    let vblank = if driver_timed && period_s - late <= prompt_s {
+        observed + Duration::from_secs_f64(period_s - late)
+    } else {
+        observed.saturating_sub(Duration::from_secs_f64(late))
+    };
     let mut next = vblank + period;
     while next <= observed {
         next += period;
@@ -424,7 +438,7 @@ impl FlipClock {
         } else {
             0
         };
-        let (vblank, grid_next) = vblank_grid(&self.observations, observed, period);
+        let (vblank, grid_next) = vblank_grid(&self.observations, observed, kernel_timed, period);
         let target = ratchet_frame_target(self.last_grid_next, grid_next, period);
         let target = self.last_target.map_or(target, |last| target.max(last));
         self.last_grid_next = Some(grid_next);
@@ -471,22 +485,14 @@ fn vblank_after(grid_point: Duration, period: Duration, time: Duration) -> Durat
     Duration::from_nanos(next as u64)
 }
 
-/// The vblank a frame rendered for `target` flips at when committed at `committed_at`: the
-/// first one after the commit, if that is later. A commit after its vblank (its flip event was
-/// handled late, or the render ran past it) shows the frame a period later, and the frame
-/// rendered ahead of it targets the vblank after that one; chained from `target`, every frame
-/// rendered ahead stayed a period short of the vblank it was shown at until the chain broke.
-fn in_flight_vblank(
-    target: Duration,
-    grid: Duration,
-    period: Duration,
-    committed_at: Duration,
-) -> Duration {
-    target.max(vblank_after(grid, period, committed_at))
-}
-
-/// Commits a frame rendered for `frame_target` through `queue`; once it is queued,
-/// `in_flight` is the vblank it flips at, or `None` when that is not known. The kernel takes
+/// Commits a frame through `queue`; once it is queued, `in_flight` is the vblank it flips at,
+/// or `None` when that is not known. That is the first vblank after the commit whatever time
+/// the frame was sampled for: a commit after the vblank it was rendered for (its flip event
+/// was handled late, or the render ran past it) shows it a period later, and one rendered for
+/// a later vblank than the commit reaches (a bumped prediction, the clock fallback) shows it
+/// sooner. Placed on its sample time instead, that time was carried into every frame rendered
+/// ahead of it, each a period past the vblank it was shown at, until one read more than three
+/// periods past the clock and was sampled at the last frame's time again. The kernel takes
 /// the commit somewhere inside `queue` (after Smithay's locks, building the atomic request and,
 /// on a modeset, a test commit), so `clock` is read on both sides: with no vblank between the
 /// reads the frame flips at the first one after them, and with one between, it may flip at
@@ -507,7 +513,6 @@ fn in_flight_vblank(
 /// the frames rendered ahead.
 fn queue_in_flight<E>(
     in_flight: &mut Option<Duration>,
-    frame_target: Duration,
     grid: Option<Duration>,
     period: Duration,
     clock: impl Fn() -> Duration,
@@ -517,8 +522,8 @@ fn queue_in_flight<E>(
     queue()?;
     let after = clock() + VBLANK_GRID_PROMPT;
     *in_flight = grid.and_then(|grid| {
-        let earliest = in_flight_vblank(frame_target, grid, period, before);
-        let latest = in_flight_vblank(frame_target, grid, period, after);
+        let earliest = vblank_after(grid, period, before);
+        let latest = vblank_after(grid, period, after);
         (earliest == latest).then_some(earliest)
     });
     Ok(())
@@ -1448,10 +1453,9 @@ struct SurfaceData {
     /// An ahead render already ran for the flip in flight (it may have had no damage);
     /// another one waits for the flip, so a burst of redraw requests does not re-render.
     ahead_attempted: bool,
-    /// The vblank the newest submitted (or held) frame flips at (see `in_flight_vblank`); an
-    /// ahead frame targets the vblank after it. `None` while what is in flight is not a rendered
-    /// frame (a cursor-only commit), its vblank is not known (see `queue_in_flight`), or nothing
-    /// is.
+    /// The vblank the newest submitted frame flips at, or a held one was rendered for; an ahead
+    /// frame targets the vblank after it. `None` while what is in flight is not a rendered frame
+    /// (a cursor-only commit), its vblank is not known (see `queue_in_flight`), or nothing is.
     in_flight_frame_target: Option<Duration>,
     /// Whether the last render used the fullscreen fast path (a fullscreen window scanned
     /// out or composited alone); render-ahead stays off for it.
@@ -2713,8 +2717,8 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 #[cfg(test)]
 mod vblank_grid_tests {
     use super::{
-        FlipClock, VBLANK_GRID_HISTORY, in_flight_vblank, queue_in_flight,
-        sanitize_next_frame_target, vblank_grid,
+        FlipClock, VBLANK_GRID_HISTORY, queue_in_flight, sanitize_next_frame_target, vblank_after,
+        vblank_grid,
     };
     use std::cell::Cell;
     use std::collections::VecDeque;
@@ -2740,7 +2744,10 @@ mod vblank_grid_tests {
                     history.pop_front();
                 }
                 history.push_back(observed);
-                vblank_grid(&history, observed, period).1.as_secs_f64() * 1_000_000.0
+                vblank_grid(&history, observed, false, period)
+                    .1
+                    .as_secs_f64()
+                    * 1_000_000.0
             })
             .collect()
     }
@@ -2860,7 +2867,7 @@ mod vblank_grid_tests {
                 _ => [50.0, 150.0, 250.0, 350.0][index as usize % 4],
             };
             let vblank = 1_000_000.0 + f64::from(index) * period_us;
-            let (_, target) = flips.observe(us(vblank + delay), true, true, period);
+            let (_, target) = flips.observe(us(vblank + delay), false, true, period);
             let target = target.as_secs_f64() * 1e6;
             if index >= 4 {
                 let expected = vblank + period_us + 50.0;
@@ -2877,21 +2884,13 @@ mod vblank_grid_tests {
         let period = us(PERIOD_US);
         let grid = us(1_000_000.0);
         // Committed in time: the vblank it was rendered for.
-        assert_eq!(in_flight_vblank(grid, grid, period, grid - us(500.0)), grid);
+        assert_eq!(vblank_after(grid, period, grid - us(500.0)), grid);
         // Committed 300 us after that vblank: the next one, and the frame rendered ahead of it
         // the one after.
+        assert_eq!(vblank_after(grid, period, grid + us(300.0)), grid + period);
         assert_eq!(
-            in_flight_vblank(grid, grid, period, grid + us(300.0)),
-            grid + period
-        );
-        assert_eq!(
-            in_flight_vblank(grid, grid - period * 3, period, grid + period + us(10.0)),
+            vblank_after(grid - period * 3, period, grid + period + us(10.0)),
             grid + period * 2
-        );
-        // Rendered for a later vblank than the commit reaches: that one.
-        assert_eq!(
-            in_flight_vblank(grid + period, grid, period, grid - us(500.0)),
-            grid + period
         );
     }
 
@@ -2911,7 +2910,6 @@ mod vblank_grid_tests {
         let mut in_flight = Some(ms(1_010.0));
         queue_in_flight(
             &mut in_flight,
-            ms(1_010.0),
             grid,
             period,
             || ms(1_011.0),
@@ -2924,7 +2922,6 @@ mod vblank_grid_tests {
         let mut in_flight = Some(ms(1_010.0));
         queue_in_flight(
             &mut in_flight,
-            ms(1_010.0),
             grid,
             period,
             || ms(1_008.5),
@@ -2942,7 +2939,6 @@ mod vblank_grid_tests {
         let mut in_flight = None;
         queue_in_flight(
             &mut in_flight,
-            ms(1_010.0),
             Some(ms(1_010.0)),
             ms(10.0),
             || clock.get(),
@@ -2964,7 +2960,6 @@ mod vblank_grid_tests {
         let mut in_flight = Some(ms(1_000.0));
         queue_in_flight(
             &mut in_flight,
-            ms(1_010.0),
             Some(ms(1_010.0)),
             ms(10.0),
             || clock.get(),
@@ -2987,7 +2982,6 @@ mod vblank_grid_tests {
         let mut in_flight = Some(ms(1_000.0));
         queue_in_flight(
             &mut in_flight,
-            ms(1_010.0),
             Some(ms(1_010.0)),
             ms(10.0),
             || clock.get(),
@@ -3003,15 +2997,14 @@ mod vblank_grid_tests {
 
     /// The grid from 32 flips at 1000 ms + n * 10, each stamped 50 us late: the estimate is
     /// 50 us late of the real vblanks.
-    fn grid_from_late_events() -> (Option<Duration>, Duration) {
+    fn grid_from_late_events() -> Option<Duration> {
         let period = ms(10.0);
         let mut flips = FlipClock::default();
-        let mut target = Duration::ZERO;
         for index in 0..32u32 {
             let observed = ms(690.0 + f64::from(index) * 10.0 + 0.05);
-            target = flips.observe(observed, true, true, period).1;
+            flips.observe(observed, true, true, period);
         }
-        (flips.placement_grid(), target)
+        flips.placement_grid()
     }
 
     /// Queued from 1010.010 to 1010.020 ms for the estimated 1010.050 vblank: the real one was
@@ -3019,13 +3012,12 @@ mod vblank_grid_tests {
     /// at 1010.050 and the frame rendered ahead of it was sampled a period short.
     #[test]
     fn a_commit_just_before_an_estimated_vblank_leaves_its_flip_unknown() {
-        let (grid, target) = grid_from_late_events();
+        let grid = grid_from_late_events();
         assert_eq!(grid, Some(ms(1_010.05)));
         let clock = Cell::new(ms(1_010.01));
         let mut in_flight = Some(ms(1_000.0));
         queue_in_flight(
             &mut in_flight,
-            target,
             grid,
             ms(10.0),
             || clock.get(),
@@ -3042,12 +3034,11 @@ mod vblank_grid_tests {
     /// before the estimated 1010.050 vblank, so the frame is placed on it.
     #[test]
     fn a_commit_clear_of_the_guard_is_placed() {
-        let (grid, target) = grid_from_late_events();
+        let grid = grid_from_late_events();
         let clock = Cell::new(ms(1_009.0));
         let mut in_flight = None;
         queue_in_flight(
             &mut in_flight,
-            target,
             grid,
             ms(10.0),
             || clock.get(),
@@ -3083,7 +3074,6 @@ mod vblank_grid_tests {
         let mut in_flight = flips.last_target;
         queue_in_flight(
             &mut in_flight,
-            flips.last_target.unwrap(),
             flips.placement_grid(),
             period,
             || clock.get(),
@@ -3258,13 +3248,80 @@ mod vblank_grid_tests {
         assert_eq!(flips.period(EDP_MODE), EDP_MODE);
     }
 
+    /// HDMI-A-1 at 144 Hz: a frame sampled a period and 0.5 ms past the vblank its commit
+    /// reaches (a prediction bumped off a flip stamped in the 144/120 Hz beat, or the clock
+    /// fallback) still flips at that vblank. Placed on the time it was sampled for, the frame
+    /// rendered ahead of it was sampled as late, and the one rendered ahead of that read more
+    /// than three periods past the clock: thrown out, it took the last frame's time again.
+    #[test]
+    fn a_frame_sampled_late_is_placed_on_the_vblank_its_commit_reaches() {
+        let period = us(1_000_000.0 / 144.0);
+        let vblank = ms(1_000.0);
+        let grid = Some(vblank);
+        let mut in_flight = None;
+        // Sampled for a period and 0.5 ms past `vblank`, committed 3 ms before it.
+        queue_in_flight(
+            &mut in_flight,
+            grid,
+            period,
+            || vblank - ms(3.0),
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(in_flight, Some(vblank));
+        // Rendered ahead of it, committed once its flip event is handled.
+        let ahead = in_flight.unwrap() + period;
+        queue_in_flight(
+            &mut in_flight,
+            grid,
+            period,
+            || vblank + us(100.0),
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert_eq!(in_flight, Some(vblank + period));
+        // Rendered ahead of that right after its commit: sampled at the vblank it is shown at.
+        let now = vblank + us(200.0);
+        assert_eq!(
+            sanitize_next_frame_target(
+                in_flight.map(|target| target + period),
+                now + period,
+                period,
+                Some(ahead),
+            ),
+            (vblank + period * 2, false)
+        );
+    }
+
+    /// HDMI-A-1 at 144 Hz: 32 flips stamped 600 us after their vblanks, then the beat with
+    /// DP-3's 120 Hz steps the stamps to 50 us. Each of those is half a millisecond before the
+    /// estimated vblank and was taken for a flip a period late at the one before it: the first
+    /// was bumped as a duplicate, and the next dozen, until the history's phase moved, were
+    /// predicted a period early, sampled at the time of the frame before.
+    #[test]
+    fn a_stamp_just_before_the_estimated_vblank_predicts_the_next_one() {
+        let period_us = 1_000_000.0 / 144.0;
+        let period = us(period_us);
+        let mut flips = FlipClock::default();
+        for index in 0..64u32 {
+            let vblank = 1_000_000.0 + f64::from(index) * period_us;
+            let delay = if index < 32 { 600.0 } else { 50.0 };
+            let (_, target) = flips.observe(us(vblank + delay), true, true, period);
+            let next = vblank + period_us;
+            let target = target.as_secs_f64() * 1e6;
+            assert!(
+                next <= target && target - next <= 1_000.0,
+                "flip {index}: target {target} us, the next vblank is {next} us"
+            );
+        }
+    }
+
     /// A rejected commit flips nothing and leaves the frame in flight as it was.
     #[test]
     fn a_failed_commit_leaves_the_frame_in_flight() {
         let mut in_flight = Some(ms(1_000.0));
         let queued = queue_in_flight(
             &mut in_flight,
-            ms(1_010.0),
             Some(ms(1_010.0)),
             ms(10.0),
             || ms(1_011.0),
@@ -4110,7 +4167,7 @@ fn submit_deferred_frame(
     generation: u64,
     deadline_scheduled: bool,
 ) {
-    {
+    let output = {
         let Some(surface) = state
             .tty_backends
             .get_mut(&node)
@@ -4121,11 +4178,24 @@ fn submit_deferred_frame(
         if surface.deferred_submit.is_none() || surface.deferred_submit_generation != generation {
             return;
         }
-    }
+        surface.output.clone()
+    };
     // Carry the freshest pointer position: the frame is still staged inside
     // the DrmCompositor, so this patches its cursor plane in place
     // (`MergedIntoQueued`) rather than committing anything by itself.
-    let _ = fast_cursor_move_inner(state, loop_handle, false);
+    // `fast_cursor_move_inner` moves the cursor of whichever output the pointer
+    // is over; on another output it committed a cursor-only flip in the middle
+    // of that output's frame, which then waited a vblank, and dropped its
+    // queued redraw.
+    let pointer_here = state.seat.get_pointer().is_some_and(|pointer| {
+        state
+            .space
+            .output_geometry(&output)
+            .is_some_and(|geo| geo.to_f64().contains(pointer.current_location()))
+    });
+    if pointer_here {
+        let _ = fast_cursor_move_inner(state, loop_handle, false);
+    }
     let Some(surface) = state
         .tty_backends
         .get_mut(&node)
@@ -4145,7 +4215,6 @@ fn submit_deferred_frame(
         );
         queue_in_flight(
             &mut surface.in_flight_frame_target,
-            deferred.frame_target,
             grid,
             period,
             || Duration::from(state.clock.now()),
@@ -7185,7 +7254,6 @@ fn render_surface(
                     );
                     let queued = queue_in_flight(
                         &mut surface.in_flight_frame_target,
-                        frame_time,
                         grid,
                         period,
                         || Duration::from(state.clock.now()),
