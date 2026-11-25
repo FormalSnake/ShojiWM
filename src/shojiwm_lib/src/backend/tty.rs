@@ -1453,6 +1453,9 @@ struct SurfaceData {
     /// An ahead render already ran for the flip in flight (it may have had no damage);
     /// another one waits for the flip, so a burst of redraw requests does not re-render.
     ahead_attempted: bool,
+    /// A redraw asked for after a no-damage frame was rendered at once instead of at the
+    /// estimated-vblank timer. One a refresh period: cleared by a vblank and by the timer.
+    estimated_retry_spent: bool,
     /// The vblank the newest submitted frame flips at, or a held one was rendered for; an ahead
     /// frame targets the vblank after it. `None` while what is in flight is not a rendered frame
     /// (a cursor-only commit), its vblank is not known (see `queue_in_flight`), or nothing is.
@@ -1791,6 +1794,7 @@ impl SurfaceData {
             ahead_submit: None,
             ahead_held_client_buffers: Vec::new(),
             ahead_attempted: false,
+            estimated_retry_spent: false,
             in_flight_frame_target: None,
             fullscreen_fast_path_active: false,
             powered_off: false,
@@ -3969,6 +3973,7 @@ fn frame_finish(
     };
     // The flip is done, so the next one may get a frame rendered ahead of it.
     surface.ahead_attempted = false;
+    surface.estimated_retry_spent = false;
     if let Some(ahead) = surface.ahead_submit.take() {
         // A frame was rendered ahead while this flip was in flight; it goes next. It
         // carries the cursor, so a pending fast-path move is superseded.
@@ -5231,7 +5236,20 @@ fn queue_tty_redraws(state: &mut ShojiWM) {
                     // cursor motion cause), tightening the cadence further and cutting wasted GPU/CPU
                     // work. The promotion here is enough to remove the refresh-rate cap; the gate
                     // would mostly be an efficiency/evenness refinement.
-                    surface.redraw_state = if tearing_active {
+                    //
+                    // Without tearing the same wait costs a vblank: a client that commits
+                    // after the no-damage render (its frame took longer than the gap from the
+                    // flip to that render) had its buffer held until the timer, a refresh
+                    // period after the render and so past the next vblank, and was shown two
+                    // periods late (0.5% of HDMI-A-1's frames inside a continuous animation
+                    // on g815). No flip is in flight here, so the first redraw asked for is
+                    // rendered at once and makes that vblank. Only the first: a second one
+                    // before the timer waits for it as before, so redraws that keep finding
+                    // no damage cost one extra render a period and the timer's frame
+                    // callbacks stay where they were.
+                    let retry = !surface.estimated_retry_spent;
+                    surface.redraw_state = if tearing_active || retry {
+                        surface.estimated_retry_spent = true;
                         TtyRedrawState::Queued
                     } else {
                         TtyRedrawState::WaitingForEstimatedVBlank {
@@ -14526,6 +14544,7 @@ fn schedule_estimated_vblank_callback(
                 // committing the moment it sends `set_minimized`), which froze
                 // the minimize fade as a stuck full-opacity ghost.
                 surface.frame_callback_timer_armed = false;
+                surface.estimated_retry_spent = false;
                 match surface.redraw_state {
                     TtyRedrawState::WaitingForEstimatedVBlank { queued, .. } => {
                         surface.frame_callback_sequence =
