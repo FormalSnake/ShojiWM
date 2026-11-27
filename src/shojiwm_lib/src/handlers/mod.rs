@@ -116,7 +116,16 @@ impl SeatHandler for ShojiWM {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let previous_owner = self.window_keyboard_focus_owner.clone();
         self.sync_window_keyboard_focus_from_surface(focused);
-        self.sync_pointer_constraint_with_keyboard_focus(focused);
+        // A popup grab ending on pointer motion moves keyboard focus while
+        // smithay still holds the pointer's lock, and the constraint sync
+        // reads the pointer, so it runs once the input event has returned.
+        self.loop_handle.insert_idle(|state| {
+            let focused = state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus());
+            state.sync_pointer_constraint_with_keyboard_focus(focused.as_ref());
+        });
         self.keyboard_focus_moved(focused);
 
         // The TS runtime only observes focus through `isFocused` snapshot
